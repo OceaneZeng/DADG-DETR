@@ -31,6 +31,35 @@ python tools/owod/download_data.py --benchmark both
 # 本机代理可加：--proxy http://127.0.0.1:10808
 ```
 
+从原始 VOC/COCO 重建 M 时，推荐显式选择以下入口，不访问 ORE Drive：
+
+```bash
+python tools/owod/download_data.py --benchmark m-owodb --m-source reconstruct
+```
+
+该命令下载三个 VOC TAR、三个 COCO ZIP 和 DINO。VOC 使用 Oxford 官方 HTTPS
+地址及 torchvision 列出的 MD5 核验，原始包保存到 `data/raw/archives/`；
+已有手工下载的同名 VOC 包通过 MD5 后复用，不覆盖校验失败的文件。
+VOC TAR 不在下载器中解压，以免 VOC2007 trainval/test 的同名目录相互覆盖；
+COCO ZIP 自动安全解压至 `data/raw/coco/`。下载成功不代表已经生成训练数据。
+只补充 VOC 包可使用 `--benchmark voc`，不会下载 COCO 或 DINO。
+默认 `--m-source author-release` 保留原来的 ORE Drive 下载行为。
+
+下载完成后，在仓库根目录、已激活的项目环境中依次执行（每步成功后继续）：
+
+```bash
+python tools/owod/prepare_voc.py --downloads data/raw/archives \
+  && python tools/owod/prepare_ore.py --coco-root data/raw/coco --ore-root data/raw/ore \
+  && python tools/owod/manage_data.py prepare --benchmark m-owodb --ore-root data/raw/ore --output-root data/owod \
+  && python tools/owod/manage_data.py verify --benchmark m-owodb --ore-root data/raw/ore --output-root data/owod --decode-images
+```
+
+`prepare_voc.py` 保留三个 VOC release 并发布固定 M 清单需要的图像/XML；
+`prepare_ore.py` 读取 COCO2017 的 train/val 图片及 instances JSON，按已核验的
+ORE 作者转换规则生成 COCO 部分 XML，将固定 M 清单需要的图像发布到同一
+`data/raw/ore/`，不重新抽样。最后由 manage_data 生成并核验 schema-3 manifest。
+因此 M 的准备包含 VOC 整理和 COCO 转换两步；S 直接使用 COCO2017，不需要 ORE 转换。
+
 脚本下载官方 COCO ZIP 与 DINO ResNet-50，支持断点续传、目标锁、来源/哈希
 记录与安全解压。COCO 使用同一官方 S3 bucket 的有效 TLS 地址，不关闭证书
 校验。M 下载分支仍尝试获取 ORE 合并发布版；2026-10-08 访问作者 Drive 时未

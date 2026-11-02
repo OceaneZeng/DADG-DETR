@@ -40,6 +40,9 @@ export PYTHONPATH="$PWD/models/ops:$PWD${PYTHONPATH:+:$PYTHONPATH}"
 扩展必须在此服务器构建，不复制 Windows 编译产物。
 
 将下方 ORE_ROOT 替换为真实作者数据根目录，包含 JPEGImages 和 Annotations。
+若尚无 ORE 合并数据，先按 [数据指南](data-preparation.md) 使用
+`download_data.py --benchmark m-owodb --m-source reconstruct` 下载 VOC/COCO，
+再依次运行 prepare_voc.py 和 prepare_ore.py 完成作者规则转换。
 准备过程引用原始图片；路径必须在训练期间保持有效。迁移旧 manifest 后不要手工改路径，
 应从真实原始数据重新 prepare，生成本机 schema-3 manifest。
 

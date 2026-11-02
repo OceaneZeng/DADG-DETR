@@ -1,4 +1,4 @@
-"""Resume official COCO/ORE sources and DINO weights, then use manage_data.py."""
+"""Resume official VOC/COCO/ORE sources and DINO weights, then use manage_data.py."""
 import argparse
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import hashlib
@@ -13,6 +13,31 @@ ROOT = Path(__file__).resolve().parents[2]
 COCO = 'https://s3.amazonaws.com/images.cocodataset.org/'
 DINO = 'https://dl.fbaipublicfiles.com/dino/dino_resnet50_pretrain/dino_resnet50_pretrain.pth'
 ORE = 'https://drive.google.com/drive/folders/1S5L-YmIiFMAKTs6nHMorB0Osz5iWI31k'
+# Official Oxford HTTPS sources and archive MD5s, as listed by torchvision:
+# https://github.com/pytorch/vision/blob/main/torchvision/datasets/voc.py
+VOC = (
+    ('voc2007', 'VOCtrainval_06-Nov-2007.tar', 'c52e279531787c972589f7e41ab4ae64'),
+    ('voc2007', 'VOCtest_06-Nov-2007.tar', 'b6e924de25625d8de591ea690078ad9f'),
+    ('voc2012', 'VOCtrainval_11-May-2012.tar', '6cd6e144f989b92b3379bac3b3de84fd'),
+)
+
+
+def download_voc(url, target, expected_md5, proxy=None):
+    """Verify release identity; reuse manually downloaded archives without overwriting."""
+    target.parent.mkdir(parents=True, exist_ok=True)
+    with FileLock(str(target) + '.lock', timeout=1):
+        record = target.with_suffix(target.suffix + '.source.json')
+        if not target.is_file() or record.is_file():
+            _download(url, target, proxy)
+        digest = hashlib.md5()
+        with target.open('rb') as stream:
+            for block in iter(lambda: stream.read(8 * 1024 * 1024), b''):
+                digest.update(block)
+        if digest.hexdigest() != expected_md5:
+            raise ValueError(f'VOC archive MD5 mismatch (file preserved): {target}')
+        record.write_text(json.dumps({'url': url, 'bytes': target.stat().st_size,
+                                     'sha256': sha256(target), 'md5': expected_md5}, indent=2))
+    return target
 
 
 def sha256(path):
@@ -125,22 +150,32 @@ def extract(archive, root, prefixes=None):
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--benchmark', choices=('m-owodb', 's-owodb', 'both', 'weights'), default='both')
+    parser.add_argument('--benchmark', choices=('m-owodb', 's-owodb', 'both', 'weights', 'voc'), default='both')
+    parser.add_argument('--m-source', choices=('author-release', 'reconstruct'), default='author-release',
+                        help='M input: original ORE Drive release (default), or official VOC + COCO archives; '
+                             'reconstruct requires prepare_voc.py then prepare_ore.py after download')
     parser.add_argument('--root', type=Path, default=ROOT / 'data/raw')
     parser.add_argument('--weights', type=Path, default=ROOT / 'pretrained/dino_resnet50.pth')
     parser.add_argument('--proxy')
     args = parser.parse_args(argv)
-    jobs = [(DINO, args.weights, None, None)]
-    if args.benchmark in ('s-owodb', 'both'):
+    jobs = [] if args.benchmark == 'voc' else [(DINO, args.weights, None, None)]
+    needs_m = args.benchmark in ('m-owodb', 'both')
+    reconstruct = needs_m and args.m_source == 'reconstruct'
+    if args.benchmark == 'voc' or reconstruct:
+        for release, name, md5 in VOC:
+            jobs.append((f'https://thor.robots.ox.ac.uk/pascal/VOC/{release}/{name}',
+                         args.root / 'archives' / name, None, md5))
+    if args.benchmark in ('s-owodb', 'both') or reconstruct:
         for name, folder in [('train2017.zip', 'zips/'), ('val2017.zip', 'zips/'),
                              ('annotations_trainval2017.zip', 'annotations/')]:
             jobs.append((COCO + folder + name, args.root / 'archives' / name, args.root / 'coco', None))
     errors = []
     def work(job):
-        url, target, destination, prefixes = job
-        archive = download(url, target, args.proxy)
+        url, target, destination, md5 = job
+        archive = (download_voc(url, target, md5, args.proxy) if md5
+                   else download(url, target, args.proxy))
         if destination:
-            extract(archive, destination, prefixes)
+            extract(archive, destination)
         print(f'Completed: {target}', flush=True)
     with ThreadPoolExecutor(max_workers=4) as pool:
         for future in as_completed([pool.submit(work, job) for job in jobs]):
@@ -149,7 +184,7 @@ def main(argv=None):
             except Exception as error:
                 errors.append(str(error))
                 print(f'Download failed: {error}', file=sys.stderr, flush=True)
-    if args.benchmark in ('m-owodb', 'both'):
+    if needs_m and not reconstruct:
         try:
             import gdown
             listing = gdown.download_folder(ORE, skip_download=True, proxy=args.proxy, quiet=True)
@@ -166,6 +201,11 @@ def main(argv=None):
         except Exception as error:
             errors.append(f'ORE: {error}')
             print(errors[-1], file=sys.stderr, flush=True)
+    if not errors and reconstruct:
+        print('Downloads ready. Next run prepare_voc.py --downloads <root>/archives, '
+              'then prepare_ore.py --coco-root <root>/coco --ore-root <root>/ore; '
+              'finally manage_data.py prepare/verify --benchmark m-owodb. '
+              'No training manifest has been generated.', flush=True)
     return int(bool(errors))
 
 
