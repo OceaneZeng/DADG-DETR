@@ -1,2 +1,3 @@
 configs/owod/*/ImageSets/*.txt -text
 tools/owod/*.sh text eol=lf
+tools/setup_linux.sh text eol=lf

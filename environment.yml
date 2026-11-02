@@ -1,8 +1,8 @@
 # ------------------------------------------------------------------------
 # Tree-DETR conda environment  (Linux + NVIDIA GPU)
 # ------------------------------------------------------------------------
-# Tuned for the target server: Linux, 2x RTX 3090 (Ampere, sm_86),
-# driver CUDA 13.2.  Replaces the README's ancient stack (py3.7 / torch1.5.1
+# Linux Ampere servers: RTX 3090 or A40 (sm_86).
+# The driver must support the CUDA 12.1 runtime below. Replaces the ancient stack (py3.7 / torch1.5.1
 # / cuda9.2), which cannot run on Ampere/Ada/Blackwell GPUs at all.
 #
 # Stack: PyTorch 2.4.1 + torchvision 0.19.1 + CUDA 12.1 runtime & toolkit.

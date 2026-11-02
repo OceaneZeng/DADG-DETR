@@ -33,12 +33,36 @@ else
 fi
 
 export TORCH_CUDA_ARCH_LIST="${CUDA_ARCH}"
+conda activate "${ENV_NAME}"
+# Compile with this environment's toolkit, not a host CUDA 13 installation.
+export CUDA_HOME="${CONDA_PREFIX}"
+export PATH="${CUDA_HOME}/bin:${PATH}"
+cd "${PROJECT_ROOT}/models/ops"
+python - <<'PY'
+import re
+import subprocess
+import torch
+import torchvision
+from torch.utils.cpp_extension import CUDA_HOME
+
+print('torch', torch.__version__, 'torchvision', torchvision.__version__)
+print('torch CUDA', torch.version.cuda, 'CUDA_HOME', CUDA_HOME)
+if not torch.cuda.is_available():
+    raise SystemExit('ERROR: CUDA GPU is unavailable; check driver and GPU visibility.')
+nvcc = subprocess.check_output([CUDA_HOME + '/bin/nvcc', '--version'], text=True)
+print(nvcc)
+release = re.search(r'release (\d+\.\d+)', nvcc)
+if release is None or release.group(1) != torch.version.cuda:
+    raise SystemExit('ERROR: nvcc and PyTorch CUDA versions must match.')
+for index in range(torch.cuda.device_count()):
+    print('GPU', index, torch.cuda.get_device_name(index), torch.cuda.get_device_capability(index))
+PY
 echo "Building MS-DeformAttn for CUDA arch ${TORCH_CUDA_ARCH_LIST}"
 conda run --no-capture-output --name "${ENV_NAME}" \
     python "${PROJECT_ROOT}/models/ops/setup.py" build_ext --inplace
 
 conda run --no-capture-output --name "${ENV_NAME}" \
-    python -c "import torch, torchvision; print('torch', torch.__version__, 'torchvision', torchvision.__version__); print('cuda', torch.version.cuda, 'available', torch.cuda.is_available(), 'gpus', torch.cuda.device_count())"
+    python -c "import MultiScaleDeformableAttention; print('MS-DeformAttn extension import OK')"
 
 echo "Environment ready: ${ENV_NAME}"
 echo "Activate with: conda activate ${ENV_NAME}"
