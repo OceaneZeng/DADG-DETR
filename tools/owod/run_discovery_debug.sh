@@ -33,8 +33,9 @@ python tools/owod/manage_data.py verify --benchmark s-owodb --output-root data/o
 timeout --signal=TERM --kill-after=30s 15m \
   python -m torch.distributed.run --standalone --nproc_per_node=2 \
   tools/owod/debug_discovery_revision.py \
-  --checkpoint output/tree-detr-s-v5-full/s-owodb/seed_42/stage_1/increment/checkpoint.pth \
-  --old-teacher-checkpoint output/tree-detr-s-v5-full/s-owodb/seed_42/stage_0/increment/checkpoint0049.pth \
+  --checkpoint output/tree-detr-s-v5-full/s-owodb/seed_42/stage_0/increment/checkpoint0049.pth \
+  --start-task2 \
+  --graph-gnn-checkpoint output/tree-detr-s-v5-full/s-owodb/seed_42/gnn/stage_0/gnn_stage0.pt \
   --manifest data/owod/s-owodb/split_manifest.json \
   --images 16 --batch-size 2 --full-resolution --steps 40 \
   --memory-limit-mib 12000 --ram-limit-mib 8192 --seconds-per-policy 300 \

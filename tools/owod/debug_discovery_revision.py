@@ -16,6 +16,41 @@ ROOT = Path(__file__).resolve().parents[2]
 sys.path[:0] = [str(ROOT), str(ROOT / 'models/ops')]
 
 
+def task2_arguments(parent, manifest, files, manifest_path, gnn_path):
+    """Diagnostic transition from an intact Task 1 parent, never Task 2 weights."""
+    current = manifest['stages'][1]
+    old = list(parent.owod_known_class_ids)
+    if old != manifest['stages'][0]['active_classes']:
+        raise ValueError('Task 1 parent class order differs from author manifest')
+    if set(current['active_classes']) != set(old) | set(current['classes']):
+        raise ValueError('Task 2 author class chain mismatch')
+    result = copy.deepcopy(parent)
+    result.owod_stage = 1
+    result.owod_phase = 'increment'
+    result.owod_manifest = str(manifest_path)
+    result.owod_known_class_ids = list(current['active_classes'])
+    result.owod_previous_class_ids = old
+    result.owod_current_class_ids = list(current['classes'])
+    result.owod_image_root = manifest['image_root']
+    result.train_ann = str(files['increment_train'])
+    result.val_ann = str(files['full_val'])
+    result.graph_gnn_checkpoint = str(gnn_path)
+    result.num_workers = 0
+    return result
+
+
+def prepare_task2(model, criterion, configuration, source_checkpoint):
+    from tools.owod.graph_adaptation import build_stage_spec, collect_promotion_features
+    from models.graph_local.routed_adapter import append_stage
+    model.known_ids = criterion.known_ids = criterion.base.active_class_ids = list(
+        configuration.owod_known_class_ids)
+    spec = build_stage_spec(model, criterion, configuration, source_checkpoint)
+    append_stage(model, spec)
+    means, routes = collect_promotion_features(model, criterion, configuration)
+    return spec, {c: v.cpu().tolist() for c, v in means.items()}, {
+        c: [v.cpu().tolist() for v in values] for c, values in routes.items()}
+
+
 def resident_mib():
     """Process RAM, without adding a profiling package dependency."""
     import os
@@ -49,6 +84,9 @@ def main():
 
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--checkpoint', required=True, type=Path)
+    parser.add_argument('--start-task2', action='store_true',
+                        help='Initialize a fresh Task 2 branch from this Task 1 checkpoint')
+    parser.add_argument('--graph-gnn-checkpoint', type=Path)
     source = parser.add_mutually_exclusive_group(required=True)
     source.add_argument('--fixture', type=Path)
     source.add_argument('--manifest', type=Path,
@@ -79,14 +117,23 @@ def main():
     device = torch.device('cuda', local_rank)
     if world > 1:
         from datetime import timedelta
-        torch.distributed.init_process_group('nccl', timeout=timedelta(seconds=120))
+        torch.distributed.init_process_group('nccl', timeout=timedelta(seconds=900))
     identity = file_sha256(opt.checkpoint)
     payload = torch.load(opt.checkpoint, map_location='cpu', weights_only=False)
     saved = payload['args']
+    source_saved = copy.deepcopy(saved)
     if not getattr(saved, 'owod_discovery', False) or saved.owod_stage not in (0, 1):
         parser.error('This paired debug accepts discovery Task 1/2 checkpoints only')
     if saved.owod_stage == 1 and not opt.old_teacher_checkpoint:
         parser.error('Task 2 debug requires the actual Task 1 frozen teacher')
+    if opt.start_task2:
+        if (saved.owod_stage != 0 or saved.owod_phase != 'increment' or
+                payload['epoch'] + 1 != saved.epochs or payload.get('diagnostic_only') or
+                not opt.manifest or not opt.graph_gnn_checkpoint or opt.old_teacher_checkpoint):
+            parser.error('--start-task2 requires a completed Task 1, manifest and its GNN; no Task 2 inputs')
+        from tools.owod.protocol import stage_files
+        manifest, files = stage_files(opt.manifest, 1)
+        saved = task2_arguments(saved, manifest, files, opt.manifest, opt.graph_gnn_checkpoint)
     released = set(saved.owod_known_class_ids)
     transforms = make_coco_transforms('val', lightweight=not opt.full_resolution)
     stream = []
@@ -129,6 +176,7 @@ def main():
               'gpu': torch.cuda.get_device_name(), 'steps': opt.steps, 'policies': {},
               'world_size': world, 'rank': rank, 'batch_size_per_rank': opt.batch_size,
               'short_side': 800 if opt.full_resolution else 384}
+    result['fresh_task2_from_task1'] = opt.start_task2
     opt.output.parent.mkdir(parents=True, exist_ok=True)
 
     def write():
@@ -136,17 +184,48 @@ def main():
 
     try:
         frozen = None
+        transition = None
         if saved.owod_stage == 1:
-            teacher_identity = file_sha256(opt.old_teacher_checkpoint)
-            source = getattr(saved, 'graph_adapter_specs', [])[-1]['source_checkpoint_sha256']
+            teacher_path = opt.checkpoint if opt.start_task2 else opt.old_teacher_checkpoint
+            teacher_identity = file_sha256(teacher_path)
+            source = identity if opt.start_task2 else getattr(saved, 'graph_adapter_specs', [])[-1]['source_checkpoint_sha256']
             if teacher_identity != source:
                 raise ValueError('Frozen teacher is not the recorded Task 2 parent')
-            frozen, _ = load_detector(saved, opt.old_teacher_checkpoint, device)
+            frozen, _ = load_detector(saved, teacher_path, device)
             frozen.eval().requires_grad_(False)
             result['old_teacher_sha256'] = teacher_identity
+        if opt.start_task2:
+            print('Preparing fresh Task 2 risk graph and promotion from Task 1 training knowledge...', flush=True)
+            # The detector criterion normalizes boxes with distributed all_reduce.
+            # Every rank must enter calibration; rank-zero-only preparation would
+            # deadlock against peers waiting in broadcast_object_list.
+            torch.manual_seed(42)
+            initial, initial_criterion = load_detector(source_saved, opt.checkpoint, device)
+            packet = [prepare_task2(initial, initial_criterion, saved, opt.checkpoint)]
+            del initial, initial_criterion
+            gc.collect()
+            torch.cuda.empty_cache()
+            if world > 1:
+                torch.distributed.broadcast_object_list(packet, src=0)
+            transition = packet[0]
+            result['fresh_task2_spec'] = transition[0]
+            result['gnn_sha256'] = file_sha256(opt.graph_gnn_checkpoint)
+            write()
+            print('Fresh Task 2 initialization ready; starting paired diagnostic updates.', flush=True)
         for policy in (5, 6):
             torch.manual_seed(42)
             model, criterion = load_detector(saved, opt.checkpoint, device)
+            if transition is not None:
+                from models.graph_local.routed_adapter import append_stage
+                layout, means, routes = copy.deepcopy(transition)
+                model.known_ids = criterion.known_ids = criterion.base.active_class_ids = list(
+                    saved.owod_known_class_ids)
+                criterion.old_ids = list(saved.owod_previous_class_ids)
+                append_stage(model, layout)
+                model.promote({c: torch.tensor(v, device=device) for c, v in means.items()}, layout,
+                              {c: [torch.tensor(v, device=device) for v in values]
+                               for c, values in routes.items()})
+                result.setdefault('initial_promotion', {})[str(policy)] = layout.get('promotion', [])
             if policy == 6:
                 model.memory.enable_adaptive()
             criterion.revision = policy
@@ -238,7 +317,7 @@ def main():
             if opt.steps >= 3 else False)
         result['status'] = 'completed'
         if frozen is not None:
-            result['old_teacher_unchanged'] = file_sha256(opt.old_teacher_checkpoint) == teacher_identity
+            result['old_teacher_unchanged'] = file_sha256(teacher_path) == teacher_identity
     except Exception as error:
         result.update(status='failed', error=str(error))
         raise

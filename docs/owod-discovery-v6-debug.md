@@ -98,9 +98,18 @@ bash tools/owod/run_discovery_debug.sh
 ```
 
 该入口锁定已核对的物理3090卡1、2的UUID；先验证CUDA可用且每卡至少空闲14 GiB，
-再验证S-OWODB数据。随后读取现有Task2第8轮与其真实Task1父权重，
+再验证S-OWODB数据。**按用户要求，只读取现有Task1第50轮checkpoint，完全不读取失败的Task2 checkpoint。**
+先用其已有Task1 GNN及作者Task2训练标注，调用正式的风险图构造与promotion初始化，
+建立全新的Task2类别adapter和router；冻结teacher同样来自这个Task1 checkpoint。
+每rank风险图与训练类别质心只构造一次，全部rank同时参与criterion的分布式归一化，
+再广播rank0结果以统一分支初始化。随后两种策略分别重新加载同一Task1权重、独立初始化Task2，
+不共享训练后的参数或优化器状态，不加载旧Task2的布局文件或任何权重。
+准备工作可能需要数分钟，也包含在整个15分钟超时内。
 直接从作者increment训练标注读取16张图像，不依赖本地fixture文件。
 使用800短边、两卡每卡batch2；两种策略各40步，仍为新AdamW lr=2e-5的独立诊断。
+它测试的是从Task1开始的全新Task2增量学习，不是继续训练Task1，也不是恢复失败的Task2。
+短程诊断直接检查warmup后的pseudo监督，不执行正式Task2完整首轮warmup，也不恢复Task1优化器。
+新建Task2路径已通过参数/初始化单元检查；完整风险图准备加双卡NCCL更新仍待服务器实测。
 每策略300秒，整个torchrun最多15分钟；每卡allocated显存上限12000 MiB，
 每rank进程RAM上限8192 MiB。资源检查是步间护栏，不能保证算子内部绝不OOM；
 若失败，torchrun终止其他rank，保留错误报告，不继续正式训练。
