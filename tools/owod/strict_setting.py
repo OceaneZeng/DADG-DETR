@@ -12,7 +12,8 @@ def configure_run(args):
         raise ValueError('screen-no-distill requires shared-parent discovery screening Task 2')
     if getattr(args, 'owod_discovery', False):
         from models.graph_local.discovery import DISCOVERY_VERSION
-        args.discovery_version = DISCOVERY_VERSION
+        args.discovery_version = (6 if getattr(args, 'discovery_policy', 'v5') == 'v6'
+                                  else DISCOVERY_VERSION)
         args.graph_routed_adapter = True
     requested = bool(args.owod_manifest or args.owod_known_class_ids is not None or args.paper_baseline
                      or getattr(args, 'graph_routed_adapter', False))
@@ -121,6 +122,8 @@ def configure_run(args):
 
 
 def validate_checkpoint(args, checkpoint, resume=False):
+    if checkpoint.get('diagnostic_only', False):
+        raise ValueError('Diagnostic checkpoints cannot initialize or resume formal training')
     if not getattr(args, 'owod_manifest', ''):
         return
     saved = checkpoint.get('args')

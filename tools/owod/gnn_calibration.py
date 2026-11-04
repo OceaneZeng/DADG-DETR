@@ -106,7 +106,10 @@ def load_detector(args, checkpoint_path: Path,
     payload = load_local_checkpoint(checkpoint_path)
     saved = payload.get('args') if isinstance(payload, Mapping) else None
     # Reconstruct the actual completed detector, including persistent banks.
-    model_args = saved if saved is not None else args
+    model_args = copy.deepcopy(saved if saved is not None else args)
+    # The complete detector state below includes the backbone. Re-reading its
+    # original pretraining file is redundant and breaks cross-host diagnostics.
+    model_args.skip_backbone_initialization = True
     if getattr(model_args, 'owod_discovery', False):
         from models.graph_local.discovery import build as build_discovery
         model, criterion, _postprocessors = build_discovery(model_args)

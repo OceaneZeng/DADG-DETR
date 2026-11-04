@@ -144,6 +144,8 @@ def build_plan(args):
                 if no_distill:
                     command += ['--screen-no-distill']
                 command += ['--owod-discovery', '--discovery-scoring', getattr(args, 'discovery_scoring', 'hierarchical')]
+                if getattr(args, 'discovery_policy', 'v5') == 'v6':
+                    command += ['--discovery-policy', 'v6']
                 if method == 'discovery-scratch':
                     command += ['--discovery-no-transfer']
                 if method == 'discovery-no-message':
@@ -195,6 +197,7 @@ def main(argv=None):
     parser.add_argument('--resume', action='store_true')
     parser.add_argument('--method', choices=('control', 'graph-adapter', 'discovery', 'discovery-scratch',
                                             'discovery-no-message'), default='control')
+    parser.add_argument('--discovery-policy', choices=('v5', 'v6'), default='v5')
     parser.add_argument('--graph-adapter-rank', type=int, default=8)
     parser.add_argument('--graph-adapter-last-n', type=int, default=2)
     parser.add_argument('--graph-risk-beta', type=float, default=2.0)

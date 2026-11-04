@@ -15,6 +15,17 @@ from util.training_runtime import gather_evidence, foreach_ema_parameters, copy_
 DISCOVERY_VERSION = 5
 
 
+def balanced_route_loss(values, targets, weights):
+    """Equal nonempty background/known/anonymous group means, fixed O(BQ)."""
+    parts = []
+    for category in range(3):
+        effective = weights * (targets == category)
+        total = effective.sum()
+        if total > 0:
+            parts.append((values * effective).sum() / total)
+    return torch.stack(parts).mean() if parts else values.sum() * 0
+
+
 class DiscoveryFFN(nn.Module):
     def __init__(self, dim, rank, capacity):
         super().__init__()
@@ -47,7 +58,8 @@ class DiscoveryDetector(nn.Module):
         self.transfer_threshold = args.discovery_transfer_threshold
         self.min_support = args.discovery_min_support
         detector.return_baseline_features = True
-        self.memory = PrototypeMemory(args.hidden_dim, args.discovery_capacity)
+        self.memory = PrototypeMemory(args.hidden_dim, args.discovery_capacity,
+                                      adaptive=getattr(args, 'discovery_version', 5) >= 6)
         self.affinity_graph = AffinityGraph(
             args.hidden_dim, use_messages=not getattr(args, 'discovery_no_message', False))
         for layer in target_decoder_layers(self, args.graph_adapter_last_n):
@@ -176,6 +188,8 @@ class DiscoveryCriterion(nn.Module):
         self.saliency_threshold = args.discovery_saliency_threshold
         self.consistency_threshold = args.discovery_consistency_threshold
         self.epoch = 0
+        self.revision = getattr(args, 'discovery_version', 5)
+        self.old_ids = list(getattr(args, 'owod_previous_class_ids', []) or [])
         self.evidence = None
         self.weight_dict.update(loss_objectness=1., loss_unknown=1., loss_discovery_route=1.,
                                 loss_discovery_consistency=1., loss_affinity=.1)
@@ -186,6 +200,18 @@ class DiscoveryCriterion(nn.Module):
                     target['labels'].new_tensor(self.known_ids))],
                     'boxes': target['boxes'][torch.isin(target['labels'],
                     target['labels'].new_tensor(self.known_ids))]} for target in targets]
+        # Reuse the existing frozen previous-task teacher, never future GT or
+        # the novelty head. Complete only released OLD classes before matching,
+        # so losses, pseudo exclusion and prototype labels agree on identity.
+        old_teacher = outputs.get('discovery_old_teacher')
+        if self.training and self.revision >= 6 and self.old_ids:
+            if old_teacher is None:
+                raise ValueError('Discovery v6 increment requires the frozen old-class teacher')
+            from .pseudo_labels import select_teacher_pseudo_labels
+            with torch.no_grad():
+                targets, _ = select_teacher_pseudo_labels(
+                    old_teacher, targets, self.old_ids, score_threshold=.5,
+                    duplicate_iou=.7, ground_truth_iou=.5, max_per_image=20)
         indices = self.matcher(outputs, targets)
         teacher = outputs.get('discovery_teacher') if self.training and self.epoch >= self.warmup else None
         candidates = mine_candidates(outputs, targets, indices, self.known_ids, teacher,
@@ -221,7 +247,9 @@ class DiscoveryCriterion(nn.Module):
         route_terms = []
         for logits in outputs['discovery_routes']:
             values = F.cross_entropy(logits.transpose(1, 2), route_target, reduction='none')
-            route_terms.append((values * proposal_weights).sum() / proposal_weights.sum().clamp_min(1))
+            route_terms.append(balanced_route_loss(values, route_target, proposal_weights)
+                               if self.revision >= 6 else
+                               (values * proposal_weights).sum() / proposal_weights.sum().clamp_min(1))
         losses['loss_discovery_route'] = torch.stack(route_terms).mean()
         consistency = outputs['query_features'].sum() * 0
         if teacher is not None:

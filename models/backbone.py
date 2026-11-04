@@ -104,14 +104,16 @@ class Backbone(BackboneBase):
                  return_interm_layers: bool,
                  dilation: bool,
                  no_pretrained: bool = False,
-                 backbone_weights: str = ''):
+                 backbone_weights: str = '',
+                 skip_initialization: bool = False):
         # Frozen ImageNet BN is appropriate for the pretrained detector path.
         # A randomly initialized backbone needs trainable running statistics.
         norm_layer = nn.BatchNorm2d if no_pretrained and not backbone_weights else FrozenBatchNorm2d
         backbone = getattr(torchvision.models, name)(
             replace_stride_with_dilation=[False, False, dilation],
-            pretrained=(is_main_process() and not no_pretrained and not backbone_weights), norm_layer=norm_layer)
-        if backbone_weights:
+            pretrained=(is_main_process() and not no_pretrained and not backbone_weights
+                        and not skip_initialization), norm_layer=norm_layer)
+        if backbone_weights and not skip_initialization:
             checkpoint = torch.load(backbone_weights, map_location='cpu', weights_only=True)
             state = checkpoint.get('teacher', checkpoint.get('state_dict', checkpoint))
             normalized = {}
@@ -162,6 +164,7 @@ def build_backbone(args):
     return_interm_layers = args.masks or (args.num_feature_levels > 1)
     backbone = Backbone(args.backbone, train_backbone, return_interm_layers, args.dilation,
                         getattr(args, 'no_pretrained_backbone', False),
-                        getattr(args, 'backbone_weights', ''))
+                        getattr(args, 'backbone_weights', ''),
+                        getattr(args, 'skip_backbone_initialization', False))
     model = Joiner(backbone, position_embedding)
     return model

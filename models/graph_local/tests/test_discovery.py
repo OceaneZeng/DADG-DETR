@@ -325,10 +325,12 @@ def test_encoder_checkpoint_preserves_dropout_outputs_and_cuda_gradients():
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason='CUDA unavailable')
-def test_real_deformable_detector_cuda_discovery_and_checkpoint():
+@pytest.mark.parametrize('revision', [5, 6])
+def test_real_deformable_detector_cuda_discovery_and_checkpoint(revision):
     from main import get_args_parser
     from models.graph_local.discovery import build, make_ema
     configuration = get_args_parser().parse_args([])
+    configuration.discovery_version = revision
     configuration.device = 'cuda'
     configuration.no_pretrained_backbone = True
     configuration.num_classes = 91
@@ -371,8 +373,11 @@ def test_real_deformable_detector_cuda_discovery_and_checkpoint():
     criterion.weight_dict['loss_adapter_route'] = configuration.graph_route_loss_coef
     model.train_discovery()
     model.known_ids = criterion.known_ids = criterion.base.active_class_ids = [1, 2, 3]
+    criterion.old_ids = [1, 2]
     model.zero_grad(set_to_none=True)
     current = model(samples)
+    with torch.no_grad():
+        current['discovery_old_teacher'] = teacher(samples)
     new_targets = [{'labels': torch.tensor([3], device='cuda'), 'boxes': targets[0]['boxes']}]
     new_losses = criterion(current, new_targets)
     new_total = sum(value * criterion.weight_dict[key] for key, value in new_losses.items()

@@ -5,20 +5,33 @@ from torch.nn import functional as F
 
 
 class PrototypeMemory(nn.Module):
-    def __init__(self, dim, capacity=16, known_slots=91):
+    def __init__(self, dim, capacity=16, known_slots=91, adaptive=False):
         super().__init__()
         self.capacity = capacity
         self.known_slots = known_slots
         self.register_buffer('centers', torch.zeros(known_slots + capacity, dim))
         self.register_buffer('counts', torch.zeros(known_slots + capacity))
         self.register_buffer('variance', torch.zeros(known_slots + capacity, dim))
+        self.adaptive = adaptive
+        if adaptive:
+            self.enable_adaptive()
+
+    def enable_adaptive(self):
+        """Fixed-size recency state, persisted for exact phase/resume continuity."""
+        if hasattr(self, 'last_seen'):
+            return
+        self.adaptive = True
+        self.register_buffer('clock', self.counts.new_zeros((), dtype=torch.long))
+        self.register_buffer('last_seen', self.counts.new_zeros(self.capacity, dtype=torch.long))
 
     @torch.no_grad()
     def observe(self, features, labels, weights, threshold=.8):
         assignments = []
+        if self.adaptive:
+            self.clock.add_(1)
         # Copy predicates once instead of synchronizing CUDA for every known
         # object. Anonymous assignments and running updates remain sequential.
-        accepted = (torch.isfinite(features).all(-1) & ~(weights <= 0)).cpu().tolist()
+        accepted = (torch.isfinite(features).all(-1) & torch.isfinite(weights) & (weights > 0)).cpu().tolist()
         label_values = labels.cpu().tolist()
         for feature, label, weight, accept in zip(features, label_values, weights, accepted):
             if not accept:
@@ -37,9 +50,23 @@ class PrototypeMemory(nn.Module):
                 elif (unknown_counts == 0).any():
                     index = self.known_slots + int(torch.where(unknown_counts == 0)[0][0])
                 else:
-                    # Do not merge an unrelated candidate into a full memory.
-                    continue
+                    if not self.adaptive:
+                        # v5: never force unrelated evidence into an occupied slot.
+                        continue
+                    # Recycle only stale slots; do not merge unrelated clusters.
+                    # At most one replacement per slot per 32 observation calls.
+                    stale = self.clock - self.last_seen >= 32
+                    if not stale.any():
+                        continue
+                    support = unknown_counts.masked_fill(~stale, float('inf'))
+                    best = int(support.argmin())
+                    index = self.known_slots + best
+                    self.centers[index].zero_()
+                    self.counts[index].zero_()
+                    self.variance[index].zero_()
                 assignments.append(index - self.known_slots)
+                if self.adaptive:
+                    self.last_seen[index - self.known_slots] = self.clock
             previous = self.counts[index].clone()
             total = previous + weight
             difference = feature - self.centers[index]

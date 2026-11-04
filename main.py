@@ -140,6 +140,8 @@ def get_args_parser():
     parser.add_argument('--discovery-scoring', choices=('hierarchical', 'focal'), default='hierarchical')
     parser.add_argument('--graph-sketch-max-images', type=int, default=12)
     parser.add_argument('--owod-discovery', action='store_true')
+    parser.add_argument('--discovery-policy', choices=('v5', 'v6'), default='v5',
+                        help='v6 is an experimental supervision/memory revision; requires a new formal chain')
     parser.add_argument('--discovery-no-message', action='store_true',
                         help='capacity-matched affinity-graph ablation: self-loop context only')
     parser.add_argument('--discovery-no-transfer', action='store_true')
@@ -309,6 +311,12 @@ def main(args):
                        'known_supervision': 'dense released-class focal loss; one-to-one matching',
                        'discovery_supervision': 'dense selected-proposal objectness/router; foreground-only novelty',
                        'implementation': 'project_research_method', 'paper_baseline': False}
+            profile.update(discovery_version=args.discovery_version,
+                           memory_policy=('stale-weak-slot-recycle-32' if args.discovery_version >= 6
+                                          else 'refuse-full'),
+                           router_supervision=('balanced-three-groups' if args.discovery_version >= 6
+                                               else 'proposal-weighted'),
+                           old_target_completion=args.discovery_version >= 6)
         elif getattr(args, 'control_postprocess_version', None):
             profile = {'method': 'supervised-control', 'unknown_score': 'none; no unknown predictions',
                        'postprocess_version': args.control_postprocess_version,
@@ -426,7 +434,9 @@ def main(args):
         if unexpected_keys:
             print('Unexpected Keys: {}'.format(unexpected_keys))
 
-    teacher_required = args.teacher_completion or args.old_class_distillation
+    teacher_required = (args.teacher_completion or args.old_class_distillation or
+                        (getattr(args, 'discovery_version', 5) >= 6 and
+                         bool(args.owod_previous_class_ids)))
     if teacher_required:
         if not args.pretrained:
             raise ValueError('teacher completion/distillation requires --pretrained')

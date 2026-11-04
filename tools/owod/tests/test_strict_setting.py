@@ -20,6 +20,9 @@ def arguments(manifest, stage=0, phase='increment'):
 
 
 class StrictSettingTests(unittest.TestCase):
+    def test_diagnostic_checkpoint_is_never_a_formal_parent(self):
+        with self.assertRaisesRegex(ValueError, 'Diagnostic checkpoints'):
+            validate_checkpoint(SimpleNamespace(), {'diagnostic_only': True})
     def test_discovery_version_and_message_mode_cannot_change_in_chain(self):
         import copy
         from models.graph_local.discovery import DISCOVERY_VERSION

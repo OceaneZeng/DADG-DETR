@@ -89,6 +89,8 @@ def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
                 ground_truth_iou=teacher_ground_truth_iou,
                 max_per_image=teacher_max_per_image)
         outputs = model(samples)
+        if getattr(criterion, 'revision', 5) >= 6 and getattr(criterion, 'old_ids', []):
+            outputs['discovery_old_teacher'] = teacher_outputs
         # The criterion discards teacher predictions during warmup. Keep the
         # teacher's EMA/prototype updates below, but skip this unused forward.
         if discovery_teacher is not None and epoch >= getattr(criterion, 'warmup', 0):
