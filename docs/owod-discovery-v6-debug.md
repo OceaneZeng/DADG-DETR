@@ -4,6 +4,30 @@
 新方法通过 `--discovery-policy v6` 显式选择，版本为 6；正式链不能使用 v5 checkpoint。
 旧权重可作为下述独立诊断的起点。诊断器不保存任何权重，不能产生正式阶段父节点。
 
+## 2026-11-05：低预算记忆检查
+
+服务器 `run-z45i8wKF` 已通过双卡资源与父权重哈希护栏；v6匿名中心变化，
+但16个历史槽的支持均降至原值以下，表明全部经历回收。仍未测AP。
+
+下一轮在Linux/Bash既有tree-detr环境、仓库根目录执行：
+
+```bash
+bash tools/owod/run_discovery_debug.sh --memory-screen
+```
+
+复用原Task1第50轮和GNN，分别新建Task2；v5/v6各96步、作者训练清单前32图循环、
+800短边、两张3090每卡batch2、新AdamW，跳过正式warmup以检查pseudo监督。
+不修改回收或训练规则，不保存权重，无finetune，无AP评估；这是机制诊断而非效果筛选。
+更新耗时按此前40步约17–19秒粗估，两组合计约1–3分钟，数据核验与初始化另计。
+torchrun含初始化最多15分钟，每策略更新最多300秒，保留原显存/RAM护栏。
+
+结果独立保存在 `output/discovery-v6-memory-screen/run-XXXXXXXX/`，包含console.log、
+两份paired.rank*.json和summary.json。逐步支持下降证明发生过清零回收；计数只能作为
+替换次数下界，因为清零后本步累积权重可能掩盖下降。汇总不将广播后的记忆重复计数。
+检查首次下降步、受影响槽数、多个周期内反复下降情况、pseudo和旧类证据均值。
+未记录router门值、候选正确率或完整原型中心，不能据此判断unknown质量或转化有效。
+若出现整库回收，先修正回收机制，再进入固定预算的Task2效果对照；不要仅因loss下降启动正式链。
+
 ## 已确认的失效
 
 服务器 main 提交为 `024180d8c7d1270c1c8163b1c5f35ed914dc95c2`。

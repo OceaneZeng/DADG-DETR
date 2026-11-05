@@ -245,6 +245,7 @@ def main():
                        if world > 1 else model)
             optimizer = torch.optim.AdamW(model.parameters(), lr=2e-5, weight_decay=1e-4)
             initial_memory = model.memory.centers[91:].detach().cpu().clone()
+            initial_support = model.memory.counts[91:].detach().cpu().clone()
             torch.cuda.reset_peak_memory_stats()
             started = time.monotonic()
             measurements = []
@@ -279,7 +280,9 @@ def main():
                 total.backward()
                 norm = torch.nn.utils.clip_grad_norm_(model.parameters(), .1, error_if_nonfinite=True)
                 optimizer.step()
+                support_before = model.memory.counts[91:].detach().cpu().clone()
                 model.observe_training(criterion.evidence)
+                support_after = model.memory.counts[91:].detach().cpu().clone()
                 update_ema(teacher, model)
                 torch.cuda.synchronize()
                 peak = torch.cuda.max_memory_allocated() / 2**20
@@ -291,6 +294,12 @@ def main():
                                      'old_known_evidence': int(torch.isin(
                                          criterion.evidence[1], criterion.evidence[1].new_tensor(
                                              saved.owod_previous_class_ids)).sum()),
+                                     # A decrease proves a reset (ordinary updates only add
+                                     # positive weights). It is a lower bound on recycling:
+                                     # a reset followed by enough evidence can hide a drop.
+                                     'support_decreased_slots': torch.where(
+                                         support_after < support_before)[0].tolist(),
+                                     'anonymous_support': support_after.tolist(),
                                      'rss_mib': ram,
                                      'live_mib': torch.cuda.memory_allocated() / 2**20})
                 del outputs, losses, total
@@ -299,6 +308,7 @@ def main():
                 'peak_sampled_rss_mib': max(m['rss_mib'] for m in measurements),
                 'measurements': measurements,
                 'anonymous_centers_changed': not torch.equal(initial_memory, model.memory.centers[91:].cpu()),
+                'initial_anonymous_support': initial_support.tolist(),
                 'anonymous_support': model.memory.counts[91:].cpu().tolist(),
                 'parameter_count': sum(p.numel() for p in model.parameters())}
             print(json.dumps({'policy': policy, **{k: v for k, v in result['policies'][str(policy)].items()

@@ -1,8 +1,15 @@
 #!/usr/bin/env bash
 # Bounded Task 2 diagnostics on toplab; no formal training or weight writes.
 set -euo pipefail
-if (( $# )); then
-  echo 'This fixed diagnostic launcher accepts no arguments.' >&2
+steps=40
+images=16
+output_root=output/discovery-v6-server-debug
+if [[ $# == 1 && $1 == --memory-screen ]]; then
+  steps=96
+  images=32
+  output_root=output/discovery-v6-memory-screen
+elif (( $# )); then
+  echo 'Accepted option: --memory-screen (96 steps, 32 images).' >&2
   exit 2
 fi
 cd "$(dirname "${BASH_SOURCE[0]}")/../.."
@@ -11,8 +18,8 @@ export PYTHONUNBUFFERED=1
 export CUDA_DEVICE_ORDER=PCI_BUS_ID
 # Physical 3090 cards 1 and 2, verified by UUID; exclude unrelated/broken cards.
 export CUDA_VISIBLE_DEVICES=GPU-82ffd094-019f-1f3b-a428-70894db481d2,GPU-938ce8ba-8aa0-eefb-9a75-09fef406559d
-mkdir -p output/discovery-v6-server-debug
-run_dir=$(mktemp -d output/discovery-v6-server-debug/run-XXXXXXXX)
+mkdir -p "$output_root"
+run_dir=$(mktemp -d "$output_root/run-XXXXXXXX")
 echo "Diagnostic output: $run_dir"
 exec > >(tee -a "$run_dir/console.log") 2>&1
 trap 'echo "Exit status: $?; diagnostic log: $run_dir/console.log"' EXIT
@@ -37,7 +44,7 @@ timeout --signal=TERM --kill-after=30s 15m \
   --start-task2 \
   --graph-gnn-checkpoint output/tree-detr-s-v5-full/s-owodb/seed_42/gnn/stage_0/gnn_stage0.pt \
   --manifest data/owod/s-owodb/split_manifest.json \
-  --images 16 --batch-size 2 --full-resolution --steps 40 \
+  --images "$images" --batch-size 2 --full-resolution --steps "$steps" \
   --memory-limit-mib 12000 --ram-limit-mib 8192 --seconds-per-policy 300 \
   --output "$run_dir/paired.json"
 python - "$run_dir" <<'PY'
@@ -50,3 +57,4 @@ assert all(r['status'] == 'completed' and r['resource_guard_passed'] and
 print('Both ranks passed resource and checkpoint identity guards.')
 print('Diagnostic only: no AP gain or formal-chain compatibility claim.')
 PY
+python tools/owod/summarize_discovery_debug.py "$run_dir"
