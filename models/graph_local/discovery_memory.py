@@ -24,15 +24,26 @@ class PrototypeMemory(nn.Module):
         self.register_buffer('clock', self.counts.new_zeros((), dtype=torch.long))
         self.register_buffer('last_seen', self.counts.new_zeros(self.capacity, dtype=torch.long))
 
+    def enable_bounded(self, mature_support=3.):
+        """v7: global recycle cooldown and longer protection for mature slots."""
+        self.enable_adaptive()
+        self.mature_support = mature_support
+        if not hasattr(self, 'last_recycle'):
+            self.register_buffer('last_recycle', self.clock.clone())
+            self.register_buffer('recycle_count', self.clock.new_zeros(()))
+
     @torch.no_grad()
     def observe(self, features, labels, weights, threshold=.8):
         assignments = []
-        if self.adaptive:
-            self.clock.add_(1)
         # Copy predicates once instead of synchronizing CUDA for every known
         # object. Anonymous assignments and running updates remain sequential.
         accepted = (torch.isfinite(features).all(-1) & torch.isfinite(weights) & (weights > 0)).cpu().tolist()
         label_values = labels.cpu().tolist()
+        # v7 ages anonymous slots only when valid anonymous evidence is offered.
+        # A full known-only warmup must not expire every inherited prototype.
+        if self.adaptive and (not hasattr(self, 'last_recycle') or
+                              any(ok and label < 0 for ok, label in zip(accepted, label_values))):
+            self.clock.add_(1)
         for feature, label, weight, accept in zip(features, label_values, weights, accepted):
             if not accept:
                 continue
@@ -56,6 +67,11 @@ class PrototypeMemory(nn.Module):
                     # Recycle only stale slots; do not merge unrelated clusters.
                     # At most one replacement per slot per 32 observation calls.
                     stale = self.clock - self.last_seen >= 32
+                    if hasattr(self, 'last_recycle'):
+                        if self.clock - self.last_recycle < 32:
+                            continue
+                        age = self.clock - self.last_seen
+                        stale &= (unknown_counts < self.mature_support) | (age >= 1024)
                     if not stale.any():
                         continue
                     support = unknown_counts.masked_fill(~stale, float('inf'))
@@ -64,6 +80,9 @@ class PrototypeMemory(nn.Module):
                     self.centers[index].zero_()
                     self.counts[index].zero_()
                     self.variance[index].zero_()
+                    if hasattr(self, 'last_recycle'):
+                        self.last_recycle.copy_(self.clock)
+                        self.recycle_count.add_(1)
                 assignments.append(index - self.known_slots)
                 if self.adaptive:
                     self.last_seen[index - self.known_slots] = self.clock

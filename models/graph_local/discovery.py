@@ -60,6 +60,8 @@ class DiscoveryDetector(nn.Module):
         detector.return_baseline_features = True
         self.memory = PrototypeMemory(args.hidden_dim, args.discovery_capacity,
                                       adaptive=getattr(args, 'discovery_version', 5) >= 6)
+        if getattr(args, 'discovery_version', 5) >= 7:
+            self.memory.enable_bounded(args.discovery_min_support)
         self.affinity_graph = AffinityGraph(
             args.hidden_dim, use_messages=not getattr(args, 'discovery_no_message', False))
         for layer in target_decoder_layers(self, args.graph_adapter_last_n):
