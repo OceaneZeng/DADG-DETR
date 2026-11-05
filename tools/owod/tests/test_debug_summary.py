@@ -3,6 +3,20 @@ import copy
 import pytest
 
 from tools.owod.summarize_discovery_debug import summarize
+from tools.owod.debug_discovery_revision import stable_repeated_batch_memory
+
+
+def test_live_memory_compares_same_inputs_and_detects_cumulative_growth():
+    rows = [dict(stream_positions=[i % 4], live_mib=600 + (i % 4) * 30)
+            for i in range(20)]
+    assert stable_repeated_batch_memory(rows)
+    rows[-1]['live_mib'] += 17
+    assert not stable_repeated_batch_memory(rows)
+
+
+def test_live_memory_requires_a_repeated_batch_after_warmup():
+    rows = [dict(stream_positions=[i], live_mib=600) for i in range(4)]
+    assert not stable_repeated_batch_memory(rows)
 
 
 def reports():

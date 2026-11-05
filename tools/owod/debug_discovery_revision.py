@@ -16,6 +16,22 @@ ROOT = Path(__file__).resolve().parents[2]
 sys.path[:0] = [str(ROOT), str(ROOT / 'models/ops')]
 
 
+def stable_repeated_batch_memory(measurements, tolerance_mib=16):
+    """Compare live allocations for identical inputs after optimizer warmup."""
+    reference = {}
+    comparisons = 0
+    for measurement in measurements[2:]:
+        key = tuple(measurement['stream_positions'])
+        current = measurement['live_mib']
+        if key in reference:
+            comparisons += 1
+            if current > reference[key] + tolerance_mib:
+                return False
+        else:
+            reference[key] = current
+    return comparisons > 0
+
+
 def task2_arguments(parent, manifest, files, manifest_path, gnn_path):
     """Diagnostic transition from an intact Task 1 parent, never Task 2 weights."""
     current = manifest['stages'][1]
@@ -290,6 +306,7 @@ def main():
                 if peak > opt.memory_limit_mib or ram > opt.ram_limit_mib:
                     raise RuntimeError('Diagnostic CUDA/RAM memory budget reached')
                 measurements.append({'loss': float(total), 'grad_norm': float(norm),
+                                     'stream_positions': positions,
                                      'pseudo': float(losses['discovery_pseudo_count']),
                                      'old_known_evidence': int(torch.isin(
                                          criterion.evidence[1], criterion.evidence[1].new_tensor(
@@ -323,7 +340,7 @@ def main():
         result['resource_guard_passed'] = (
             treatment['peak_allocated_mib'] <= baseline['peak_allocated_mib'] * 1.2 + 64 and
             treatment['peak_sampled_rss_mib'] <= baseline['peak_sampled_rss_mib'] * 1.2 + 128 and
-            treatment['measurements'][-1]['live_mib'] <= treatment['measurements'][2]['live_mib'] + 16
+            stable_repeated_batch_memory(treatment['measurements'])
             if opt.steps >= 3 else False)
         result['status'] = 'completed'
         if frozen is not None:
