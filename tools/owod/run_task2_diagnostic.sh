@@ -9,6 +9,8 @@ cd "$(dirname "${BASH_SOURCE[0]}")/../.."
 export CUDA_DEVICE_ORDER=PCI_BUS_ID
 # Physical GPUs 0 and 1 (RTX 3090), using the server's PCI ordering.
 export CUDA_VISIBLE_DEVICES=0,1
+# Project dataset helpers use LOCAL_SIZE; torchrun only sets LOCAL_WORLD_SIZE.
+export LOCAL_SIZE=2
 export OMP_NUM_THREADS=2
 export PYTHONUNBUFFERED=1
 output=output/task2-v5-v7-diagnostic-3epochs-2gpu
