@@ -4,7 +4,10 @@ import pytest
 import torch
 
 from models.graph_local.discovery_memory import PrototypeMemory
-from tools.owod.train_task2_diagnostic import make_optimizer, validate_diagnostic_resume
+from tools.owod.train_task2_diagnostic import (
+    make_optimizer, validate_diagnostic_resume, diagnostic_identity,
+    capture_rank_state, restore_rank_state,
+)
 from tools.owod.strict_setting import validate_checkpoint
 
 
@@ -78,6 +81,90 @@ def test_optimizer_preserves_masked_classifier_rows_with_zero_decay():
     optimizer.step()
     assert torch.equal(before[0], model.class_embed.weight[0])
     assert not torch.equal(before[1], model.class_embed.weight[1])
+
+
+def test_two_gpu_plan_keeps_effective_batch_and_rejects_single_gpu_resume(tmp_path):
+    files = [tmp_path / name for name in ('manifest', 'checkpoint', 'gnn')]
+    for path in files:
+        path.write_text('identity fixture')
+    single = diagnostic_identity(*files)
+    dual = diagnostic_identity(*files, world_size=2)
+    assert single['batch_size'] * single['world_size'] == 2
+    assert dual['batch_size'] == 1 and dual['world_size'] == 2
+    assert dual['effective_batch_size'] == 2
+    with pytest.raises(ValueError, match='identity'):
+        validate_diagnostic_resume(dict(diagnostic_only=True, diagnostic_identity=single,
+                                        policy=7, epoch=0), dual, 7)
+
+
+def test_two_gpu_resume_requires_all_rank_random_states():
+    identity = {'world_size': 2}
+    generator = torch.Generator().manual_seed(42)
+    state = capture_rank_state(generator)
+    payload = dict(diagnostic_only=True, diagnostic_identity=identity, policy=7, epoch=0,
+                   model={}, optimizer={}, discovery_ema={}, args={}, **state)
+    with pytest.raises(ValueError, match='per-rank'):
+        validate_diagnostic_resume(payload, identity, 7)
+    payload['rank_states'] = [state, dict(state)]
+    validate_diagnostic_resume(payload, identity, 7)
+    payload['rank_states'][1].pop('loader_rng')
+    with pytest.raises(ValueError, match='per-rank'):
+        validate_diagnostic_resume(payload, identity, 7)
+
+
+def test_rank_random_state_restores_training_and_loader_streams():
+    import random
+    import numpy as np
+    generator = torch.Generator().manual_seed(43)
+    before = capture_rank_state(generator)
+
+    def draw():
+        return (torch.rand(3), torch.rand(3, generator=generator),
+                np.random.rand(3), random.random())
+
+    expected = draw()
+    draw()
+    restore_rank_state(before, generator)
+    actual = draw()
+    assert torch.equal(expected[0], actual[0])
+    assert torch.equal(expected[1], actual[1])
+    assert np.array_equal(expected[2], actual[2]) and expected[3] == actual[3]
+
+
+def test_two_process_checkpoint_restores_each_rank_rng():
+    from tools.owod.tests.test_runtime_distributed import _run_workers
+    _run_workers(r'''
+import io
+import random
+import numpy as np
+import torch
+import torch.distributed as dist
+from tools.owod.train_task2_diagnostic import capture_rank_state, restore_rank_state
+dist.init_process_group('gloo')
+rank = dist.get_rank()
+torch.manual_seed(42 + rank)
+np.random.seed(42 + rank)
+random.seed(42 + rank)
+generator = torch.Generator().manual_seed(42 + rank)
+states = [None, None]
+dist.all_gather_object(states, capture_rank_state(generator))
+def draw():
+    return (torch.rand(3), torch.rand(3, generator=generator), np.random.rand(3), random.random())
+expected = draw()
+# Exercise serialization of the same list saved in the rank-zero checkpoint.
+buffer = io.BytesIO()
+torch.save({'rank_states': states}, buffer)
+buffer.seek(0)
+saved = torch.load(buffer, weights_only=False)
+draw()
+restore_rank_state(saved['rank_states'][rank], generator)
+actual = draw()
+assert torch.equal(expected[0], actual[0])
+assert torch.equal(expected[1], actual[1])
+assert np.array_equal(expected[2], actual[2]) and expected[3] == actual[3]
+assert not torch.equal(states[0]['torch_rng'], states[1]['torch_rng'])
+dist.destroy_process_group()
+''')
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason='CUDA integration check')

@@ -21,13 +21,14 @@ def dump(path, value):
     temporary.replace(path)
 
 
-def diagnostic_identity(manifest, checkpoint, gnn):
+def diagnostic_identity(manifest, checkpoint, gnn, world_size=1):
     # Include implementation changes so --resume cannot silently change methods.
     sources = [ROOT / 'main.py', ROOT / 'engine.py']
     for folder in ('models', 'datasets', 'util', 'tools/owod'):
         sources.extend(p for p in sorted((ROOT / folder).rglob('*.py')) if 'tests' not in p.parts)
     return dict(manifest_sha256=file_sha256(manifest), checkpoint_sha256=file_sha256(checkpoint),
-                gnn_sha256=file_sha256(gnn), epochs=3, batch_size=2, world_size=1,
+                gnn_sha256=file_sha256(gnn), epochs=3, batch_size=2 // world_size,
+                world_size=world_size, effective_batch_size=2,
                 policies=[5, 7], diagnostic_only=True, finetune=False,
                 sources={p.relative_to(ROOT).as_posix(): file_sha256(p) for p in sources})
 
@@ -42,6 +43,29 @@ def validate_diagnostic_resume(checkpoint, identity, policy):
                 'numpy_rng', 'python_rng', 'loader_rng', 'args'}
     if not required <= checkpoint.keys():
         raise ValueError('Incomplete diagnostic resume state')
+    if identity.get('world_size', 1) > 1:
+        states = checkpoint.get('rank_states', [])
+        fields = {'torch_rng', 'cuda_rng', 'numpy_rng', 'python_rng', 'loader_rng'}
+        if len(states) != identity['world_size'] or any(not fields <= s.keys() for s in states):
+            raise ValueError('Incomplete per-rank diagnostic resume state')
+
+
+def capture_rank_state(generator):
+    import numpy as np
+    import torch
+    return dict(torch_rng=torch.get_rng_state(), cuda_rng=torch.cuda.get_rng_state_all(),
+                numpy_rng=np.random.get_state(), python_rng=random.getstate(),
+                loader_rng=generator.get_state())
+
+
+def restore_rank_state(state, generator):
+    import numpy as np
+    import torch
+    torch.set_rng_state(state['torch_rng'])
+    torch.cuda.set_rng_state_all(state['cuda_rng'])
+    np.random.set_state(state['numpy_rng'])
+    random.setstate(state['python_rng'])
+    generator.set_state(state['loader_rng'])
 
 
 def make_optimizer(model, args):
@@ -65,7 +89,7 @@ def make_optimizer(model, args):
 def run_policy(opt, identity, policy):
     import numpy as np
     import torch
-    from torch.utils.data import DataLoader, RandomSampler, SequentialSampler
+    from torch.utils.data import DataLoader, RandomSampler, SequentialSampler, DistributedSampler
     from datasets import build_dataset, get_coco_api_from_dataset
     from engine import train_one_epoch, evaluate
     from main import get_args_parser
@@ -75,6 +99,13 @@ def run_policy(opt, identity, policy):
     from tools.owod.gnn_calibration import load_detector, atomic_torch_save
     from tools.owod.strict_setting import configure_run, validate_checkpoint
     from util.misc import collate_fn
+
+    rank, world, gpu = opt.rank, opt.world_size, opt.gpu
+    distributed = world > 1
+
+    def write(path, value):
+        if rank == 0:
+            dump(path, value)
 
     directory = opt.output / f'v{policy}'
     directory.mkdir(exist_ok=True)
@@ -98,7 +129,7 @@ def run_policy(opt, identity, policy):
     args.coco_path = manifest['image_root']
     args.epochs = 3
     args.start_epoch = 0
-    args.batch_size = 2
+    args.batch_size = 2 // world
     args.num_workers = 2
     args.lr = 2e-4
     args.lr_backbone = 2e-5
@@ -106,10 +137,10 @@ def run_policy(opt, identity, policy):
     args.weight_decay = 1e-4
     args.sgd = False
     args.eval = False
-    args.distributed = False
-    args.world_size = 1
-    args.rank = 0
-    args.gpu = 0
+    args.distributed = distributed
+    args.world_size = world
+    args.rank = rank
+    args.gpu = gpu
     args.device = 'cuda'
     args.discovery_policy = 'v5'
     configure_run(args)
@@ -124,9 +155,10 @@ def run_policy(opt, identity, policy):
     np.random.seed(args.seed)
     random.seed(args.seed)
     torch.cuda.manual_seed_all(args.seed)
-    device = torch.device('cuda')
+    device = torch.device('cuda', gpu)
     path = directory / 'checkpoint.pth'
     restored = torch.load(path, map_location='cpu', weights_only=False) if opt.resume and path.exists() else None
+    resuming = restored is not None
     if restored:
         validate_diagnostic_resume(restored, identity, policy)
         if (restored['epoch'] == 2 and (directory / 'training_complete.json').is_file()
@@ -136,9 +168,15 @@ def run_policy(opt, identity, policy):
         # Reconstruct the diagnostic model from its own complete saved bank.
         model, criterion = load_detector(args, path, device)
         args = restored['args']
+        args.rank, args.gpu = rank, gpu
     else:
         model, criterion = load_detector(source, opt.checkpoint, device)
         layout, means, routes = prepare_task2(model, criterion, args, opt.checkpoint)
+        if distributed:
+            # Every rank enters calibration, whose criterion uses collectives.
+            packet = [(layout, means, routes)]
+            torch.distributed.broadcast_object_list(packet, src=0)
+            layout, means, routes = packet[0]
         model.promote({c: torch.tensor(v, device=device) for c, v in means.items()}, layout,
                       {c: [torch.tensor(v, device=device) for v in values] for c, values in routes.items()})
         args.graph_adapter_specs = [layout]
@@ -157,24 +195,31 @@ def run_policy(opt, identity, policy):
     criterion.weight_dict['loss_adapter_route'] = args.graph_route_loss_coef
     frozen, _ = load_detector(source, opt.checkpoint, device)
     frozen.eval().requires_grad_(False)
-    teacher = make_ema(model)
     optimizer = make_optimizer(model, args)
-    generator = torch.Generator().manual_seed(args.seed)
+    network = (torch.nn.parallel.DistributedDataParallel(model, device_ids=[gpu])
+               if distributed else model)
+    teacher = make_ema(model)
+    generator = torch.Generator().manual_seed(args.seed + rank)
     train = build_dataset('train', args)
     validation = build_dataset('val', args)
     # Reset shuffle and worker RNG independently of policy-specific model construction.
-    train_loader = DataLoader(train, batch_size=2, sampler=RandomSampler(train, generator=generator),
+    train_sampler = (DistributedSampler(train, num_replicas=world, rank=rank,
+                                       seed=args.seed, drop_last=True) if distributed
+                     else RandomSampler(train, generator=generator))
+    val_sampler = (DistributedSampler(validation, num_replicas=world, rank=rank, shuffle=False)
+                   if distributed else SequentialSampler(validation))
+    train_loader = DataLoader(train, batch_size=args.batch_size, sampler=train_sampler,
                               drop_last=True, num_workers=2, collate_fn=collate_fn,
                               pin_memory=True, generator=generator, multiprocessing_context='spawn')
     val_generator = torch.Generator().manual_seed(args.seed + 1)
-    val_loader = DataLoader(validation, batch_size=2, sampler=SequentialSampler(validation),
+    val_loader = DataLoader(validation, batch_size=args.batch_size, sampler=val_sampler,
                             num_workers=2, collate_fn=collate_fn, pin_memory=True,
                             generator=val_generator, multiprocessing_context='spawn')
     base_ds = get_coco_api_from_dataset(validation)
     postprocessors = {'bbox': DiscoveryPostProcess(known_ids=args.owod_known_class_ids,
                         max_detections=args.owod_max_detections,
                         unknown_threshold=args.unknown_threshold, scoring=args.discovery_scoring)}
-    dump(directory / 'run_config.json', vars(args))
+    write(directory / 'run_config.json', vars(args))
 
     def evaluate_now():
         return evaluate(model, criterion, postprocessors, val_loader, base_ds, device, str(directory),
@@ -189,23 +234,27 @@ def run_policy(opt, identity, policy):
         optimizer.load_state_dict(restored['optimizer'])
         teacher.load_state_dict(restored['discovery_ema'], strict=True)
         start = restored['epoch'] + 1
-        torch.set_rng_state(restored['torch_rng'])
-        torch.cuda.set_rng_state_all(restored['cuda_rng'])
-        np.random.set_state(restored['numpy_rng'])
-        random.setstate(restored['python_rng'])
-        generator.set_state(restored['loader_rng'])
+        restore_rank_state(restored['rank_states'][rank] if distributed else restored, generator)
         del restored
     else:
         criterion.epoch = 0
-        dump(directory / 'initial_metrics.json', evaluate_now())
+        write(directory / 'initial_metrics.json', evaluate_now())
         torch.manual_seed(args.seed)
         np.random.seed(args.seed)
         random.seed(args.seed)
         torch.cuda.manual_seed_all(args.seed)
+    if not resuming and distributed:
+        # Identical model initialization, distinct but policy-paired augmentation streams.
+        torch.manual_seed(args.seed + rank)
+        np.random.seed(args.seed + rank)
+        random.seed(args.seed + rank)
+        torch.cuda.manual_seed_all(args.seed + rank)
     for epoch in range(start, 3):
+        if distributed:
+            train_sampler.set_epoch(epoch)
         criterion.epoch = epoch
         started = time.monotonic()
-        stats = train_one_epoch(model, criterion, train_loader, optimizer, device, epoch,
+        stats = train_one_epoch(network, criterion, train_loader, optimizer, device, epoch,
                                 args.clip_max_norm, print_freq=100, teacher=frozen,
                                 distill_old_class_ids=args.owod_previous_class_ids,
                                 distill_class_coef=args.distill_class_coef,
@@ -215,20 +264,27 @@ def run_policy(opt, identity, policy):
                                 discovery_teacher=teacher)
         payload = dict(diagnostic_only=True, diagnostic_identity=identity, policy=policy,
                        epoch=epoch, args=args, model=model.state_dict(), optimizer=optimizer.state_dict(),
-                       discovery_ema=teacher.state_dict(), torch_rng=torch.get_rng_state(),
-                       cuda_rng=torch.cuda.get_rng_state_all(), numpy_rng=np.random.get_state(),
-                       python_rng=random.getstate(), loader_rng=generator.get_state())
-        atomic_torch_save(payload, path)
-        dump(directory / f'epoch_{epoch}.json', dict(epoch=epoch, train=stats,
+                       discovery_ema=teacher.state_dict(), **capture_rank_state(generator))
+        if distributed:
+            states = [None] * world
+            torch.distributed.all_gather_object(states, capture_rank_state(generator))
+            payload['rank_states'] = states
+        if rank == 0:
+            atomic_torch_save(payload, path)
+        write(directory / f'epoch_{epoch}.json', dict(epoch=epoch, train=stats,
              seconds=time.monotonic()-started, anonymous_support=model.memory.counts[91:].cpu().tolist(),
              recycle_count=int(model.memory.recycle_count) if policy == 7 else None))
         del payload
+        if distributed:
+            torch.distributed.barrier()
     criterion.epoch = 2
-    dump(directory / 'final_metrics.json', evaluate_now())
-    dump(directory / 'training_complete.json', dict(diagnostic_only=True, epoch=2, policy=policy))
+    write(directory / 'final_metrics.json', evaluate_now())
+    write(directory / 'training_complete.json', dict(diagnostic_only=True, epoch=2, policy=policy))
+    if distributed:
+        torch.distributed.barrier()
     for hook in hooks:
         hook.remove()
-    del model, criterion, teacher, frozen, optimizer
+    del network, model, criterion, teacher, frozen, optimizer
     gc.collect()
     torch.cuda.empty_cache()
 
@@ -242,19 +298,30 @@ def main():
     parser.add_argument('--resume', action='store_true')
     opt = parser.parse_args()
     import torch
-    if int(os.environ.get('WORLD_SIZE', 1)) != 1 or not torch.cuda.is_available() or torch.cuda.device_count() != 1:
-        parser.error('Requires exactly one visible CUDA GPU; do not use torchrun')
+    opt.world_size = int(os.environ.get('WORLD_SIZE', 1))
+    opt.rank = int(os.environ.get('RANK', 0))
+    opt.gpu = int(os.environ.get('LOCAL_RANK', 0))
+    if (opt.world_size not in (1, 2) or not torch.cuda.is_available()
+            or torch.cuda.device_count() != opt.world_size):
+        parser.error('Requires one GPU or two GPUs via torchrun; effective batch is fixed at 2')
+    torch.cuda.set_device(opt.gpu)
+    if opt.world_size > 1:
+        from datetime import timedelta
+        torch.distributed.init_process_group('nccl', timeout=timedelta(minutes=30))
     for field in ('manifest', 'checkpoint', 'gnn', 'output'):
         setattr(opt, field, getattr(opt, field).resolve())
-    identity = diagnostic_identity(opt.manifest, opt.checkpoint, opt.gnn)
+    identity = diagnostic_identity(opt.manifest, opt.checkpoint, opt.gnn, opt.world_size)
     opt.output.mkdir(parents=True, exist_ok=True)
     plan = opt.output / 'diagnostic_plan.json'
-    if plan.exists():
-        if not opt.resume or json.loads(plan.read_text()) != identity:
-            raise ValueError('Use --resume with unchanged code and inputs, or a new output directory')
-    elif any(opt.output.iterdir()):
-        raise ValueError('Use an empty diagnostic output directory')
-    dump(plan, identity)
+    if opt.rank == 0:
+        if plan.exists():
+            if not opt.resume or json.loads(plan.read_text()) != identity:
+                raise ValueError('Use --resume with unchanged code and inputs, or a new output directory')
+        elif any(opt.output.iterdir()):
+            raise ValueError('Use an empty diagnostic output directory')
+        dump(plan, identity)
+    if opt.world_size > 1:
+        torch.distributed.barrier()
     for policy in (5, 7):
         run_policy(opt, identity, policy)
     if (file_sha256(opt.checkpoint) != identity['checkpoint_sha256']
@@ -262,8 +329,11 @@ def main():
         raise ValueError('Parent artifacts changed during diagnostic')
     summary = {f'v{p}': {phase: json.loads((opt.output / f'v{p}' / f'{phase}_metrics.json').read_text())
                         for phase in ('initial', 'final')} for p in (5, 7)}
-    dump(opt.output / 'comparison.json', dict(diagnostic_only=True, results=summary))
-    print(json.dumps(summary, indent=2))
+    if opt.rank == 0:
+        dump(opt.output / 'comparison.json', dict(diagnostic_only=True, results=summary))
+        print(json.dumps(summary, indent=2))
+    if opt.world_size > 1:
+        torch.distributed.destroy_process_group()
 
 
 if __name__ == '__main__':
