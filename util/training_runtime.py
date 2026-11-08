@@ -1,5 +1,6 @@
 """Runtime optimizations that do not change the training recipe or state format."""
 from collections import defaultdict
+import json
 import os
 from pathlib import Path
 import tempfile
@@ -81,3 +82,33 @@ def loader_worker_options(num_workers):
     # Recreated workers must not fork a rank after CUDA has been initialized.
     # Keep non-persistent workers so epoch-level worker seeding is unchanged.
     return {'multiprocessing_context': 'spawn'} if num_workers > 0 else {}
+
+
+def training_epoch_limit(args):
+    """An execution pause never shortens the optimizer's registered schedule."""
+    budget = getattr(args, 'pause_after_epochs', 0)
+    if budget < 0 or budget > args.epochs:
+        raise ValueError('pause-after-epochs must be between 0 and the registered epoch count')
+    if budget and (not getattr(args, 'owod_manifest', '')
+                   or not getattr(args, 'owod_discovery', False)
+                   or getattr(args, 'owod_stage', None) != 0
+                   or getattr(args, 'owod_phase', None) != 'increment'
+                   or getattr(args, 'owod_screening', '')):
+        raise ValueError('pause-after-epochs is restricted to full-data discovery Task 1')
+    return budget or args.epochs
+
+
+def write_training_status(directory, epochs, last_epoch, seconds, merged_checkpoint=None):
+    """A paused stage must never acquire a completion marker."""
+    directory = Path(directory)
+    complete = last_epoch == epochs - 1
+    opposite = directory / ('training_paused.json' if complete else 'training_complete.json')
+    if opposite.exists():
+        opposite.unlink()
+    path = directory / ('training_complete.json' if complete else 'training_paused.json')
+    status = dict(epochs=epochs, last_epoch=last_epoch, training_time_seconds=int(seconds),
+                  merged_checkpoint=merged_checkpoint)
+    if not complete:
+        status.update(completed_epochs=last_epoch + 1, stage_complete=False,
+                      reason='execution_pause_budget', resumable=True)
+    path.write_text(json.dumps(status, indent=2) + '\n', encoding='utf-8')

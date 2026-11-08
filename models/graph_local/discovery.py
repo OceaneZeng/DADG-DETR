@@ -10,10 +10,13 @@ from .routed_adapter import ClassAdapter
 from .discovery_memory import PrototypeMemory, AffinityGraph, initialize_from_deltas
 from .discovery_candidates import mine_candidates
 from util import box_ops
+from models.segmentation import sigmoid_focal_loss
+from util.misc import get_world_size, is_dist_avail_and_initialized
 from util.training_runtime import gather_evidence, foreach_ema_parameters, copy_model_buffers
 
 DISCOVERY_VERSION = 5
 DISCOVERY_RAMP_VERSION = 6
+DISCOVERY_LOSS_VERSION = 7
 
 
 class DiscoveryFFN(nn.Module):
@@ -146,7 +149,9 @@ def pseudo_supervision_scale(epoch, warmup, ramp_epochs):
     return min(1., (epoch - warmup + 1) / ramp_epochs) if ramp_epochs else 1.
 
 
-def balanced_bce(logits, targets, weights, contribution_scale=None):
+def balanced_bce(logits, targets, weights, contribution_scale=None, normalization='weight-sum'):
+    if normalization not in ('weight-sum', 'count'):
+        raise ValueError('Unknown discovery BCE normalization')
     values = F.binary_cross_entropy_with_logits(logits, targets, reduction='none')
     if contribution_scale is not None:
         # Scale contributions AFTER fixing normalization. Scaling the weights
@@ -156,8 +161,29 @@ def balanced_bce(logits, targets, weights, contribution_scale=None):
     for mask in (targets > .5, targets <= .5):
         effective = weights * mask
         if effective.sum() > 0:
-            parts.append((values * effective).sum() / effective.sum())
+            # Count only supervised entries. Confidence stays in the numerator
+            # in v7, so low-confidence pseudo evidence reduces the whole group.
+            denominator = (effective.sum() if normalization == 'weight-sum'
+                           else ((weights > 0) & mask).sum())
+            parts.append((values * effective).sum() / denominator)
     return torch.stack(parts).mean() if parts else logits.sum() * 0
+
+
+def proposal_focal_loss(logits, foreground, weights, contribution_scale=None, alpha=.25):
+    """Dense selected-slot focal loss, normalized by DDP mean positive count.
+
+    Positive counts, rather than confidence sums or separate positive/negative
+    group means, fix the normalization. Pseudo confidence and the phase ramp
+    therefore remain actual contribution multipliers, including on empty ranks.
+    """
+    normalizer = foreground.sum().detach().to(dtype=torch.float32)
+    if is_dist_avail_and_initialized():
+        torch.distributed.all_reduce(normalizer)
+        normalizer /= get_world_size()
+    effective = weights if contribution_scale is None else weights * contribution_scale
+    return sigmoid_focal_loss(
+        logits[..., None], foreground[..., None].to(logits.dtype), normalizer.clamp_min(1),
+        alpha=alpha, gamma=2, query_weights=effective) * logits.shape[1]
 
 
 def proposal_supervision(positive, pseudo, confidence):
@@ -185,6 +211,12 @@ class DiscoveryCriterion(nn.Module):
         self.known_ids = list(args.owod_known_class_ids)
         self.warmup = args.discovery_warmup
         self.pseudo_ramp_epochs = getattr(args, 'discovery_pseudo_ramp_epochs', 0)
+        self.objectness_loss = getattr(args, 'discovery_objectness_loss', 'balanced-bce')
+        self.pseudo_normalization = getattr(args, 'discovery_pseudo_normalization', 'weight-sum')
+        if self.objectness_loss not in ('balanced-bce', 'focal'):
+            raise ValueError('Invalid discovery_objectness_loss')
+        if self.pseudo_normalization not in ('weight-sum', 'count'):
+            raise ValueError('Invalid discovery_pseudo_normalization')
         if self.pseudo_ramp_epochs < 0:
             raise ValueError('discovery_pseudo_ramp_epochs must be nonnegative')
         self.top_k = args.discovery_top_k
@@ -232,10 +264,16 @@ class DiscoveryCriterion(nn.Module):
             layer.pop('query_label_weights', None)
             prepared['aux_outputs'].append(layer)
         losses = self.base(prepared, targets)
-        losses['loss_objectness'] = balanced_bce(outputs['pred_objectness'], foreground.float(),
-                                                proposal_weights, contribution_scale)
+        if self.objectness_loss == 'focal':
+            losses['loss_objectness'] = proposal_focal_loss(
+                outputs['pred_objectness'], foreground, proposal_weights, contribution_scale,
+                alpha=self.base.focal_alpha)
+        else:
+            losses['loss_objectness'] = balanced_bce(outputs['pred_objectness'], foreground.float(),
+                                                    proposal_weights, contribution_scale)
         losses['loss_unknown'] = balanced_bce(outputs['pred_novelty'], pseudo.float(),
-                                             foreground_weights, contribution_scale)
+                                             foreground_weights, contribution_scale,
+                                             normalization=self.pseudo_normalization)
         route_target = torch.zeros_like(semantic)
         route_target[positive] = 1
         route_target[pseudo] = 2

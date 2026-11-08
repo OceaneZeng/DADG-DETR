@@ -142,6 +142,8 @@ def test_legacy_v5_metadata_without_ramp_option_can_still_be_compared(chains):
     checkpoint = Path(a['runs'][0]['output_dir']) / 'checkpoint.pth'
     saved = torch.load(checkpoint, weights_only=False)
     del saved['args'].discovery_pseudo_ramp_epochs
+    del saved['args'].discovery_objectness_loss, saved['args'].discovery_pseudo_normalization
+    del saved['args'].pause_after_epochs
     torch.save(saved, checkpoint)
     result = validate_discovery.compare_runs(before, after)
     assert len(result['comparisons']) == 7

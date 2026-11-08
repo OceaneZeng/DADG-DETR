@@ -28,7 +28,7 @@ from models import build_model
 from models.graph_local import (freeze_for_class_ids, inject_decoder_lora,
                                 merge_decoder_lora)
 from util.checkpoint import matching_state_dict
-from util.training_runtime import loader_worker_options
+from util.training_runtime import loader_worker_options, training_epoch_limit, write_training_status
 from util.experiment_log import (archive_log_file, experiment_log_path,
                                  prepare_log_file, start_file_logging,
                                  stop_file_logging)
@@ -59,6 +59,8 @@ def get_args_parser():
                         help='recompute encoder activations in backward to reduce peak memory')
     parser.add_argument('--weight_decay', default=1e-4, type=float)
     parser.add_argument('--epochs', default=50, type=int)
+    parser.add_argument('--pause-after-epochs', default=0, type=int,
+                        help='Pause full-data discovery Task 1 at this completed epoch count; 0 runs the full schedule')
     parser.add_argument('--lr_drop', default=40, type=int)
     parser.add_argument('--lr_drop_epochs', default=None, type=int, nargs='+')
     parser.add_argument('--clip_max_norm', default=0.1, type=float,
@@ -150,6 +152,10 @@ def get_args_parser():
     parser.add_argument('--discovery-warmup', type=int, default=1)
     parser.add_argument('--discovery-pseudo-ramp-epochs', type=int, default=0,
                         help='Experimental v6: ramp pseudo loss contributions after warmup; 0 preserves v5')
+    parser.add_argument('--discovery-objectness-loss', choices=('balanced-bce', 'focal'), default='balanced-bce',
+                        help='Experimental v7 selected-slot focal loss; default preserves v5/v6')
+    parser.add_argument('--discovery-pseudo-normalization', choices=('weight-sum', 'count'), default='weight-sum',
+                        help='Experimental v7 count normalization preserves absolute pseudo confidence for novelty')
     parser.add_argument('--discovery-top-k', type=int, default=5)
     parser.add_argument('--discovery-saliency-threshold', type=float, default=.65)
     parser.add_argument('--discovery-consistency-threshold', type=float, default=.5)
@@ -312,6 +318,10 @@ def main(args):
                        'discovery_supervision': 'dense selected-proposal objectness/router; foreground-only novelty',
                        'discovery_version': args.discovery_version,
                        'pseudo_ramp_epochs': args.discovery_pseudo_ramp_epochs,
+                       'objectness_loss': args.discovery_objectness_loss,
+                       'objectness_focal_alpha': args.focal_alpha if args.discovery_objectness_loss == 'focal' else None,
+                       'objectness_focal_gamma': 2 if args.discovery_objectness_loss == 'focal' else None,
+                       'pseudo_normalization': args.discovery_pseudo_normalization,
                        'implementation': 'project_research_method', 'paper_baseline': False}
         elif getattr(args, 'control_postprocess_version', None):
             profile = {'method': 'supervised-control', 'unknown_score': 'none; no unknown predictions',
@@ -727,7 +737,9 @@ def main(args):
             if 'discovery_ema' not in resumed:
                 raise ValueError('Discovery resume requires its saved EMA teacher')
             discovery_teacher.load_state_dict(resumed['discovery_ema'], strict=True)
-    for epoch in range(args.start_epoch, args.epochs):
+    end_epoch = training_epoch_limit(args)
+    last_epoch = args.start_epoch - 1
+    for epoch in range(args.start_epoch, end_epoch):
         epoch_state['value'] = epoch
         if args.paper_baseline or args.owod_discovery:
             criterion.epoch = epoch
@@ -757,7 +769,8 @@ def main(args):
         if args.output_dir:
             checkpoint_paths = [output_dir / 'checkpoint.pth']
             # extra checkpoint before LR drop and every 5 epochs
-            if (epoch + 1) % args.lr_drop == 0 or (epoch + 1) % 5 == 0:
+            if ((epoch + 1) % args.lr_drop == 0 or (epoch + 1) % 5 == 0
+                    or epoch + 1 == end_epoch < args.epochs):
                 checkpoint_paths.append(output_dir / f'checkpoint{epoch:04}.pth')
             for checkpoint_path in checkpoint_paths:
                 utils.save_on_master({
@@ -774,7 +787,7 @@ def main(args):
 
         should_evaluate = (not getattr(args, 'skip_eval', False) and
                             ((epoch + 1) % max(1, args.eval_interval) == 0
-                             or epoch + 1 == args.epochs))
+                             or epoch + 1 == end_epoch))
         if should_evaluate:
             test_stats, coco_evaluator = evaluate(
                 model, criterion, postprocessors, data_loader_val, base_ds, device, args.output_dir,
@@ -807,6 +820,7 @@ def main(args):
                     for name in filenames:
                         torch.save(coco_evaluator.coco_eval["bbox"].eval,
                                    output_dir / "eval" / name)
+        last_epoch = epoch
 
     if args.paper_baseline == 'ew-detr':
         beta = model_without_ddp.consolidate(args.ew_current_samples, args.ew_previous_samples)
@@ -842,11 +856,11 @@ def main(args):
                 'source_checkpoint': str(output_dir / 'checkpoint.pth'),
             }, output_dir / 'checkpoint_merged.pth')
             print('Merged {} LoRA linears into checkpoint_merged.pth'.format(merged_count))
-        with (output_dir / 'training_complete.json').open('w') as f:
-            json.dump({'epochs': args.epochs, 'last_epoch': args.epochs - 1,
-                       'training_time_seconds': int(total_time),
-                       'merged_checkpoint': ('checkpoint_merged.pth'
-                                             if args.neighbor_scoped_lora else None)}, f)
+        write_training_status(output_dir, args.epochs, last_epoch, total_time,
+                              'checkpoint_merged.pth' if args.neighbor_scoped_lora else None)
+    if last_epoch + 1 < args.epochs:
+        print(f'Training paused: completed_epochs={last_epoch + 1}/{args.epochs}; '
+              'checkpoint retained; stage is incomplete. Resume the unchanged plan to continue.', flush=True)
     for handle in classifier_hook_handles:
         handle.remove()
     stop_file_logging(file_log_state)

@@ -29,9 +29,11 @@ def validate_plan_arguments(run, saved):
     planned = get_args_parser().parse_args(command[index + 1:])
     configure_run(planned)
     for field, value in vars(planned).items():
-        if field in ('start_epoch', 'resume', 'dist_url'):
+        if field in ('start_epoch', 'resume', 'dist_url', 'pause_after_epochs'):
             continue  # resume advances this counter without changing the recipe
-        default = 0 if field == 'discovery_pseudo_ramp_epochs' else None
+        default = {'discovery_pseudo_ramp_epochs': 0,
+                   'discovery_objectness_loss': 'balanced-bce',
+                   'discovery_pseudo_normalization': 'weight-sum'}.get(field)
         if getattr(saved, field, default) != value:
             raise ValueError(f'Saved checkpoint differs from launch arguments: {field}')
     world_size = int(command[command.index('--nproc_per_node') + 1]) if '--nproc_per_node' in command else 1

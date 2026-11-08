@@ -10,6 +10,7 @@ WORKER = r'''
 import torch
 import torch.distributed as dist
 from util.training_runtime import gather_evidence
+from models.graph_local.discovery import proposal_focal_loss
 dist.init_process_group('gloo')
 rank = dist.get_rank()
 for sizes in ((0, 3), (2, 5), (0, 0)):
@@ -23,6 +24,17 @@ for sizes in ((0, 3), (2, 5), (0, 0)):
     for field in range(3):
         torch.testing.assert_close(actual[field], torch.cat([part[field] for part in reference]),
                                    rtol=0, atol=0)
+# One rank has no selected objects. The DDP mean of local gradients must
+# equal the global-positive-normalized objective over the concatenated batch.
+joined = torch.tensor([[.7, -.4, 1.1], [.4, -.8, -2.]], requires_grad=True)
+foreground = torch.tensor([[True, True, False], [False, False, False]])
+weights = torch.tensor([[1., .2, 1.], [1., 1., 1.]])
+reference_loss = proposal_focal_loss(joined, foreground, weights)
+reference_grad = torch.autograd.grad(reference_loss, joined)[0]
+local = joined.detach()[rank:rank + 1].clone().requires_grad_(True)
+loss = proposal_focal_loss(local, foreground[rank:rank + 1], weights[rank:rank + 1])
+grad = torch.autograd.grad(loss, local)[0]
+torch.testing.assert_close(grad / 2, reference_grad[rank:rank + 1])
 dist.destroy_process_group()
 '''
 

@@ -7,16 +7,29 @@ from tools.owod.protocol import file_sha256, stage_files, RETIRED_MESSAGE
 
 def configure_run(args):
     ramp_epochs = getattr(args, 'discovery_pseudo_ramp_epochs', 0)
+    objectness_loss = getattr(args, 'discovery_objectness_loss', 'balanced-bce')
+    pseudo_normalization = getattr(args, 'discovery_pseudo_normalization', 'weight-sum')
+    if objectness_loss not in ('balanced-bce', 'focal') or pseudo_normalization not in ('weight-sum', 'count'):
+        raise ValueError('Invalid discovery loss configuration')
+    loss_experiment = objectness_loss != 'balanced-bce' or pseudo_normalization != 'weight-sum'
+    if loss_experiment and not getattr(args, 'owod_discovery', False):
+        raise ValueError('Discovery loss options require discovery')
     if ramp_epochs < 0 or (ramp_epochs and not getattr(args, 'owod_discovery', False)):
         raise ValueError('discovery_pseudo_ramp_epochs must be nonnegative and requires discovery')
+    if getattr(args, 'pause_after_epochs', 0):
+        from util.training_runtime import training_epoch_limit
+        training_epoch_limit(args)
     if getattr(args, 'screen_no_distill', False) and not (
             getattr(args, 'owod_screening', '') and getattr(args, 'screen_branch_checkpoint', '')
             and args.owod_stage == 1 and getattr(args, 'owod_discovery', False)):
         raise ValueError('screen-no-distill requires shared-parent discovery screening Task 2')
     if getattr(args, 'owod_discovery', False):
-        from models.graph_local.discovery import DISCOVERY_VERSION, DISCOVERY_RAMP_VERSION
+        from models.graph_local.discovery import DISCOVERY_VERSION, DISCOVERY_RAMP_VERSION, DISCOVERY_LOSS_VERSION
         args.discovery_pseudo_ramp_epochs = ramp_epochs
-        args.discovery_version = DISCOVERY_RAMP_VERSION if ramp_epochs else DISCOVERY_VERSION
+        args.discovery_objectness_loss = objectness_loss
+        args.discovery_pseudo_normalization = pseudo_normalization
+        args.discovery_version = (DISCOVERY_LOSS_VERSION if loss_experiment else
+                                  DISCOVERY_RAMP_VERSION if ramp_epochs else DISCOVERY_VERSION)
         args.graph_routed_adapter = True
     requested = bool(args.owod_manifest or args.owod_known_class_ids is not None or args.paper_baseline
                      or getattr(args, 'graph_routed_adapter', False))
@@ -161,6 +174,13 @@ def validate_checkpoint(args, checkpoint, resume=False):
             raise ValueError('Discovery checkpoint cannot change discovery_scoring')
         if getattr(saved, 'discovery_pseudo_ramp_epochs', 0) != getattr(args, 'discovery_pseudo_ramp_epochs', 0):
             raise ValueError('Discovery checkpoint cannot change discovery_pseudo_ramp_epochs')
+        for field, default in (('discovery_objectness_loss', 'balanced-bce'),
+                               ('discovery_pseudo_normalization', 'weight-sum')):
+            if getattr(saved, field, default) != getattr(args, field, default):
+                raise ValueError(f'Discovery checkpoint cannot change {field}')
+        if (getattr(args, 'discovery_objectness_loss', 'balanced-bce') == 'focal'
+                and getattr(saved, 'focal_alpha', .25) != getattr(args, 'focal_alpha', .25)):
+            raise ValueError('Discovery checkpoint cannot change focal_alpha')
         for field in ('discovery_version', 'discovery_no_message',
                       'discovery_no_transfer', 'discovery_no_keep', 'discovery_capacity', 'discovery_min_support',
                       'discovery_transfer_threshold', 'discovery_warmup', 'discovery_top_k',

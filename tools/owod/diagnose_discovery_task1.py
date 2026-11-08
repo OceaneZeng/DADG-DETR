@@ -173,6 +173,8 @@ def main():
                           train_annotation_sha256=annotation_identity,
                           discovery_version=getattr(saved, 'discovery_version', None),
                           pseudo_ramp_epochs=getattr(saved, 'discovery_pseudo_ramp_epochs', 0),
+                          objectness_loss=getattr(saved, 'discovery_objectness_loss', 'balanced-bce'),
+                          pseudo_normalization=getattr(saved, 'discovery_pseudo_normalization', 'weight-sum'),
                           image_ids=image_ids, summary=summarize(rows), supervision=counts,
                           score_competition=summarize_competition(competition),
                           ema_candidates=dict(available=teacher is not None, images=candidate_rows,

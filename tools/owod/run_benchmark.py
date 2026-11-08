@@ -24,6 +24,10 @@ def build_plan(args):
     shared_gnn = getattr(args, 'screen_shared_gnn', None)
     no_distill = getattr(args, 'screen_no_distill', False)
     task1_only = getattr(args, 'task1_only', False)
+    pause_after = getattr(args, 'pause_after_epochs', 0)
+    if pause_after < 0 or (pause_after and (
+            not task1_only or not getattr(args, 'method', 'control').startswith('discovery'))):
+        raise ValueError('pause-after-epochs requires full-data discovery --task1-only and a nonnegative budget')
     if task1_only and (screening or shared or shared_gnn):
         raise ValueError('task1-only is for fresh full-data Task 1, not screening/shared-parent runs')
     if no_distill and not (screening and shared and shared_gnn and args.method == 'discovery'):
@@ -44,6 +48,8 @@ def build_plan(args):
             raise ValueError('OW-DETR Appendix D requires 20 finetuning epochs')
         if not args.backbone_weights:
             raise ValueError('Original OW-DETR recipe requires DINO --backbone-weights')
+    if pause_after > epochs:
+        raise ValueError('pause-after-epochs exceeds the registered training schedule')
     if manifest['protocol'] == 's-owodb' and not args.backbone_weights:
         raise ValueError('S-OWODB original recipe requires DINO backbone pretraining')
     if args.backbone_weights and not args.backbone_weights.is_file():
@@ -51,6 +57,12 @@ def build_plan(args):
     image_root = Path(manifest['image_root'])
     method = getattr(args, 'method', 'control')
     ramp_epochs = getattr(args, 'discovery_pseudo_ramp_epochs', 0)
+    objectness_loss = getattr(args, 'discovery_objectness_loss', 'balanced-bce')
+    pseudo_normalization = getattr(args, 'discovery_pseudo_normalization', 'weight-sum')
+    if objectness_loss not in ('balanced-bce', 'focal') or pseudo_normalization not in ('weight-sum', 'count'):
+        raise ValueError('Invalid discovery loss configuration')
+    if (objectness_loss != 'balanced-bce' or pseudo_normalization != 'weight-sum') and not method.startswith('discovery'):
+        raise ValueError('Discovery loss options require a discovery method')
     if ramp_epochs < 0 or (ramp_epochs and not method.startswith('discovery')):
         raise ValueError('discovery-pseudo-ramp-epochs must be nonnegative and requires a discovery method')
     if screening:
@@ -150,6 +162,10 @@ def build_plan(args):
                 # Keep legacy v5 command lists identical, including resume plans.
                 if ramp_epochs:
                     command += ['--discovery-pseudo-ramp-epochs', str(ramp_epochs)]
+                if objectness_loss != 'balanced-bce':
+                    command += ['--discovery-objectness-loss', objectness_loss]
+                if pseudo_normalization != 'weight-sum':
+                    command += ['--discovery-pseudo-normalization', pseudo_normalization]
                 if method == 'discovery-scratch':
                     command += ['--discovery-no-transfer']
                 if method == 'discovery-no-message':
@@ -180,6 +196,8 @@ def main(argv=None):
     parser.add_argument('--manifest', required=True, type=Path)
     parser.add_argument('--task1-only', action='store_true',
                         help='Train only full-data Task 1 and stop before any increment/calibration')
+    parser.add_argument('--pause-after-epochs', type=int, default=0,
+                        help='Pause discovery --task1-only at this completed epoch count without changing its plan')
     parser.add_argument('--owod-screening', type=Path)
     parser.add_argument('--screen-shared-task1', type=Path)
     parser.add_argument('--screen-shared-gnn', type=Path)
@@ -210,6 +228,8 @@ def main(argv=None):
     parser.add_argument('--discovery-scoring', choices=('hierarchical', 'focal'), default='hierarchical')
     parser.add_argument('--discovery-pseudo-ramp-epochs', type=int, default=0,
                         help='Experimental v6 pseudo loss ramp after warmup; default 0 keeps v5')
+    parser.add_argument('--discovery-objectness-loss', choices=('balanced-bce', 'focal'), default='balanced-bce')
+    parser.add_argument('--discovery-pseudo-normalization', choices=('weight-sum', 'count'), default='weight-sum')
     parser.add_argument('--graph-sketch-max-images', type=int, default=12)
     args = parser.parse_args(argv)
     if args.nproc_per_node < 1 or args.batch_size < 1 or (args.finetune_epochs is not None and args.finetune_epochs < 1):
@@ -226,7 +246,10 @@ def main(argv=None):
     plan = build_plan(args)
     if args.dry_run:
         for run in plan['runs']:
-            print(shlex.join(run['command']))
+            command = list(run['command'])
+            if args.pause_after_epochs and run.get('kind') != 'calibration':
+                command += ['--pause-after-epochs', str(args.pause_after_epochs)]
+            print(shlex.join(command))
         return 0
     root = args.output_dir / plan['protocol'] / f'seed_{args.seed}'
     plan_path = root / 'benchmark_plan.json'
@@ -260,6 +283,8 @@ def main(argv=None):
             raise ValueError(f'Invalid completion marker: {marker}')
         if args.resume and (directory / 'checkpoint.pth').is_file():
             command += ['--resume', str(directory / 'checkpoint.pth')]
+        if args.pause_after_epochs:
+            command += ['--pause-after-epochs', str(args.pause_after_epochs)]
         result = subprocess.run(command, cwd=ROOT, env=env)
         if result.returncode:
             return result.returncode
