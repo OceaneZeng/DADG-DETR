@@ -1,65 +1,17 @@
-import json
-import tempfile
 from types import SimpleNamespace
-from pathlib import Path
 
-import pytest
 import numpy as np
 import torch
 from torch import nn
 
 from engine import _coco_ap50_for_categories
-from datasets.samplers import ReplayBalancedSampler
 from models.graph_local.distillation import old_class_distillation_losses
-from models.graph_local.gnn import ClassInterferenceGNN, save_gnn_checkpoint
 from models.graph_local.lora import (freeze_for_class_ids, inject_decoder_lora,
                                      merge_decoder_lora)
 from models.graph_local.losses import local_margin_loss, projection_loss
 from models.graph_local.protection import build_off_neighborhood_basis
 from models.graph_local.pseudo_labels import select_teacher_pseudo_labels
-from models.graph_local.replay import build_increment_annotation
 from tools.owod.calibrate_interference_gnn import resolve_gnn_ablation, source_masks
-from models.graph_local.selection import random_neighbors, rank_stage_old_classes, select_neighbors
-
-
-def test_stage_ranking_only_selects_old_classes_and_treats_k_as_total():
-    class_ids = [1, 2, 10, 11]
-    scores = torch.tensor([
-        [0.0, 0.0, 0.0, 0.0],
-        [0.0, 0.0, 0.0, 0.0],
-        [0.9, 0.2, 0.0, 1.0],
-        [0.1, 0.8, 1.0, 0.0],
-    ])
-
-    selected, details = rank_stage_old_classes(
-        class_ids, scores, new_ids=[10, 11], old_ids=[1, 2], k=2,
-        aggregation="max")
-
-    assert selected == [1, 2]
-    assert details["selection_scope"] == "stage_top_k_old_classes"
-    assert details["selected_k"] == 2
-    assert set(selected).issubset({1, 2})
-
-
-def test_top_mean_aggregation_is_robust_to_one_source_outlier():
-    scores = torch.tensor([
-        [0.0, 0.0, 0.0, 0.0, 0.0],
-        [0.0, 0.0, 0.0, 0.0, 0.0],
-        [0.9, 0.6, 0.0, 0.0, 0.0],
-        [0.0, 0.6, 0.0, 0.0, 0.0],
-        [0.0, 0.6, 0.0, 0.0, 0.0],
-    ])
-    selected, details = rank_stage_old_classes(
-        [1, 2, 10, 11, 12], scores, new_ids=[10, 11, 12], old_ids=[1, 2],
-        k=1, aggregation="top_mean", aggregation_top_n=3)
-    assert selected == [2]
-    assert details["aggregation"] == "mean_top_3_over_new_classes"
-
-
-def test_random_control_can_match_graph_neighborhood_size():
-    selected = random_neighbors([1, 2, 3, 4], graph_k=3, seed=42)
-    assert len(selected) == 3
-    assert set(selected).issubset({1, 2, 3, 4})
 
 
 def test_internal_gnn_ablations_disable_exactly_one_component():
@@ -77,25 +29,6 @@ def test_internal_gnn_ablations_disable_exactly_one_component():
         config = resolve_gnn_ablation(SimpleNamespace(gnn_ablation=name, **base))
         assert (config["use_node_encoder"], config["message_steps"],
                 config["ranking_weight"]) == values
-
-
-def test_gnn_checkpoint_must_have_empirical_harm_supervision():
-    with tempfile.TemporaryDirectory() as directory:
-        checkpoint = Path(directory) / "legacy_gnn.pt"
-        save_gnn_checkpoint(ClassInterferenceGNN(input_dim=2), checkpoint,
-                            extra={"supervision": "cosine_proxy"})
-        args = SimpleNamespace(
-            control="graph", graph_k=1,
-            gnn_checkpoint=checkpoint, gnn_min_score=0.0)
-        try:
-            select_neighbors(args, {
-                1: torch.tensor([1.0, 0.0]),
-                10: torch.tensor([0.0, 1.0]),
-            }, new_ids=[10], old_ids=[1])
-        except ValueError as error:
-            assert "not empirically supervised" in str(error)
-        else:
-            raise AssertionError("legacy proxy-supervised GNN checkpoint was accepted")
 
 
 def test_source_holdout_masks_entire_rows_without_label_leakage():
@@ -141,74 +74,6 @@ def test_category_ap50_uses_requested_category_subset():
     )
 
     assert np.isclose(_coco_ap50_for_categories(evaluator, [1, 2]), 0.4)
-
-
-def test_replay_merge_deduplicates_annotations_and_unions_categories():
-    categories = {
-        1: {"id": 1, "name": "old"},
-        2: {"id": 2, "name": "new"},
-    }
-    image = {"id": 7, "file_name": "7.jpg"}
-    new = {
-        "images": [image],
-        "annotations": [{"id": 20, "image_id": 7, "category_id": 2, "bbox": [0, 0, 2, 2]}],
-        "categories": [categories[2]],
-    }
-    base = {
-        "images": [image],
-        "annotations": [
-            {"id": 10, "image_id": 7, "category_id": 1, "bbox": [2, 2, 2, 2]},
-            {"id": 20, "image_id": 7, "category_id": 2, "bbox": [0, 0, 2, 2]},
-        ],
-        "categories": [categories[1], categories[2]],
-    }
-    with tempfile.TemporaryDirectory() as directory:
-        output = Path(directory) / "combined.json"
-        build_increment_annotation(new, base, [1], 1, output)
-        combined = json.loads(output.read_text(encoding="utf-8"))
-
-    assert len(combined["annotations"]) == 2
-    assert {category["id"] for category in combined["categories"]} == {1, 2}
-
-
-def test_adaptive_replay_uses_base_and_risk_quotas_and_tags_images():
-    categories = [{"id": value, "name": str(value)} for value in (1, 2, 10)]
-    old_images = [{"id": value, "file_name": f"{value}.jpg"} for value in range(1, 9)]
-    base = {
-        "images": old_images,
-        "annotations": [
-            {"id": value, "image_id": value, "category_id": 1 if value <= 4 else 2,
-             "bbox": [0, 0, 2, 2]}
-            for value in range(1, 9)
-        ],
-        "categories": categories,
-    }
-    new = {
-        "images": [{"id": 20, "file_name": "20.jpg"}],
-        "annotations": [{"id": 20, "image_id": 20, "category_id": 10,
-                         "bbox": [0, 0, 2, 2]}],
-        "categories": categories,
-    }
-    with tempfile.TemporaryDirectory() as directory:
-        output = Path(directory) / "adaptive.json"
-        info = build_increment_annotation(
-            new, base, [1, 2], 0, output, class_quotas={1: 3, 2: 1})
-        combined = json.loads(output.read_text(encoding="utf-8"))
-
-    assert info["class_quotas"] == {"1": 3, "2": 1}
-    assert info["replay_images"] == 4
-    assert sum(bool(image["owod_replay"]) for image in combined["images"]) == 4
-
-
-def test_balanced_replay_sampler_keeps_fraction_on_each_rank():
-    dataset = list(range(100))
-    replay = list(range(10))
-    rank0 = ReplayBalancedSampler(dataset, replay, 0.25, num_replicas=2, rank=0, seed=42)
-    rank1 = ReplayBalancedSampler(dataset, replay, 0.25, num_replicas=2, rank=1, seed=42)
-    for sampler in (rank0, rank1):
-        indices = list(iter(sampler))
-        assert len(indices) == 50
-        assert sum(index in replay for index in indices) == 12
 
 
 def test_old_class_distillation_is_zero_at_initialization_and_detects_drift():

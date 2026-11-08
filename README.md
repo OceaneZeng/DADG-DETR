@@ -4,7 +4,8 @@
 **S-OWODB（OW-DETR，CVPR 2022 附录 A.2）**。更新于 2026-10-08。
 
 [协议来源与评估定义](docs/owod-benchmarks.md) ·
-[数据准备操作指南](docs/data-preparation.md) · [项目目录](docs/project-layout.md)。
+[数据准备操作指南](docs/data-preparation.md) · [项目目录](docs/project-layout.md) ·
+[可选的本地 paper-baseline](docs/paper-baselines.md)。
 
 - M 的新增类别数为 20/20/20/20；S 为 19/21/20/20。
 - 固定作者类别顺序和 ImageSets；禁止自定义或随机重划分。

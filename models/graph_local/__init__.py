@@ -22,13 +22,10 @@ from .losses import local_margin_loss, projection_loss, weighted_detection_loss
 from .protection import build_off_neighborhood_basis
 from .pseudo_labels import select_teacher_pseudo_labels
 from .distillation import old_class_distillation_losses
-from .replay import (build_increment_annotation, select_replay_images,
-                     select_replay_images_by_quota)
 
 __all__ = [
     "LoRALinear",
     "ClassInterferenceGNN",
-    "build_increment_annotation",
     "build_off_neighborhood_basis",
     "compress_gradient_sketches",
     "expand_classification_head",
@@ -44,8 +41,6 @@ __all__ = [
     "old_class_distillation_losses",
     "projection_loss",
     "select_gnn_neighbors",
-    "select_replay_images",
-    "select_replay_images_by_quota",
     "select_teacher_pseudo_labels",
     "save_gnn_checkpoint",
     "weighted_detection_loss",

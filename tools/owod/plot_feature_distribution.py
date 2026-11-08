@@ -101,7 +101,6 @@ def detector_args_from_config(config: Mapping, cli_args):
     detector_args.masks = False
     detector_args.cache_mode = False
     detector_args.paper_baseline = None
-    detector_args.with_tree = False
     if not detector_args.coco_path:
         raise ValueError("run_config.json does not contain coco_path")
     if not detector_args.val_ann:

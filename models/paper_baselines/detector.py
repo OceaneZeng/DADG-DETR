@@ -296,7 +296,7 @@ def build(args):
     if args.paper_baseline == 'ew-detr' and args.replay_sampling_fraction:
         raise ValueError('EW-DETR is exemplar-free; replay is not allowed')
     if ((args.lr_backbone == 0 and not getattr(args, 'no_pretrained_backbone', False))
-            or args.with_tree or args.neighbor_scoped_lora
+            or args.neighbor_scoped_lora
             or args.teacher_completion or args.old_class_distillation or args.masks
             or args.two_stage or args.with_box_refine or args.num_feature_levels < 3
             or args.local_margin_coef or args.off_projection_coef):

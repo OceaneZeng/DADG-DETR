@@ -56,6 +56,9 @@
   "relocated_files": {
     "tools/owod/plot_replay_comparison.py": "tools/analysis/plot_replay_comparison.py"
   },
+  "reintroduced_files": {
+    "docs/paper-baselines.md": "Current boundary documentation for the retained optional local paper-baseline implementations (2026-11-08)"
+  },
   "preserved": [
     "baselines",
     "exps",

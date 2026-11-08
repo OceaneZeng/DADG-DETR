@@ -104,7 +104,7 @@ class StrictSettingTests(unittest.TestCase):
             args = arguments(path, stage=1, phase='finetune')
             args.pretrained = 'increment.pth'
             args.graph_routed_adapter = True
-            args.with_tree = args.neighbor_scoped_lora = args.reset_classifier = args.masks = args.two_stage = False
+            args.neighbor_scoped_lora = args.reset_classifier = args.masks = args.two_stage = False
             args.frozen_weights = None
             args.off_projection_coef = 0
             args.dec_layers = 6

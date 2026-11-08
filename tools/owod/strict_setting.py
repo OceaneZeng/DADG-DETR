@@ -109,7 +109,7 @@ def configure_run(args):
             args.old_class_distillation = False
             args.distill_old_class_ids = []
     if getattr(args, 'graph_routed_adapter', False):
-        if (args.with_tree or args.paper_baseline or args.neighbor_scoped_lora
+        if (args.paper_baseline or args.neighbor_scoped_lora
                 or args.reset_classifier or args.frozen_weights or args.masks
                 or args.two_stage or args.off_projection_coef):
             raise ValueError('Graph-routed adapters require the plain one-stage detector without legacy LoRA')

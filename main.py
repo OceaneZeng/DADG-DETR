@@ -70,8 +70,6 @@ def get_args_parser():
     # Variants of Deformable DETR
     parser.add_argument('--with_box_refine', default=False, action='store_true')
     parser.add_argument('--two_stage', default=False, action='store_true')
-    parser.add_argument('--with_tree', action='store_true',
-                        help='Enable the experimental Tree-DETR EE-0 flat-tree losses and adapters')
     parser.add_argument('--paper-baseline', choices=('ow-detr', 'prob', 'owobj', 'cat', 'ew-detr'), default=None)
     parser.add_argument('--ow-pseudo-warmup', type=int, default=9)
     parser.add_argument('--ow-top-unknown', type=int, default=5)
@@ -351,10 +349,6 @@ def main(args):
     np.random.seed(seed)
     random.seed(seed)
 
-    # Keep the original detector path as the default.  The opt-in tree path is
-    # currently the EE-0 flat-tree control, not an automatically induced tree.
-    epoch_state = {'value': args.start_epoch}
-    tree_head = None
     if args.owod_discovery:
         from models.graph_local.discovery import build as build_discovery
         model, criterion, postprocessors = build_discovery(args)
@@ -362,11 +356,6 @@ def main(args):
         from models.paper_baselines import build as build_paper_baseline
         model, criterion, postprocessors = build_paper_baseline(args)
         print('Controlled paper adaptation:', args.paper_baseline)
-    elif args.with_tree:
-        from models.tree import build_tree
-        model, criterion, postprocessors, tree_head = build_tree(
-            args, epoch_getter=lambda: epoch_state['value'])
-        print('Tree-DETR enabled: EE-0 flat two-level tree with reserved-gap losses.')
     else:
         model, criterion, postprocessors = build_model(args)
     model.to(device)
@@ -378,8 +367,6 @@ def main(args):
     off_neighborhood_basis = None
     output_dir = Path(args.output_dir)
 
-    if args.neighbor_scoped_lora and args.with_tree:
-        raise ValueError('--neighbor-scoped-lora currently requires the Deformable DETR path')
     if args.neighbor_scoped_lora and not args.trainable_class_ids:
         raise ValueError('--neighbor-scoped-lora requires --trainable-class-ids')
     if args.lora_train_detection_heads and not args.neighbor_scoped_lora:
@@ -523,7 +510,7 @@ def main(args):
 
     n_parameters = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print('number of trainable params:', n_parameters)
-    if args.lr_backbone == 0 and not args.with_tree:
+    if args.lr_backbone == 0:
         detector = model_without_ddp.detr if hasattr(model_without_ddp, 'detr') else model_without_ddp
         backbone_trainable = sum(p.numel() for p in detector.backbone.parameters() if p.requires_grad)
         if backbone_trainable:
@@ -741,7 +728,6 @@ def main(args):
                 raise ValueError('Discovery resume requires its saved EMA teacher')
             discovery_teacher.load_state_dict(resumed['discovery_ema'], strict=True)
     for epoch in range(args.start_epoch, args.epochs):
-        epoch_state['value'] = epoch
         if args.paper_baseline or args.owod_discovery:
             criterion.epoch = epoch
         if args.distributed:
