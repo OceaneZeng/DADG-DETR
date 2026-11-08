@@ -178,6 +178,26 @@ def proposal_supervision(positive, pseudo, confidence):
     return foreground, foreground_weights, proposal_weights
 
 
+def novelty_supervision(foreground, pseudo, background, confidence,
+                        include_background_negative=False):
+    """Build conditional novelty weights without treating every unmatched slot as background.
+
+    ``background`` is deliberately restricted to the conservative, low-saliency
+    candidates produced by :func:`mine_candidates`.  It is never used as a
+    positive proposal or as a known-class target.  The opt-in negative branch
+    therefore adds only those trusted slots to the novelty BCE; all other
+    unmatched queries remain ignored by the novelty head.
+    """
+    foreground_weights = torch.where(
+        foreground & ~pseudo, torch.ones_like(confidence),
+        torch.where(pseudo, confidence, torch.zeros_like(confidence)))
+    trusted_background = background & ~foreground
+    novelty_weights = foreground_weights
+    if include_background_negative:
+        novelty_weights = novelty_weights + trusted_background.float()
+    return novelty_weights, trusted_background
+
+
 class DiscoveryCriterion(nn.Module):
     def __init__(self, base, model, args):
         super().__init__()
@@ -191,6 +211,8 @@ class DiscoveryCriterion(nn.Module):
         self.consistency_threshold = args.discovery_consistency_threshold
         self.epoch = 0
         self.revision = getattr(args, 'discovery_version', 5)
+        self.trusted_background_negative = bool(
+            getattr(args, 'discovery_trusted_background_negative', False))
         self.old_ids = list(getattr(args, 'owod_previous_class_ids', []) or [])
         self.evidence = None
         self.weight_dict.update(loss_objectness=1., loss_unknown=1., loss_discovery_route=1.,
@@ -226,13 +248,18 @@ class DiscoveryCriterion(nn.Module):
             semantic[batch, queries] = targets[batch]['labels'][matches]
         foreground, foreground_weights, proposal_weights = proposal_supervision(
             positive, pseudo, confidence)
+        novelty_weights, trusted_background = novelty_supervision(
+            foreground, pseudo, background, confidence,
+            include_background_negative=self.trusted_background_negative)
         # Known-class membership and foreground existence are different targets.
         # Keep standard one-to-one DETR supervision over ALL queries for released
         # classes. An unmatched query is a negative for those classes, not a
         # claim that its region contains no (possibly unknown) object. Masking
         # this loss with discovery trust removes duplicate/background suppression.
-        # Novelty uses selected foreground only; objectness and routing learn
-        # one-to-one proposal selection, including unselected-query negatives.
+        # Novelty uses selected foreground only by default.  The optional
+        # trusted-background branch adds a conservative subset of negatives;
+        # objectness and routing always learn one-to-one proposal selection,
+        # including unselected-query negatives.
         prepared = dict(outputs)
         prepared.pop('query_label_weights', None)
         prepared['aux_outputs'] = []
@@ -242,7 +269,7 @@ class DiscoveryCriterion(nn.Module):
             prepared['aux_outputs'].append(layer)
         losses = self.base(prepared, targets)
         losses['loss_objectness'] = balanced_bce(outputs['pred_objectness'], foreground.float(), proposal_weights)
-        losses['loss_unknown'] = balanced_bce(outputs['pred_novelty'], pseudo.float(), foreground_weights)
+        losses['loss_unknown'] = balanced_bce(outputs['pred_novelty'], pseudo.float(), novelty_weights)
         route_target = torch.zeros_like(semantic)
         route_target[positive] = 1
         route_target[pseudo] = 2
@@ -270,14 +297,17 @@ class DiscoveryCriterion(nn.Module):
         losses['loss_affinity'] = (F.cross_entropy(affinity[anchor] / .1, semantic[anchor])
                                    if anchor.any() else affinity.sum() * 0)
         losses['discovery_pseudo_count'] = pseudo.sum().float()
-        # v5 ignores unselected slots for conditional novelty only. Classification,
-        # objectness and routing all receive dense proposal supervision.
+        # v5 ignores unselected slots for conditional novelty only unless the
+        # explicitly recorded trusted-background experiment is enabled.
+        # Classification, objectness and routing receive dense proposal
+        # supervision in both modes.
         losses['discovery_ignored_fraction'] = (~foreground).float().mean()
         losses['discovery_known_supervised_fraction'] = confidence.new_ones(())
         losses['discovery_objectness_supervised_fraction'] = (proposal_weights > 0).float().mean()
-        losses['discovery_novelty_supervised_fraction'] = (foreground_weights > 0).float().mean()
+        losses['discovery_novelty_supervised_fraction'] = (novelty_weights > 0).float().mean()
         losses['discovery_proposal_negative_fraction'] = (~foreground).float().mean()
         losses['discovery_background_fraction'] = background.float().mean()
+        losses['discovery_background_negative_fraction'] = trusted_background.float().mean()
         losses['discovery_positive_fraction'] = positive.float().mean()
         if self.training:
             accepted = positive | pseudo
@@ -310,7 +340,14 @@ class DiscoveryPostProcess(PostProcess):
         probabilities = known * known_mass[..., None]
         categories = torch.tensor(self.known_ids, device=known.device)
         if len(self.known_ids) < 80:
-            probabilities = torch.cat([probabilities, unknown[..., None]], -1)
+            # The threshold is part of the OWOD decision rule.  Mask unknown
+            # candidates before the shared Top-K so a low-score unknown cannot
+            # displace a known detection and later be counted by the author
+            # evaluator merely because it carried label 91.
+            masked_unknown = torch.where(
+                unknown >= self.unknown_threshold, unknown,
+                torch.full_like(unknown, float('-inf')))
+            probabilities = torch.cat([probabilities, masked_unknown[..., None]], -1)
             categories = torch.cat([categories, categories.new_tensor([91])])
         values, positions = probabilities.flatten(1).topk(min(self.max_detections, probabilities[0].numel()), dim=1)
         queries = positions // len(categories)
@@ -320,8 +357,23 @@ class DiscoveryPostProcess(PostProcess):
         h, w = target_sizes.unbind(1)
         boxes *= torch.stack([w, h, w, h], -1)[:, None]
         unknown = unknown.gather(1, queries)
-        return [dict(scores=s, labels=l, boxes=b, unknown_scores=u,
-                     unknown_mask=u >= self.unknown_threshold) for s, l, b, u in zip(values, labels, boxes, unknown)]
+        results = []
+        for scores, labels_row, boxes_row, unknown_row in zip(values, labels, boxes, unknown):
+            # If an image has fewer valid candidates than max_detections,
+            # Top-K fills the tail with the -inf sentinels above.  Drop those
+            # entries instead of returning fake unknown detections.
+            keep = torch.isfinite(scores)
+            scores = scores[keep]
+            labels_row = labels_row[keep]
+            boxes_row = boxes_row[keep]
+            unknown_row = unknown_row[keep]
+            results.append(dict(
+                scores=scores,
+                labels=labels_row,
+                boxes=boxes_row,
+                unknown_scores=unknown_row,
+                unknown_mask=unknown_row >= self.unknown_threshold))
+        return results
 
 
 def build(args):

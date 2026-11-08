@@ -39,6 +39,24 @@ class AuthorEvaluationTests(unittest.TestCase):
         self.assertEqual(stats['unknown_precision'], 1.)
         self.assertEqual(stats['a_ose'], 0.)
 
+    def test_unknown_threshold_is_defensive_for_external_predictions(self):
+        anns = [
+            {'category_id': 1, 'voc_bbox': [1, 1, 10, 10], 'difficult': False},
+            {'category_id': 5, 'voc_bbox': [21, 1, 30, 10], 'difficult': False},
+        ]
+        coco = SimpleNamespace(imgs={1: {'owod_source_id': 'one'}}, imgToAnns={1: anns})
+        predictions = {1: {
+            'labels': torch.tensor([91, 1]),
+            'boxes': torch.tensor([[20, 0, 30, 10], [0, 0, 10, 10]], dtype=torch.float64),
+            'scores': torch.tensor([.99, .9]),
+            'unknown_scores': torch.tensor([.2, .2]),
+        }}
+        spec = {**specification('m-owodb'), 'image_source_ids': ['one']}
+        stats = evaluate_author_benchmark(predictions, coco, [1], [], [1], spec,
+                                          unknown_threshold=.5)
+        self.assertEqual(stats['unknown_predictions'], 0.)
+        self.assertEqual(stats['u_recall'], 0.)
+
     def test_aose_counts_misclassified_predictions_and_wi_uses_known_curve(self):
         stats = self.evaluate([(1, [1, 1, 10, 10], False), (5, [21, 1, 30, 10], False)],
                               [1, 1, 1], [[20, 0, 30, 10], [20, 0, 30, 10], [0, 0, 10, 10]],

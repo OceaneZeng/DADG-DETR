@@ -340,7 +340,8 @@ def evaluate(model, criterion, postprocessors, data_loader, base_ds, device, out
             by_image.setdefault(int(target['image_id'].item()), prediction)
         benchmark_stats = evaluate_author_benchmark(
             by_image, base_ds, owod_known_class_ids, owod_previous_class_ids or [],
-            owod_current_class_ids or [], owod_specification)
+            owod_current_class_ids or [], owod_specification,
+            unknown_threshold=owod_unknown_threshold)
         stats.update({'owod_' + key: value for key, value in benchmark_stats.items()})
         print('Author OWOD protocol metrics:', benchmark_stats)
     return stats, coco_evaluator

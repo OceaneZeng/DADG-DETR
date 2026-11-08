@@ -34,7 +34,7 @@ def overlaps(box, boxes):
 
 
 def evaluate_author_benchmark(predictions, coco, known_ids, previous_ids, current_ids,
-                              specification):
+                              specification, unknown_threshold=None):
     known = set(known_ids)
     gt, source_to_id = {}, {}
     for image_id, image in coco.imgs.items():
@@ -54,10 +54,23 @@ def evaluate_author_benchmark(predictions, coco, known_ids, previous_ids, curren
     # is removed in engine.py before applying official list multiplicity here.
     for image_id in sequence:
         prediction = predictions[image_id]
-        for score, label, box in zip(prediction['scores'].tolist(),
-                                     prediction['labels'].tolist(), prediction['boxes'].tolist()):
+        unknown_scores = prediction.get('unknown_scores')
+        unknown_mask = prediction.get('unknown_mask')
+        for index, (score, label, box) in enumerate(zip(prediction['scores'].tolist(),
+                                                        prediction['labels'].tolist(),
+                                                        prediction['boxes'].tolist())):
             label = int(label)
             if label == 91:
+                if unknown_threshold is not None:
+                    if unknown_mask is not None:
+                        value = unknown_mask[index]
+                        accepted = bool(value.item() if hasattr(value, 'item') else value)
+                    elif unknown_scores is not None:
+                        accepted = float(unknown_scores[index]) >= float(unknown_threshold)
+                    else:
+                        accepted = True
+                    if not accepted:
+                        continue
                 label = -1
             elif label not in known:
                 raise ValueError(f'Prediction uses an unseen or invalid category: {label}')

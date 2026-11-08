@@ -15,6 +15,8 @@ def configure_run(args):
         args.discovery_version = (6 if getattr(args, 'discovery_policy', 'v5') == 'v6'
                                   else DISCOVERY_VERSION)
         args.graph_routed_adapter = True
+    elif getattr(args, 'discovery_trusted_background_negative', False):
+        raise ValueError('--discovery-trusted-background-negative requires --owod-discovery')
     requested = bool(args.owod_manifest or args.owod_known_class_ids is not None or args.paper_baseline
                      or getattr(args, 'graph_routed_adapter', False))
     if not requested:
@@ -162,8 +164,10 @@ def validate_checkpoint(args, checkpoint, resume=False):
                       'discovery_no_transfer', 'discovery_no_keep', 'discovery_capacity', 'discovery_min_support',
                       'discovery_transfer_threshold', 'discovery_warmup', 'discovery_top_k',
                       'discovery_saliency_threshold', 'discovery_consistency_threshold',
+                      'discovery_trusted_background_negative',
                       'distill_class_coef', 'distill_bbox_coef', 'distill_score_threshold', 'distill_max_queries'):
-            if getattr(saved, field, None) != getattr(args, field, None):
+            default = False if field == 'discovery_trusted_background_negative' else None
+            if getattr(saved, field, default) != getattr(args, field, default):
                 raise ValueError(f'Discovery checkpoint cannot change {field}')
     if bool(getattr(saved, 'graph_routed_adapter', False)) != bool(getattr(args, 'graph_routed_adapter', False)):
         raise ValueError('Cannot switch graph adapter method within the checkpoint chain')

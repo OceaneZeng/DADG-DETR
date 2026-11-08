@@ -6,7 +6,8 @@ import torch
 from torch import nn
 
 from models.graph_local.discovery import (DiscoveryCriterion, DiscoveryDetector,
-                                         DiscoveryFFN, DiscoveryPostProcess, balanced_bce)
+                                         DiscoveryFFN, DiscoveryPostProcess, balanced_bce,
+                                         novelty_supervision)
 from models.graph_local.discovery_candidates import flip_samples, mine_candidates
 from models.graph_local.discovery_memory import PrototypeMemory, initialize_from_deltas
 from models.graph_local.routed_adapter import ClassAdapter, append_stage
@@ -21,7 +22,8 @@ def args():
                           discovery_transfer_threshold=.5, discovery_min_support=1.,
                           hidden_dim=4, discovery_capacity=2, graph_adapter_last_n=1,
                           graph_adapter_rank=2, discovery_warmup=0, discovery_top_k=5,
-                          discovery_saliency_threshold=.65, discovery_consistency_threshold=.5)
+                          discovery_saliency_threshold=.65, discovery_consistency_threshold=.5,
+                          discovery_trusted_background_negative=False)
 
 
 def evidence():
@@ -54,7 +56,8 @@ def test_objectness_prevents_background_from_becoming_unknown():
     result = DiscoveryPostProcess(known_ids=[1], max_detections=6)(outputs, torch.tensor([[100, 100]]))[0]
     unknown = result['scores'][result['labels'] == 91].sort(descending=True).values
     assert unknown[0] > .99
-    assert unknown[1] < 1e-4 and unknown[2] < 1e-4
+    assert len(unknown) == 1
+    assert result['unknown_mask'][result['labels'] == 91].all()
 
 
 def test_focal_scoring_preserves_known_sigmoid_without_novelty_veto():
@@ -62,7 +65,8 @@ def test_focal_scoring_preserves_known_sigmoid_without_novelty_veto():
     outputs['pred_logits'] = torch.zeros(1, 3, 7)
     outputs['pred_objectness'] = torch.zeros(1, 3)
     outputs['pred_novelty'] = torch.full((1, 3), 8.)
-    result = DiscoveryPostProcess(known_ids=[1, 2], max_detections=9, scoring='focal')(
+    result = DiscoveryPostProcess(known_ids=[1, 2], max_detections=9, scoring='focal',
+                                 unknown_threshold=.4)(
         outputs, torch.tensor([[100, 100]]))[0]
     assert torch.allclose(result['scores'][result['labels'] != 91], torch.full((6,), .25))
     assert torch.allclose(result['scores'][result['labels'] == 91], .5 * torch.sigmoid(torch.full((3,), 8.)))
@@ -191,6 +195,31 @@ def test_novelty_is_conditional_on_selected_foreground_and_router_rejects_other_
     router_grad = outputs['discovery_routes'][0].grad
     assert router_grad[0, 2, 0] < 0  # Reject unselected slot via null/background route.
     assert router_grad[0, 1, 2] < 0
+
+
+def test_trusted_background_can_be_opted_into_novelty_negative_supervision():
+    outputs, targets = evidence()
+    base = SetCriterion(7, HungarianMatcher(), {}, ['labels', 'boxes'])
+    base.active_class_ids = [1]
+    configured = args()
+    configured.discovery_trusted_background_negative = True
+    losses = DiscoveryCriterion(base, None, configured)(outputs, targets)
+    losses['loss_unknown'].backward()
+    # Query 2 is the conservative low-saliency background candidate in the
+    # fixture.  A target of zero at logit 0 has a positive gradient.
+    assert outputs['pred_novelty'].grad[0, 2] > 0
+    assert losses['discovery_background_negative_fraction'] > 0
+    assert losses['discovery_novelty_supervised_fraction'] > losses['discovery_positive_fraction']
+
+
+def test_novelty_supervision_keeps_untrusted_unmatched_queries_ignored():
+    foreground = torch.tensor([[True, False, False]])
+    pseudo = torch.tensor([[False, False, False]])
+    background = torch.tensor([[False, False, True]])
+    confidence = torch.ones(1, 3)
+    weights, trusted = novelty_supervision(foreground, pseudo, background, confidence)
+    assert weights.tolist() == [[1., 0., 0.]]
+    assert trusted.tolist() == [[False, False, True]]
 
 
 @pytest.mark.parametrize('all_empty', [False, True])

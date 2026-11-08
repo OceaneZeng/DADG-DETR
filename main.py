@@ -153,6 +153,8 @@ def get_args_parser():
     parser.add_argument('--discovery-top-k', type=int, default=5)
     parser.add_argument('--discovery-saliency-threshold', type=float, default=.65)
     parser.add_argument('--discovery-consistency-threshold', type=float, default=.5)
+    parser.add_argument('--discovery-trusted-background-negative', action='store_true',
+                        help='opt in to novelty=0 supervision only for conservative low-saliency background slots')
     parser.add_argument('--lora-rank', default=8, type=int)
     parser.add_argument('--lora-last-decoder-layers', default=2, type=int)
     parser.add_argument('--lora-train-detection-heads', action='store_true',
@@ -305,6 +307,7 @@ def main(args):
                     'paper_comparable': False} if args.paper_baseline else detector_profile_dict())
         if args.owod_discovery:
             profile = {'method': 'discovery', 'unknown_score': 'objectness * novelty',
+                       'unknown_threshold_stage': 'pre_topk',
                        'known_score': ('objectness * (1 - novelty) * softmax(known_logits)'
                                        if args.discovery_scoring == 'hierarchical' else
                                        'objectness * sigmoid(known_logits)'),
@@ -317,6 +320,10 @@ def main(args):
                            router_supervision=('balanced-three-groups' if args.discovery_version >= 6
                                                else 'proposal-weighted'),
                            old_target_completion=args.discovery_version >= 6)
+            if getattr(args, 'discovery_trusted_background_negative', False):
+                profile['discovery_supervision'] = (
+                    'dense selected-proposal objectness/router; selected foreground plus trusted-background novelty negatives')
+                profile['trusted_background_negative'] = True
         elif getattr(args, 'control_postprocess_version', None):
             profile = {'method': 'supervised-control', 'unknown_score': 'none; no unknown predictions',
                        'postprocess_version': args.control_postprocess_version,

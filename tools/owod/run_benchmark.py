@@ -144,6 +144,8 @@ def build_plan(args):
                 if no_distill:
                     command += ['--screen-no-distill']
                 command += ['--owod-discovery', '--discovery-scoring', getattr(args, 'discovery_scoring', 'hierarchical')]
+                if getattr(args, 'discovery_trusted_background_negative', False):
+                    command += ['--discovery-trusted-background-negative']
                 if getattr(args, 'discovery_policy', 'v5') == 'v6':
                     command += ['--discovery-policy', 'v6']
                 if method == 'discovery-scratch':
@@ -205,10 +207,14 @@ def main(argv=None):
     parser.add_argument('--graph-routing', choices=('hard', 'soft'), default='hard')
     parser.add_argument('--graph-localization', choices=('frozen', 'bbox-last'), default='frozen')
     parser.add_argument('--discovery-scoring', choices=('hierarchical', 'focal'), default='hierarchical')
+    parser.add_argument('--discovery-trusted-background-negative', action='store_true',
+                        help='record and enable conservative background negatives for novelty')
     parser.add_argument('--graph-sketch-max-images', type=int, default=12)
     args = parser.parse_args(argv)
     if args.nproc_per_node < 1 or args.batch_size < 1 or (args.finetune_epochs is not None and args.finetune_epochs < 1):
         raise ValueError('Process count, batch size and finetuning epochs must be positive')
+    if args.discovery_trusted_background_negative and not args.method.startswith('discovery'):
+        raise ValueError('--discovery-trusted-background-negative requires a discovery method')
     args.manifest = args.manifest.resolve()
     if args.owod_screening:
         args.owod_screening = args.owod_screening.resolve()

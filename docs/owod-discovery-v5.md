@@ -29,6 +29,18 @@ novelty为0.729；这一组可能包含真实未知，不能称作全是背景�
 
 ## v5修改及边界
 
+### 2026-11-08：unknown threshold 的评分修正
+
+原实现只把 `unknown_threshold` 写入 `unknown_mask`，却在共享 Top-K 前仍保留所有
+`objectness * novelty` unknown 分数；作者评估器只按 `label=91` 计数，因此低于阈值的
+候选仍会挤占 known 结果并被算作 unknown。现在在 `DiscoveryPostProcess` 合并 Top-K 前
+屏蔽低于阈值的 unknown 候选，并在候选不足 `max_detections` 时丢弃屏蔽占位项。评估器
+同时对外部 prediction 做同一阈值的防御性检查。
+
+这只改变 post-process/evaluation，不改变模型权重、hard routing、frozen localization、
+训练损失或数据协议；已有 v5 checkpoint 可以只读重评估。修正前后的正式指标不能直接
+混写，重评估结果必须记录对应提交和阈值。
+
 1. 保持v4的全部query已知类focal监督。
 2. objectness改成检测槽位是否被选中的监督：Hungarian匹配GT及去重后的可信pseudo
    为正，其余槽位为负。pseudo保留其置信权重。负例不再依赖极稀疏的低显著性背景掩码。
