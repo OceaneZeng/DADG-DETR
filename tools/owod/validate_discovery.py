@@ -31,7 +31,8 @@ def validate_plan_arguments(run, saved):
     for field, value in vars(planned).items():
         if field in ('start_epoch', 'resume', 'dist_url'):
             continue  # resume advances this counter without changing the recipe
-        if getattr(saved, field, None) != value:
+        default = 0 if field == 'discovery_pseudo_ramp_epochs' else None
+        if getattr(saved, field, default) != value:
             raise ValueError(f'Saved checkpoint differs from launch arguments: {field}')
     world_size = int(command[command.index('--nproc_per_node') + 1]) if '--nproc_per_node' in command else 1
     if getattr(saved, 'world_size', 1) != world_size:

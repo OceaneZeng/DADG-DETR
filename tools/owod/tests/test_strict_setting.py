@@ -201,6 +201,56 @@ class StrictSettingTests(unittest.TestCase):
                     self.assertIn('--owod-discovery', run['command'])
                     self.assertIn('--discovery-no-message', run['command'])
                     self.assertNotIn('--discovery-no-transfer', run['command'])
+            args.discovery_pseudo_ramp_epochs = 0
+            self.assertEqual(build_plan(args), message_plan)  # Legacy plans still resume unchanged.
+            args.discovery_pseudo_ramp_epochs = 3
+            for run in build_plan(args)['runs']:
+                if run.get('kind') != 'calibration':
+                    command = run['command']
+                    self.assertEqual(command[command.index('--discovery-pseudo-ramp-epochs') + 1], '3')
+            args.method = 'control'
+            with self.assertRaisesRegex(ValueError, 'requires a discovery'):
+                build_plan(args)
+            args.discovery_pseudo_ramp_epochs = -1
+            with self.assertRaisesRegex(ValueError, 'nonnegative'):
+                build_plan(args)
+
+    @patch('tools.owod.protocol.official_split', fixture_split)
+    def test_pseudo_ramp_versions_legacy_resume_and_schedule_binding(self):
+        import copy
+        from main import get_args_parser
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            make_tree(root)
+            manifest = build_official_manifest(root, 'm-owodb', 'author-release-fixture')
+            manifest['image_root'] = str(root)
+            path = root / 'split_manifest.json'
+            path.write_text(json.dumps(manifest), encoding='utf-8')
+            args = get_args_parser().parse_args([
+                '--owod-manifest', str(path), '--owod-stage', '0', '--owod-recipe', 'ore-paper',
+                '--owod-discovery'])
+            args.world_size = 2
+            args.graph_adapter_specs = []
+            configure_run(args)
+            self.assertEqual(args.discovery_version, 5)
+            legacy = copy.deepcopy(args)
+            del legacy.discovery_pseudo_ramp_epochs
+            validate_checkpoint(args, {'args': legacy, 'epoch': 1}, resume=True)
+            args.discovery_pseudo_ramp_epochs = 3
+            configure_run(args)
+            self.assertEqual(args.discovery_version, 6)
+            for resume in (False, True):
+                with self.assertRaisesRegex(ValueError, 'discovery_pseudo_ramp_epochs'):
+                    validate_checkpoint(args, {'args': legacy, 'epoch': 49}, resume=resume)
+            saved = copy.deepcopy(args)
+            validate_checkpoint(args, {'args': saved, 'epoch': 2}, resume=True)
+            args.discovery_pseudo_ramp_epochs = 4
+            with self.assertRaisesRegex(ValueError, 'discovery_pseudo_ramp_epochs'):
+                validate_checkpoint(args, {'args': saved, 'epoch': 2}, resume=True)
+            args.discovery_pseudo_ramp_epochs = 3
+            saved.discovery_version = 5
+            with self.assertRaisesRegex(ValueError, 'discovery_version'):
+                validate_checkpoint(args, {'args': saved, 'epoch': 2}, resume=True)
 
 
 if __name__ == '__main__':

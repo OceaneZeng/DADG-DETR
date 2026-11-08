@@ -325,7 +325,8 @@ def test_encoder_checkpoint_preserves_dropout_outputs_and_cuda_gradients():
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason='CUDA unavailable')
-def test_real_deformable_detector_cuda_discovery_and_checkpoint():
+@pytest.mark.parametrize('pseudo_ramp_epochs', [0, 3])
+def test_real_deformable_detector_cuda_discovery_and_checkpoint(pseudo_ramp_epochs):
     from main import get_args_parser
     from models.graph_local.discovery import build, make_ema
     configuration = get_args_parser().parse_args([])
@@ -341,6 +342,7 @@ def test_real_deformable_detector_cuda_discovery_and_checkpoint():
     configuration.owod_known_class_ids = [1, 2]
     configuration.owod_max_detections = 8
     configuration.discovery_warmup = 0
+    configuration.discovery_pseudo_ramp_epochs = pseudo_ramp_epochs
     configuration.graph_routed_adapter = True
     model, criterion, _ = build(configuration)
     model.cuda()

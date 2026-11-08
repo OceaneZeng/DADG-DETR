@@ -61,6 +61,7 @@ def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
                         "adapter_active_fraction", "loss_objectness", "loss_unknown",
                         "loss_discovery_route", "loss_discovery_consistency", "loss_affinity",
                         "discovery_pseudo_count", "discovery_ignored_fraction",
+                        "discovery_pseudo_scale", "discovery_pseudo_per_image", "discovery_pseudo_weight_sum",
                         "discovery_known_supervised_fraction", "discovery_background_fraction",
                         "discovery_positive_fraction", "discovery_proposal_negative_fraction",
                         "discovery_objectness_supervised_fraction", "discovery_novelty_supervised_fraction"})

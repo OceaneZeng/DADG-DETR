@@ -148,6 +148,8 @@ def get_args_parser():
     parser.add_argument('--discovery-min-support', type=float, default=3.)
     parser.add_argument('--discovery-transfer-threshold', type=float, default=.8)
     parser.add_argument('--discovery-warmup', type=int, default=1)
+    parser.add_argument('--discovery-pseudo-ramp-epochs', type=int, default=0,
+                        help='Experimental v6: ramp pseudo loss contributions after warmup; 0 preserves v5')
     parser.add_argument('--discovery-top-k', type=int, default=5)
     parser.add_argument('--discovery-saliency-threshold', type=float, default=.65)
     parser.add_argument('--discovery-consistency-threshold', type=float, default=.5)
@@ -308,6 +310,8 @@ def main(args):
                                        'objectness * sigmoid(known_logits)'),
                        'known_supervision': 'dense released-class focal loss; one-to-one matching',
                        'discovery_supervision': 'dense selected-proposal objectness/router; foreground-only novelty',
+                       'discovery_version': args.discovery_version,
+                       'pseudo_ramp_epochs': args.discovery_pseudo_ramp_epochs,
                        'implementation': 'project_research_method', 'paper_baseline': False}
         elif getattr(args, 'control_postprocess_version', None):
             profile = {'method': 'supervised-control', 'unknown_score': 'none; no unknown predictions',

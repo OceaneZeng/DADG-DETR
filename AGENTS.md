@@ -32,7 +32,7 @@ python tools/owod/manage_data.py --help
 python tools/owod/run_benchmark.py --help
 ```
 
-数据操作详见 [数据指南](docs/data-preparation.md)，目录职责见 [项目目录](docs/project-layout.md)。具体全量启动/恢复命令按当前版本文档与脚本核对，例如 [discovery v5](docs/owod-discovery-v5.md)；不要从聊天旧命令直接启动。
+数据操作详见 [数据指南](docs/data-preparation.md)，目录职责见 [项目目录](docs/project-layout.md)。正式全量启动/恢复按 [discovery v5](docs/owod-discovery-v5.md) 核对；实验性渐进监督 v6 及双 3090 入口见 [调试记录](docs/owod-discovery-v6-debug.md)，不要从聊天旧命令直接启动。
 
 - `baselines/` 集中保存外部源码；`tools/analysis/` 只读历史日志、绘图和汇总，不启动旧实验。不要恢复已删除的 pilot 启动器、旧 setting 或论文导出文件。
 - Git 保留源码、运行配置、固定作者 ImageSets、必要 Markdown 和许可证；生成文档、图像、压缩包、权重和日志保持忽略，不 force-add。清理时保留原始数据、权重、指标日志、外部源码版本及无关用户改动；论文压缩包不随意解压进实验仓库。

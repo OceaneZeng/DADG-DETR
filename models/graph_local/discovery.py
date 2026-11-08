@@ -13,6 +13,7 @@ from util import box_ops
 from util.training_runtime import gather_evidence, foreach_ema_parameters, copy_model_buffers
 
 DISCOVERY_VERSION = 5
+DISCOVERY_RAMP_VERSION = 6
 
 
 class DiscoveryFFN(nn.Module):
@@ -138,8 +139,19 @@ class DiscoveryDetector(nn.Module):
         return reports
 
 
-def balanced_bce(logits, targets, weights):
+def pseudo_supervision_scale(epoch, warmup, ramp_epochs):
+    """Phase-local schedule, reconstructed from the saved epoch on resume."""
+    if epoch < warmup:
+        return 0.
+    return min(1., (epoch - warmup + 1) / ramp_epochs) if ramp_epochs else 1.
+
+
+def balanced_bce(logits, targets, weights, contribution_scale=None):
     values = F.binary_cross_entropy_with_logits(logits, targets, reduction='none')
+    if contribution_scale is not None:
+        # Scale contributions AFTER fixing normalization. Scaling the weights
+        # in both numerator and denominator would cancel for a pseudo group.
+        values = values * contribution_scale
     parts = []
     for mask in (targets > .5, targets <= .5):
         effective = weights * mask
@@ -172,6 +184,9 @@ class DiscoveryCriterion(nn.Module):
         self.weight_dict = base.weight_dict
         self.known_ids = list(args.owod_known_class_ids)
         self.warmup = args.discovery_warmup
+        self.pseudo_ramp_epochs = getattr(args, 'discovery_pseudo_ramp_epochs', 0)
+        if self.pseudo_ramp_epochs < 0:
+            raise ValueError('discovery_pseudo_ramp_epochs must be nonnegative')
         self.top_k = args.discovery_top_k
         self.saliency_threshold = args.discovery_saliency_threshold
         self.consistency_threshold = args.discovery_consistency_threshold
@@ -198,6 +213,10 @@ class DiscoveryCriterion(nn.Module):
             semantic[batch, queries] = targets[batch]['labels'][matches]
         foreground, foreground_weights, proposal_weights = proposal_supervision(
             positive, pseudo, confidence)
+        pseudo_scale = (pseudo_supervision_scale(self.epoch, self.warmup, self.pseudo_ramp_epochs)
+                        if self.training else 1.)
+        contribution_scale = (torch.where(pseudo, confidence.new_tensor(pseudo_scale), 1.)
+                              if self.pseudo_ramp_epochs else None)
         # Known-class membership and foreground existence are different targets.
         # Keep standard one-to-one DETR supervision over ALL queries for released
         # classes. An unmatched query is a negative for those classes, not a
@@ -213,14 +232,18 @@ class DiscoveryCriterion(nn.Module):
             layer.pop('query_label_weights', None)
             prepared['aux_outputs'].append(layer)
         losses = self.base(prepared, targets)
-        losses['loss_objectness'] = balanced_bce(outputs['pred_objectness'], foreground.float(), proposal_weights)
-        losses['loss_unknown'] = balanced_bce(outputs['pred_novelty'], pseudo.float(), foreground_weights)
+        losses['loss_objectness'] = balanced_bce(outputs['pred_objectness'], foreground.float(),
+                                                proposal_weights, contribution_scale)
+        losses['loss_unknown'] = balanced_bce(outputs['pred_novelty'], pseudo.float(),
+                                             foreground_weights, contribution_scale)
         route_target = torch.zeros_like(semantic)
         route_target[positive] = 1
         route_target[pseudo] = 2
         route_terms = []
         for logits in outputs['discovery_routes']:
             values = F.cross_entropy(logits.transpose(1, 2), route_target, reduction='none')
+            if contribution_scale is not None:
+                values = values * contribution_scale
             route_terms.append((values * proposal_weights).sum() / proposal_weights.sum().clamp_min(1))
         losses['loss_discovery_route'] = torch.stack(route_terms).mean()
         consistency = outputs['query_features'].sum() * 0
@@ -232,7 +255,7 @@ class DiscoveryCriterion(nn.Module):
             teacher_boxes = candidates['teacher_boxes'][batch_ids, maps.clamp_min(0)].detach()
             box_cost = (outputs['pred_boxes'] - teacher_boxes).abs().sum(-1)
             consistency = ((feature_cost + box_cost) * confidence).sum() / confidence.sum().clamp_min(1)
-        losses['loss_discovery_consistency'] = consistency
+        losses['loss_discovery_consistency'] = consistency * pseudo_scale if self.pseudo_ramp_epochs else consistency
         affinity = outputs['affinities']
         anchor = positive & (affinity.amax(-1) > -100)
         # The correct known prototype must exist; invalid anchors cannot be targets.
@@ -240,6 +263,9 @@ class DiscoveryCriterion(nn.Module):
         losses['loss_affinity'] = (F.cross_entropy(affinity[anchor] / .1, semantic[anchor])
                                    if anchor.any() else affinity.sum() * 0)
         losses['discovery_pseudo_count'] = pseudo.sum().float()
+        losses['discovery_pseudo_per_image'] = pseudo.sum().float() / pseudo.shape[0]
+        losses['discovery_pseudo_weight_sum'] = confidence.sum()
+        losses['discovery_pseudo_scale'] = confidence.new_tensor(pseudo_scale)
         # v5 ignores unselected slots for conditional novelty only. Classification,
         # objectness and routing all receive dense proposal supervision.
         losses['discovery_ignored_fraction'] = (~foreground).float().mean()

@@ -6,13 +6,17 @@ from tools.owod.protocol import file_sha256, stage_files, RETIRED_MESSAGE
 
 
 def configure_run(args):
+    ramp_epochs = getattr(args, 'discovery_pseudo_ramp_epochs', 0)
+    if ramp_epochs < 0 or (ramp_epochs and not getattr(args, 'owod_discovery', False)):
+        raise ValueError('discovery_pseudo_ramp_epochs must be nonnegative and requires discovery')
     if getattr(args, 'screen_no_distill', False) and not (
             getattr(args, 'owod_screening', '') and getattr(args, 'screen_branch_checkpoint', '')
             and args.owod_stage == 1 and getattr(args, 'owod_discovery', False)):
         raise ValueError('screen-no-distill requires shared-parent discovery screening Task 2')
     if getattr(args, 'owod_discovery', False):
-        from models.graph_local.discovery import DISCOVERY_VERSION
-        args.discovery_version = DISCOVERY_VERSION
+        from models.graph_local.discovery import DISCOVERY_VERSION, DISCOVERY_RAMP_VERSION
+        args.discovery_pseudo_ramp_epochs = ramp_epochs
+        args.discovery_version = DISCOVERY_RAMP_VERSION if ramp_epochs else DISCOVERY_VERSION
         args.graph_routed_adapter = True
     requested = bool(args.owod_manifest or args.owod_known_class_ids is not None or args.paper_baseline
                      or getattr(args, 'graph_routed_adapter', False))
@@ -155,6 +159,8 @@ def validate_checkpoint(args, checkpoint, resume=False):
     if getattr(args, 'owod_discovery', False):
         if getattr(saved, 'discovery_scoring', 'hierarchical') != getattr(args, 'discovery_scoring', 'hierarchical'):
             raise ValueError('Discovery checkpoint cannot change discovery_scoring')
+        if getattr(saved, 'discovery_pseudo_ramp_epochs', 0) != getattr(args, 'discovery_pseudo_ramp_epochs', 0):
+            raise ValueError('Discovery checkpoint cannot change discovery_pseudo_ramp_epochs')
         for field in ('discovery_version', 'discovery_no_message',
                       'discovery_no_transfer', 'discovery_no_keep', 'discovery_capacity', 'discovery_min_support',
                       'discovery_transfer_threshold', 'discovery_warmup', 'discovery_top_k',

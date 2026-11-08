@@ -137,6 +137,16 @@ def test_unpaired_pretraining_rejected(chains):
         validate_discovery.compare_runs(before, after)
 
 
+def test_legacy_v5_metadata_without_ramp_option_can_still_be_compared(chains):
+    before, after, a, b = chains
+    checkpoint = Path(a['runs'][0]['output_dir']) / 'checkpoint.pth'
+    saved = torch.load(checkpoint, weights_only=False)
+    del saved['args'].discovery_pseudo_ramp_epochs
+    torch.save(saved, checkpoint)
+    result = validate_discovery.compare_runs(before, after)
+    assert len(result['comparisons']) == 7
+
+
 def test_pipeline_continues_s_after_m_source_failure(tmp_path, monkeypatch):
     calls = []
     def execute(command, logfile):

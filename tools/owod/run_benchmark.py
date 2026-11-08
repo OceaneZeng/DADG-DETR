@@ -50,6 +50,9 @@ def build_plan(args):
         raise FileNotFoundError(args.backbone_weights)
     image_root = Path(manifest['image_root'])
     method = getattr(args, 'method', 'control')
+    ramp_epochs = getattr(args, 'discovery_pseudo_ramp_epochs', 0)
+    if ramp_epochs < 0 or (ramp_epochs and not method.startswith('discovery')):
+        raise ValueError('discovery-pseudo-ramp-epochs must be nonnegative and requires a discovery method')
     if screening:
         from tools.owod.screening_data import screening_files
         screening_files(args.manifest, screening, 0)
@@ -144,6 +147,9 @@ def build_plan(args):
                 if no_distill:
                     command += ['--screen-no-distill']
                 command += ['--owod-discovery', '--discovery-scoring', getattr(args, 'discovery_scoring', 'hierarchical')]
+                # Keep legacy v5 command lists identical, including resume plans.
+                if ramp_epochs:
+                    command += ['--discovery-pseudo-ramp-epochs', str(ramp_epochs)]
                 if method == 'discovery-scratch':
                     command += ['--discovery-no-transfer']
                 if method == 'discovery-no-message':
@@ -202,6 +208,8 @@ def main(argv=None):
     parser.add_argument('--graph-routing', choices=('hard', 'soft'), default='hard')
     parser.add_argument('--graph-localization', choices=('frozen', 'bbox-last'), default='frozen')
     parser.add_argument('--discovery-scoring', choices=('hierarchical', 'focal'), default='hierarchical')
+    parser.add_argument('--discovery-pseudo-ramp-epochs', type=int, default=0,
+                        help='Experimental v6 pseudo loss ramp after warmup; default 0 keeps v5')
     parser.add_argument('--graph-sketch-max-images', type=int, default=12)
     args = parser.parse_args(argv)
     if args.nproc_per_node < 1 or args.batch_size < 1 or (args.finetune_epochs is not None and args.finetune_epochs < 1):
