@@ -24,6 +24,9 @@ def test_same_forward_isolates_unknown_competition_without_changing_boxes():
     assert summary['unknown_fraction'] == 1
     assert summary['groups']['matched']['count'] == 1
     assert summary['groups']['unmatched_no_known_overlap']['count'] == 1
+    ranking = summary['matched_known_ranking']
+    assert ranking['count'] == ranking['violations'] == 1
+    assert ranking['mean_unknown_score'] > ranking['mean_true_known_score']
     for key in outputs:
         assert torch.equal(outputs[key], before[key])
 
@@ -38,6 +41,7 @@ def test_empty_gt_retains_unmatched_scores_without_claiming_background_labels():
     assert all(value is None for value in summary['coverage_fraction'].values())
     assert summary['groups']['matched']['mean'] is None
     assert summary['groups']['unmatched_no_known_overlap']['count'] == 2
+    assert summary['matched_known_ranking']['violation_fraction'] is None
 
 
 @pytest.mark.parametrize('scoring', ['hierarchical', 'focal'])

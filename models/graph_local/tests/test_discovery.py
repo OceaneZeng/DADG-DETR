@@ -325,11 +325,13 @@ def test_encoder_checkpoint_preserves_dropout_outputs_and_cuda_gradients():
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason='CUDA unavailable')
-@pytest.mark.parametrize('pseudo_ramp_epochs,objectness_loss,pseudo_normalization', [
-    (0, 'balanced-bce', 'weight-sum'), (3, 'balanced-bce', 'weight-sum'),
-    (3, 'focal', 'weight-sum'), (3, 'balanced-bce', 'count'), (3, 'focal', 'count')])
+@pytest.mark.parametrize('pseudo_ramp_epochs,objectness_loss,pseudo_normalization,rank_coef,grad_scale', [
+    (0, 'balanced-bce', 'weight-sum', 0., 1.), (3, 'balanced-bce', 'weight-sum', 0., 1.),
+    (3, 'focal', 'weight-sum', 0., 1.), (3, 'balanced-bce', 'count', 0., 1.),
+    (3, 'focal', 'count', 0., 1.), (3, 'balanced-bce', 'count', 1., 1.),
+    (3, 'balanced-bce', 'count', 0., .1), (3, 'balanced-bce', 'count', 1., .1)])
 def test_real_deformable_detector_cuda_discovery_and_checkpoint(
-        pseudo_ramp_epochs, objectness_loss, pseudo_normalization):
+        pseudo_ramp_epochs, objectness_loss, pseudo_normalization, rank_coef, grad_scale):
     from main import get_args_parser
     from models.graph_local.discovery import build, make_ema
     configuration = get_args_parser().parse_args([])
@@ -348,6 +350,8 @@ def test_real_deformable_detector_cuda_discovery_and_checkpoint(
     configuration.discovery_pseudo_ramp_epochs = pseudo_ramp_epochs
     configuration.discovery_objectness_loss = objectness_loss
     configuration.discovery_pseudo_normalization = pseudo_normalization
+    configuration.discovery_known_rank_coef = rank_coef
+    configuration.discovery_feature_grad_scale = grad_scale
     configuration.graph_routed_adapter = True
     model, criterion, _ = build(configuration)
     model.cuda()

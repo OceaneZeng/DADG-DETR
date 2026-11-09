@@ -156,6 +156,10 @@ def get_args_parser():
                         help='Experimental v7 selected-slot focal loss; default preserves v5/v6')
     parser.add_argument('--discovery-pseudo-normalization', choices=('weight-sum', 'count'), default='weight-sum',
                         help='Experimental v7 count normalization preserves absolute pseudo confidence for novelty')
+    parser.add_argument('--discovery-known-rank-coef', type=float, default=0.,
+                        help='Experimental v8 matched-GT known/unknown score ranking loss coefficient')
+    parser.add_argument('--discovery-feature-grad-scale', type=float, default=1.,
+                        help='Experimental v8 discovery-graph input and pseudo box-consistency gradient scale')
     parser.add_argument('--discovery-top-k', type=int, default=5)
     parser.add_argument('--discovery-saliency-threshold', type=float, default=.65)
     parser.add_argument('--discovery-consistency-threshold', type=float, default=.5)
@@ -322,6 +326,8 @@ def main(args):
                        'objectness_focal_alpha': args.focal_alpha if args.discovery_objectness_loss == 'focal' else None,
                        'objectness_focal_gamma': 2 if args.discovery_objectness_loss == 'focal' else None,
                        'pseudo_normalization': args.discovery_pseudo_normalization,
+                       'known_rank_coef': args.discovery_known_rank_coef,
+                       'feature_grad_scale': args.discovery_feature_grad_scale,
                        'implementation': 'project_research_method', 'paper_baseline': False}
         elif getattr(args, 'control_postprocess_version', None):
             profile = {'method': 'supervised-control', 'unknown_score': 'none; no unknown predictions',

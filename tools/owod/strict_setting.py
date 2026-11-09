@@ -9,10 +9,16 @@ def configure_run(args):
     ramp_epochs = getattr(args, 'discovery_pseudo_ramp_epochs', 0)
     objectness_loss = getattr(args, 'discovery_objectness_loss', 'balanced-bce')
     pseudo_normalization = getattr(args, 'discovery_pseudo_normalization', 'weight-sum')
+    known_rank_coef = getattr(args, 'discovery_known_rank_coef', 0.)
+    feature_grad_scale = getattr(args, 'discovery_feature_grad_scale', 1.)
+    if (not math.isfinite(known_rank_coef) or known_rank_coef < 0
+            or not math.isfinite(feature_grad_scale) or not 0 <= feature_grad_scale <= 1):
+        raise ValueError('Invalid discovery stability configuration: rank coefficient >= 0, gradient scale in [0, 1]')
+    stability_experiment = known_rank_coef > 0 or feature_grad_scale != 1.
     if objectness_loss not in ('balanced-bce', 'focal') or pseudo_normalization not in ('weight-sum', 'count'):
         raise ValueError('Invalid discovery loss configuration')
     loss_experiment = objectness_loss != 'balanced-bce' or pseudo_normalization != 'weight-sum'
-    if loss_experiment and not getattr(args, 'owod_discovery', False):
+    if (loss_experiment or stability_experiment) and not getattr(args, 'owod_discovery', False):
         raise ValueError('Discovery loss options require discovery')
     if ramp_epochs < 0 or (ramp_epochs and not getattr(args, 'owod_discovery', False)):
         raise ValueError('discovery_pseudo_ramp_epochs must be nonnegative and requires discovery')
@@ -24,11 +30,15 @@ def configure_run(args):
             and args.owod_stage == 1 and getattr(args, 'owod_discovery', False)):
         raise ValueError('screen-no-distill requires shared-parent discovery screening Task 2')
     if getattr(args, 'owod_discovery', False):
-        from models.graph_local.discovery import DISCOVERY_VERSION, DISCOVERY_RAMP_VERSION, DISCOVERY_LOSS_VERSION
+        from models.graph_local.discovery import (DISCOVERY_VERSION, DISCOVERY_RAMP_VERSION,
+                                                  DISCOVERY_LOSS_VERSION, DISCOVERY_STABILITY_VERSION)
         args.discovery_pseudo_ramp_epochs = ramp_epochs
         args.discovery_objectness_loss = objectness_loss
         args.discovery_pseudo_normalization = pseudo_normalization
-        args.discovery_version = (DISCOVERY_LOSS_VERSION if loss_experiment else
+        args.discovery_known_rank_coef = known_rank_coef
+        args.discovery_feature_grad_scale = feature_grad_scale
+        args.discovery_version = (DISCOVERY_STABILITY_VERSION if stability_experiment else
+                                  DISCOVERY_LOSS_VERSION if loss_experiment else
                                   DISCOVERY_RAMP_VERSION if ramp_epochs else DISCOVERY_VERSION)
         args.graph_routed_adapter = True
     requested = bool(args.owod_manifest or args.owod_known_class_ids is not None or args.paper_baseline
@@ -175,7 +185,9 @@ def validate_checkpoint(args, checkpoint, resume=False):
         if getattr(saved, 'discovery_pseudo_ramp_epochs', 0) != getattr(args, 'discovery_pseudo_ramp_epochs', 0):
             raise ValueError('Discovery checkpoint cannot change discovery_pseudo_ramp_epochs')
         for field, default in (('discovery_objectness_loss', 'balanced-bce'),
-                               ('discovery_pseudo_normalization', 'weight-sum')):
+                               ('discovery_pseudo_normalization', 'weight-sum'),
+                               ('discovery_known_rank_coef', 0.),
+                               ('discovery_feature_grad_scale', 1.)):
             if getattr(saved, field, default) != getattr(args, field, default):
                 raise ValueError(f'Discovery checkpoint cannot change {field}')
         if (getattr(args, 'discovery_objectness_loss', 'balanced-bce') == 'focal'

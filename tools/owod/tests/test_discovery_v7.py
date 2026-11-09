@@ -189,7 +189,8 @@ def test_launcher_runs_variant_with_fixed_gpu_budget_and_captures_data_failures(
     assert f'variant={variant}' in logfile.read_text()
 
 
-def test_actual_training_loop_pauses_and_restores_all_state_without_shortening_schedule(inputs, monkeypatch):
+@pytest.mark.parametrize('rank_coef,grad_scale', [(0., 1.), (1., .1)])
+def test_actual_training_loop_pauses_and_restores_all_state_without_shortening_schedule(inputs, monkeypatch, rank_coef, grad_scale):
     import torch
     from torch import nn
     import main as training
@@ -231,6 +232,8 @@ def test_actual_training_loop_pauses_and_restores_all_state_without_shortening_s
     monkeypatch.setattr(training, 'train_one_epoch', train)
     monkeypatch.setattr(training, 'evaluate', lambda *args, **kwargs: ({}, SimpleNamespace(coco_eval={})))
     inputs.discovery_objectness_loss = 'focal'
+    inputs.discovery_known_rank_coef = rank_coef
+    inputs.discovery_feature_grad_scale = grad_scale
     fresh = configured(run_benchmark.build_plan(inputs))
     fresh.device = 'cpu'
     paused = copy.deepcopy(fresh)

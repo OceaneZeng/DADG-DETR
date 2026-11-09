@@ -1,5 +1,6 @@
 """Open-world discovery, persistent anonymous memory, and supervised promotion."""
 import copy
+import math
 import torch
 from torch import nn
 from torch.nn import functional as F
@@ -17,6 +18,42 @@ from util.training_runtime import gather_evidence, foreach_ema_parameters, copy_
 DISCOVERY_VERSION = 5
 DISCOVERY_RAMP_VERSION = 6
 DISCOVERY_LOSS_VERSION = 7
+DISCOVERY_STABILITY_VERSION = 8
+
+
+def scale_gradient(value, scale):
+    """Keep the forward value; scale only this branch's input gradient."""
+    return value if scale == 1. else value.detach() + scale * (value - value.detach())
+
+
+def known_unknown_log_ratio(logits, novelty, labels, known_ids, scoring='hierarchical'):
+    """log(S_unknown / S_true_known) on released, matched GT slots.
+
+    Objectness cancels for the same slot. Work in log space so uncertain
+    classifiers and saturated novelty still receive finite, useful gradients.
+    This does not rank genuine unknown objects below known objects elsewhere.
+    """
+    if scoring == 'hierarchical':
+        columns = (labels[:, None] == labels.new_tensor(known_ids)).long().argmax(-1)
+        log_known = logits[..., known_ids].log_softmax(-1).gather(1, columns[:, None]).squeeze(1)
+        return novelty - log_known
+    if scoring == 'focal':
+        log_known = F.logsigmoid(logits.gather(1, labels[:, None]).squeeze(1))
+        return F.logsigmoid(novelty) - log_known
+    raise ValueError('Unknown discovery scoring rule')
+
+
+def matched_known_ranking_loss(log_ratio):
+    """Pairwise logistic loss, normalized by global matched-GT count under DDP."""
+    count = log_ratio.new_tensor(log_ratio.numel(), dtype=torch.float32)
+    if is_dist_avail_and_initialized():
+        torch.distributed.all_reduce(count)
+        # Clamp the GLOBAL count before dividing by world size. A single GT
+        # across two ranks must have the same gradient as a one-process batch.
+        count = count.clamp_min(1) / get_world_size()
+    else:
+        count = count.clamp_min(1)
+    return F.softplus(log_ratio).sum() / count
 
 
 class DiscoveryFFN(nn.Module):
@@ -50,6 +87,9 @@ class DiscoveryDetector(nn.Module):
         self.transfer_enabled = not args.discovery_no_transfer
         self.transfer_threshold = args.discovery_transfer_threshold
         self.min_support = args.discovery_min_support
+        self.feature_grad_scale = getattr(args, 'discovery_feature_grad_scale', 1.)
+        if not math.isfinite(self.feature_grad_scale) or not 0 <= self.feature_grad_scale <= 1:
+            raise ValueError('discovery_feature_grad_scale must be finite and in [0, 1]')
         detector.return_baseline_features = True
         self.memory = PrototypeMemory(args.hidden_dim, args.discovery_capacity)
         self.affinity_graph = AffinityGraph(
@@ -65,7 +105,7 @@ class DiscoveryDetector(nn.Module):
         outputs = self.detr(samples)
         features = outputs.pop('decoder_features')[-1]
         outputs['query_features'] = features
-        outputs.update(self.affinity_graph(features, self.memory))
+        outputs.update(self.affinity_graph(scale_gradient(features, self.feature_grad_scale), self.memory))
         routes = []
         route_inputs = []
         for module in self.modules():
@@ -213,6 +253,14 @@ class DiscoveryCriterion(nn.Module):
         self.pseudo_ramp_epochs = getattr(args, 'discovery_pseudo_ramp_epochs', 0)
         self.objectness_loss = getattr(args, 'discovery_objectness_loss', 'balanced-bce')
         self.pseudo_normalization = getattr(args, 'discovery_pseudo_normalization', 'weight-sum')
+        self.known_rank_coef = getattr(args, 'discovery_known_rank_coef', 0.)
+        self.feature_grad_scale = getattr(args, 'discovery_feature_grad_scale', 1.)
+        self.scoring = getattr(args, 'discovery_scoring', 'hierarchical')
+        if not math.isfinite(self.known_rank_coef) or self.known_rank_coef < 0:
+            raise ValueError('discovery_known_rank_coef must be finite and nonnegative')
+        if not math.isfinite(self.feature_grad_scale) or not 0 <= self.feature_grad_scale <= 1:
+            raise ValueError('discovery_feature_grad_scale must be finite and in [0, 1]')
+        self.stability = self.known_rank_coef > 0 or self.feature_grad_scale != 1.
         if self.objectness_loss not in ('balanced-bce', 'focal'):
             raise ValueError('Invalid discovery_objectness_loss')
         if self.pseudo_normalization not in ('weight-sum', 'count'):
@@ -226,6 +274,8 @@ class DiscoveryCriterion(nn.Module):
         self.evidence = None
         self.weight_dict.update(loss_objectness=1., loss_unknown=1., loss_discovery_route=1.,
                                 loss_discovery_consistency=1., loss_affinity=.1)
+        if self.known_rank_coef:
+            self.weight_dict['loss_discovery_rank'] = self.known_rank_coef
 
     def forward(self, outputs, targets):
         # Unknown GT in full evaluation annotations is never visible to losses.
@@ -274,6 +324,35 @@ class DiscoveryCriterion(nn.Module):
         losses['loss_unknown'] = balanced_bce(outputs['pred_novelty'], pseudo.float(),
                                              foreground_weights, contribution_scale,
                                              normalization=self.pseudo_normalization)
+        if self.stability:
+            matched_logits = outputs['pred_logits'][positive]
+            matched_novelty = outputs['pred_novelty'][positive]
+            matched_labels = semantic[positive]
+            log_ratio = known_unknown_log_ratio(matched_logits, matched_novelty,
+                                                matched_labels, self.known_ids, self.scoring)
+            if self.known_rank_coef:
+                # Task 4 has no unknown output or unknown-ranking objective.
+                losses['loss_discovery_rank'] = (matched_known_ranking_loss(log_ratio)
+                    if len(self.known_ids) < 80 else log_ratio.sum() * 0)
+            with torch.no_grad():
+                obj = outputs['pred_objectness'].sigmoid()
+                novelty = matched_novelty.sigmoid() if len(self.known_ids) < 80 else torch.zeros_like(matched_novelty)
+                gt_logits = matched_logits.gather(1, matched_labels[:, None]).squeeze(1)
+                if self.scoring == 'hierarchical':
+                    columns = (matched_labels[:, None] == matched_labels.new_tensor(self.known_ids)).long().argmax(-1)
+                    conditional = matched_logits[..., self.known_ids].softmax(-1).gather(1, columns[:, None]).squeeze(1)
+                    known_score = obj[positive] * (1 - novelty) * conditional
+                else:
+                    known_score = obj[positive] * gt_logits.sigmoid()
+                losses.update(discovery_known_count=positive.sum().float(),
+                    discovery_known_rank_violations=((log_ratio >= 0).sum().float()
+                                                     if len(self.known_ids) < 80 else obj.new_zeros(())),
+                    discovery_known_score_sum=known_score.sum(),
+                    discovery_known_unknown_score_sum=(obj[positive] * novelty).sum(),
+                    discovery_known_objectness_sum=obj[positive].sum(),
+                    discovery_known_novelty_sum=novelty.sum(),
+                    discovery_unselected_count=(~foreground).sum().float(),
+                    discovery_unselected_objectness_sum=obj[~foreground].sum())
         route_target = torch.zeros_like(semantic)
         route_target[positive] = 1
         route_target[pseudo] = 2
@@ -291,7 +370,8 @@ class DiscoveryCriterion(nn.Module):
             teacher_features = teacher['discovery_embedding'][batch_ids, maps.clamp_min(0)].detach()
             feature_cost = 1 - F.cosine_similarity(outputs['discovery_embedding'], teacher_features, dim=-1)
             teacher_boxes = candidates['teacher_boxes'][batch_ids, maps.clamp_min(0)].detach()
-            box_cost = (outputs['pred_boxes'] - teacher_boxes).abs().sum(-1)
+            box_cost = (scale_gradient(outputs['pred_boxes'], self.feature_grad_scale)
+                        - teacher_boxes).abs().sum(-1)
             consistency = ((feature_cost + box_cost) * confidence).sum() / confidence.sum().clamp_min(1)
         losses['loss_discovery_consistency'] = consistency * pseudo_scale if self.pseudo_ramp_epochs else consistency
         affinity = outputs['affinities']

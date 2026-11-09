@@ -11,11 +11,12 @@ sys.path[:0] = [str(ROOT), str(ROOT / 'models/ops')]
 def score_competition(outputs, targets, indices, known, limit=50, scoring='hierarchical'):
     """Counterfactual known-only ranking on the same forward, never deployment."""
     import torch
+    from models.graph_local.discovery import known_unknown_log_ratio
     from util.box_ops import box_iou, box_cxcywh_to_xyxy
     if scoring not in ('hierarchical', 'focal'):
         raise ValueError('Unknown discovery scoring rule')
     result = dict(gt=0, coverage=dict(raw=0, joint=0, known_actual=0, known_hierarchical=0, known_sigmoid=0),
-                  detections=0, unknown=0, groups={}, scoring=scoring)
+                  detections=0, unknown=0, groups={}, scoring=scoring, known_ranking=[])
     with torch.no_grad():
         for b, target in enumerate(targets):
             obj = outputs['pred_objectness'][b].sigmoid()
@@ -24,6 +25,13 @@ def score_competition(outputs, targets, indices, known, limit=50, scoring='hiera
             unknown = obj * novelty
             scores = logits.softmax(-1) * (obj * (1 - novelty))[:, None]
             actual_known = scores if scoring == 'hierarchical' else logits.sigmoid() * obj[:, None]
+            queries, matches = indices[b]
+            labels = target['labels'][matches]
+            columns = (labels[:, None] == labels.new_tensor(known)).long().argmax(-1)
+            log_ratio = known_unknown_log_ratio(outputs['pred_logits'][b, queries],
+                outputs['pred_novelty'][b, queries], labels, known, scoring)
+            result['known_ranking'].extend(torch.stack([
+                actual_known[queries, columns], unknown[queries], log_ratio], -1).cpu().tolist())
             joint = torch.cat([actual_known, unknown[:, None]], -1)
             selection = joint.flatten().topk(min(limit, joint.numel())).indices
             result['detections'] += len(selection)
@@ -66,6 +74,8 @@ def summarize_competition(batches):
     gt = sum(b['gt'] for b in batches)
     detections = sum(b['detections'] for b in batches)
     unknown = sum(b['unknown'] for b in batches)
+    ranking = [row for batch in batches for row in batch.get('known_ranking', [])]
+    violations = sum(row[2] >= 0 for row in ranking)
     coverage = {name: sum(b['coverage'][name] for b in batches)
                 for name in ('raw', 'joint', 'known_actual', 'known_hierarchical', 'known_sigmoid')}
     return dict(gt=gt, scoring=scoring.pop(),
@@ -73,6 +83,10 @@ def summarize_competition(batches):
                 coverage_fraction={name: count / gt if gt else None for name, count in coverage.items()},
                 detections=detections, unknown=unknown,
                 unknown_fraction=unknown / detections if detections else None,
+                matched_known_ranking=dict(count=len(ranking), violations=violations,
+                    violation_fraction=violations / len(ranking) if ranking else None,
+                    mean_true_known_score=sum(row[0] for row in ranking) / len(ranking) if ranking else None,
+                    mean_unknown_score=sum(row[1] for row in ranking) / len(ranking) if ranking else None),
                 score_columns=['objectness', 'novelty', 'unknown', 'max_known_sigmoid',
                                'max_known_softmax', 'max_known_actual_score'],
                 groups={name: dict(count=len(rows),
@@ -175,6 +189,8 @@ def main():
                           pseudo_ramp_epochs=getattr(saved, 'discovery_pseudo_ramp_epochs', 0),
                           objectness_loss=getattr(saved, 'discovery_objectness_loss', 'balanced-bce'),
                           pseudo_normalization=getattr(saved, 'discovery_pseudo_normalization', 'weight-sum'),
+                          known_rank_coef=getattr(saved, 'discovery_known_rank_coef', 0.),
+                          feature_grad_scale=getattr(saved, 'discovery_feature_grad_scale', 1.),
                           image_ids=image_ids, summary=summarize(rows), supervision=counts,
                           score_competition=summarize_competition(competition),
                           ema_candidates=dict(available=teacher is not None, images=candidate_rows,

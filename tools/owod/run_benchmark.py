@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 from pathlib import Path
 import shlex
@@ -59,6 +60,13 @@ def build_plan(args):
     ramp_epochs = getattr(args, 'discovery_pseudo_ramp_epochs', 0)
     objectness_loss = getattr(args, 'discovery_objectness_loss', 'balanced-bce')
     pseudo_normalization = getattr(args, 'discovery_pseudo_normalization', 'weight-sum')
+    known_rank_coef = getattr(args, 'discovery_known_rank_coef', 0.)
+    feature_grad_scale = getattr(args, 'discovery_feature_grad_scale', 1.)
+    if (not math.isfinite(known_rank_coef) or known_rank_coef < 0
+            or not math.isfinite(feature_grad_scale) or not 0 <= feature_grad_scale <= 1):
+        raise ValueError('Invalid discovery stability configuration: rank coefficient >= 0, gradient scale in [0, 1]')
+    if (known_rank_coef > 0 or feature_grad_scale != 1.) and not method.startswith('discovery'):
+        raise ValueError('Discovery stability options require a discovery method')
     if objectness_loss not in ('balanced-bce', 'focal') or pseudo_normalization not in ('weight-sum', 'count'):
         raise ValueError('Invalid discovery loss configuration')
     if (objectness_loss != 'balanced-bce' or pseudo_normalization != 'weight-sum') and not method.startswith('discovery'):
@@ -166,6 +174,10 @@ def build_plan(args):
                     command += ['--discovery-objectness-loss', objectness_loss]
                 if pseudo_normalization != 'weight-sum':
                     command += ['--discovery-pseudo-normalization', pseudo_normalization]
+                if known_rank_coef:
+                    command += ['--discovery-known-rank-coef', str(known_rank_coef)]
+                if feature_grad_scale != 1.:
+                    command += ['--discovery-feature-grad-scale', str(feature_grad_scale)]
                 if method == 'discovery-scratch':
                     command += ['--discovery-no-transfer']
                 if method == 'discovery-no-message':
@@ -230,6 +242,8 @@ def main(argv=None):
                         help='Experimental v6 pseudo loss ramp after warmup; default 0 keeps v5')
     parser.add_argument('--discovery-objectness-loss', choices=('balanced-bce', 'focal'), default='balanced-bce')
     parser.add_argument('--discovery-pseudo-normalization', choices=('weight-sum', 'count'), default='weight-sum')
+    parser.add_argument('--discovery-known-rank-coef', type=float, default=0.)
+    parser.add_argument('--discovery-feature-grad-scale', type=float, default=1.)
     parser.add_argument('--graph-sketch-max-images', type=int, default=12)
     args = parser.parse_args(argv)
     if args.nproc_per_node < 1 or args.batch_size < 1 or (args.finetune_epochs is not None and args.finetune_epochs < 1):

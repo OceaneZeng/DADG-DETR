@@ -33,7 +33,9 @@ def validate_plan_arguments(run, saved):
             continue  # resume advances this counter without changing the recipe
         default = {'discovery_pseudo_ramp_epochs': 0,
                    'discovery_objectness_loss': 'balanced-bce',
-                   'discovery_pseudo_normalization': 'weight-sum'}.get(field)
+                   'discovery_pseudo_normalization': 'weight-sum',
+                   'discovery_known_rank_coef': 0.,
+                   'discovery_feature_grad_scale': 1.}.get(field)
         if getattr(saved, field, default) != value:
             raise ValueError(f'Saved checkpoint differs from launch arguments: {field}')
     world_size = int(command[command.index('--nproc_per_node') + 1]) if '--nproc_per_node' in command else 1
