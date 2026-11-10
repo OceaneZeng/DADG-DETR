@@ -107,7 +107,7 @@ def test_pause_preserves_schedule_and_cannot_promote_partial_task(inputs, tmp_pa
     assert json.loads((tmp_path / 'training_complete.json').read_text())['last_epoch'] == 49
 
 
-@pytest.mark.parametrize('change', [dict(task1_only=False), dict(method='control'),
+@pytest.mark.parametrize('change', [dict(task1_only=False), dict(method='graph-adapter'),
                                    dict(pause_after_epochs=-1), dict(pause_after_epochs=51)])
 def test_pause_rejects_unsafe_scopes(inputs, change):
     inputs.pause_after_epochs = 8

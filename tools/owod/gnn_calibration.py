@@ -61,11 +61,19 @@ def build_calibration_dataset(coco_path: Path, annotation: Path,
 
 
 def dataset_indices_for_class(dataset: CocoDetection, class_id: int) -> list[int]:
-    return [
-        index for index, image_id in enumerate(dataset.ids)
-        if any(int(annotation["category_id"]) == int(class_id)
-               for annotation in dataset.coco.imgToAnns.get(image_id, []))
-    ]
+    # Calibration annotations/ids are immutable for this dataset's lifetime.
+    # Build every class index once rather than rescanning all images for each
+    # source-target probe. Preserve image order and count an image only once.
+    if not hasattr(dataset, '_calibration_class_indices'):
+        by_class = {}
+        for index, image_id in enumerate(dataset.ids):
+            categories = {int(annotation['category_id'])
+                          for annotation in dataset.coco.imgToAnns.get(image_id, [])}
+            for category in categories:
+                by_class.setdefault(category, []).append(index)
+        dataset._calibration_class_indices = {category: tuple(indices)
+                                              for category, indices in by_class.items()}
+    return list(dataset._calibration_class_indices.get(int(class_id), ()))
 
 
 def class_loader(dataset: CocoDetection, class_id: int, batch_size: int,

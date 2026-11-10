@@ -132,6 +132,12 @@ def test_launcher_binds_variant_keeps_results_and_stops_on_bad_data(tmp_path, va
     assert '--discovery-objectness-loss' not in command
     assert ('--discovery-known-rank-coef' in command) == (variant != 'guarded')
     assert ('--discovery-feature-grad-scale' in command) == (variant != 'ranking')
+    trace.write_text('')
+    result = execute('--dry-run', '--profile-runtime')
+    assert result.returncode == 0, result.stdout + result.stderr
+    profiled = next(shlex.split(line) for line in trace.read_text().splitlines() if 'run_benchmark.py' in line)
+    assert profiled[profiled.index('--profile-runtime-steps') + 1] == '50'
+    assert profiled[profiled.index('--profile-runtime-warmup') + 1] == '20'
     directory = tmp_path / f'output/tree-detr-m-v8-{variant}-3090/m-owodb/seed_42/stage_0/increment'
     directory.mkdir(parents=True)
     checkpoint = directory / 'checkpoint.pth'

@@ -1,5 +1,8 @@
 # Discovery v8：已知／未知评分约束与发现梯度对照
 
+教师计算精简和 `--profile-runtime` 的日志位置、恢复边界，以及独立的新链计算／
+风险消融，见[运行效率说明](owod-runtime-optimization-v3.md)。
+
 这是针对 2026-11-09 M-OWODB Task 1 退化的实验性实现，尚无服务器 AP 提升结论。
 保留 Deformable DETR、affinity GNN、discovery adapter、匿名原型、快照继承与旧类保持。
 作者 ImageSets、类别顺序、schema-3 manifest／输入哈希、联合 Top50 与作者 VOC 积分

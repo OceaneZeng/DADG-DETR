@@ -111,7 +111,7 @@ class DeformableDETR(nn.Module):
             for box_embed in self.bbox_embed:
                 nn.init.constant_(box_embed.layers[-1].bias.data[2:], 0.0)
 
-    def forward(self, samples: NestedTensor):
+    def forward(self, samples: NestedTensor, *, final_only=False):
         """ The forward expects a NestedTensor, which consists of:
                - samples.tensor: batched images, of shape [batch_size x 3 x H x W]
                - samples.mask: a binary mask of shape [batch_size x H x W], containing 1 on padded pixels
@@ -166,7 +166,10 @@ class DeformableDETR(nn.Module):
 
         outputs_classes = []
         outputs_coords = []
-        for lvl in range(hs.shape[0]):
+        # Teacher consumers need only the final predictions. Decoder-internal
+        # refinement still runs in the transformer; skip only unused heads here.
+        levels = [hs.shape[0] - 1] if final_only else range(hs.shape[0])
+        for lvl in levels:
             if lvl == 0:
                 reference = init_reference
             else:
@@ -190,7 +193,7 @@ class DeformableDETR(nn.Module):
         routes = routing_outputs(self)
         if routes:
             out['adapter_routes'] = routes
-        if self.aux_loss:
+        if self.aux_loss and not final_only:
             out['aux_outputs'] = self._set_aux_loss(outputs_class, outputs_coord)
 
         if self.two_stage:
@@ -203,6 +206,15 @@ class DeformableDETR(nn.Module):
             out['attention_feature'] = features[1].tensors
             out['padded_size'] = samples.tensors.shape[-2:]
         return out
+
+    @torch.no_grad()
+    def forward_teacher(self, samples, *, purpose='distillation'):
+        if self.training:
+            raise ValueError('Teacher forward requires eval mode')
+        if purpose != 'distillation':
+            raise ValueError('Plain detector supports only distillation teacher outputs')
+        outputs = self(samples, final_only=True)
+        return {key: outputs[key] for key in ('pred_logits', 'pred_boxes')}
 
     @torch.jit.unused
     def _set_aux_loss(self, outputs_class, outputs_coord):

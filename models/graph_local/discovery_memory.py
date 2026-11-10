@@ -2,6 +2,7 @@
 import torch
 from torch import nn
 from torch.nn import functional as F
+from util.runtime_profile import scope
 
 
 class PrototypeMemory(nn.Module):
@@ -63,6 +64,10 @@ class AffinityGraph(nn.Module):
         return F.normalize(self.project(features), dim=-1) @ F.normalize(self.project(centers), dim=-1).T
 
     def forward(self, features, memory):
+        with scope('affinity_graph'):
+            return self._forward(features, memory)
+
+    def _forward(self, features, memory):
         query = F.normalize(self.project(features), dim=-1)
         nodes = F.normalize(self.project(memory.centers.detach()), dim=-1)
         valid = memory.counts > 0

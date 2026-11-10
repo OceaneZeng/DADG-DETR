@@ -6,6 +6,19 @@ from tools.owod.protocol import file_sha256, stage_files, RETIRED_MESSAGE
 
 
 def configure_run(args):
+    risk_mode = getattr(args, 'graph_risk_mode', 'learned')
+    compute = getattr(args, 'graph_adapter_compute', 'loop')
+    if risk_mode not in ('learned', 'disabled') or compute not in ('loop', 'batched'):
+        raise ValueError('Invalid graph risk or adapter compute mode')
+    if risk_mode != 'learned' or compute != 'loop':
+        if not (getattr(args, 'owod_discovery', False) or getattr(args, 'graph_routed_adapter', False)):
+            raise ValueError('Graph runtime/ablation options require graph-routed adapters')
+    if risk_mode == 'disabled':
+        if getattr(args, 'screen_branch_checkpoint', ''):
+            raise ValueError('Disabled risk requires an independent task chain, not a shared GNN parent')
+        if getattr(args, 'graph_gnn_checkpoint', ''):
+            raise ValueError('Disabled risk cannot consume a graph GNN checkpoint')
+        args.graph_risk_beta = 0.
     ramp_epochs = getattr(args, 'discovery_pseudo_ramp_epochs', 0)
     objectness_loss = getattr(args, 'discovery_objectness_loss', 'balanced-bce')
     pseudo_normalization = getattr(args, 'discovery_pseudo_normalization', 'weight-sum')
@@ -142,7 +155,7 @@ def configure_run(args):
                 or not math.isfinite(args.graph_risk_beta) or args.graph_risk_beta < 0
                 or not math.isfinite(args.graph_route_loss_coef) or args.graph_route_loss_coef <= 0):
             raise ValueError('Invalid graph adapter method hyperparameters')
-        if args.owod_stage > 0 and not args.resume and args.owod_phase == 'increment':
+        if risk_mode == 'learned' and args.owod_stage > 0 and not args.resume and args.owod_phase == 'increment':
             if not Path(args.graph_gnn_checkpoint).is_file():
                 raise ValueError('New task requires a calibrated preceding-stage --graph-gnn-checkpoint')
 
@@ -203,6 +216,9 @@ def validate_checkpoint(args, checkpoint, resume=False):
     if bool(getattr(saved, 'graph_routed_adapter', False)) != bool(getattr(args, 'graph_routed_adapter', False)):
         raise ValueError('Cannot switch graph adapter method within the checkpoint chain')
     if getattr(args, 'graph_routed_adapter', False):
+        for field, default in (('graph_risk_mode', 'learned'), ('graph_adapter_compute', 'loop')):
+            if getattr(saved, field, default) != getattr(args, field, default):
+                raise ValueError(f'Graph adapter checkpoint cannot change {field}')
         if not branching and getattr(saved, 'graph_routing', 'hard') != getattr(args, 'graph_routing', 'hard'):
             raise ValueError('Graph adapter checkpoint cannot change graph_routing')
         if not branching and getattr(saved, 'graph_localization', 'frozen') != getattr(args, 'graph_localization', 'frozen'):
@@ -223,8 +239,15 @@ def validate_checkpoint(args, checkpoint, resume=False):
                     or spec['rank'] != args.graph_adapter_rank
                     or spec['last_n'] != args.graph_adapter_last_n
                     or spec['risk_beta'] != args.graph_risk_beta
+                    or spec.get('risk_mode', 'learned') != getattr(args, 'graph_risk_mode', 'learned')
+                    or spec.get('compute', 'loop') != getattr(args, 'graph_adapter_compute', 'loop')
                     or spec.get('routing', 'hard') != getattr(args, 'graph_routing', 'hard')):
                 raise ValueError('Graph checkpoint adapter layout differs from the official task chain')
+            if spec.get('risk_mode') == 'disabled' and (
+                    spec.get('gnn_sha256') is not None
+                    or spec.get('score_semantics') != 'disabled_no_interference_controller'
+                    or any(value != 0 for row in spec['risk'] for value in row)):
+                raise ValueError('Disabled risk checkpoint contains learned controller state')
     stage = args.owod_stage if resume or args.owod_phase == 'finetune' else args.owod_stage - 1
     phase = args.owod_phase if resume else ('increment' if args.owod_phase == 'finetune'
                                           or stage == 0 else 'finetune')

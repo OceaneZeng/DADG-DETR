@@ -27,6 +27,15 @@ from models.graph_local.lora import lora_delta_vector
 from models.graph_local.routed_adapter import mask_inactive_adapter_gradients
 from models.graph_local.pseudo_labels import select_teacher_pseudo_labels
 from models.owod_benchmark_eval import evaluate_author_benchmark
+from util.runtime_profile import scope
+
+
+@torch.no_grad()
+def teacher_prediction(teacher, samples, purpose):
+    # Other baseline wrappers keep their existing full-forward behavior.
+    if hasattr(teacher, 'forward_teacher'):
+        return teacher.forward_teacher(samples, purpose=purpose)
+    return teacher(samples)
 
 
 def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
@@ -49,7 +58,8 @@ def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
                     local_margin: float = 1.0,
                     off_neighborhood_basis: torch.Tensor | None = None,
                     off_projection_coef: float = 0.0,
-                    discovery_teacher: torch.nn.Module | None = None):
+                    discovery_teacher: torch.nn.Module | None = None,
+                    runtime_profile=None):
     model.train()
     criterion.train()
     metric_logger = utils.MetricLogger(
@@ -77,8 +87,8 @@ def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
         optimizer.zero_grad(set_to_none=True)
         teacher_outputs = None
         if teacher is not None:
-            with torch.no_grad():
-                teacher_outputs = teacher(samples)
+            with scope('old_teacher_forward'):
+                teacher_outputs = teacher_prediction(teacher, samples, 'distillation')
         completed_targets = targets
         pseudo_label_counts = [0] * len(targets)
         if teacher_completion:
@@ -90,14 +100,16 @@ def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
                 duplicate_iou=teacher_duplicate_iou,
                 ground_truth_iou=teacher_ground_truth_iou,
                 max_per_image=teacher_max_per_image)
-        outputs = model(samples)
+        with scope('student_forward'):
+            outputs = model(samples)
         # The criterion discards teacher predictions during warmup. Keep the
         # teacher's EMA/prototype updates below, but skip this unused forward.
         if discovery_teacher is not None and epoch >= getattr(criterion, 'warmup', 0):
             from models.graph_local.discovery_candidates import flip_samples
-            with torch.no_grad():
-                outputs['discovery_teacher'] = discovery_teacher(flip_samples(samples))
-        loss_dict = criterion(outputs, completed_targets)
+            with scope('ema_teacher_forward'):
+                outputs['discovery_teacher'] = teacher_prediction(discovery_teacher, flip_samples(samples), 'discovery')
+        with scope('criterion'):
+            loss_dict = criterion(outputs, completed_targets)
         weight_dict = dict(criterion.weight_dict)
         if local_margin_coef > 0:
             loss_dict['loss_local_margin'] = local_margin_loss(
@@ -112,10 +124,11 @@ def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
             weight_dict['loss_off_projection'] = float(off_projection_coef)
         distill_query_count = 0
         if teacher_outputs is not None and distill_old_class_ids:
-            distill_losses, distill_query_count = old_class_distillation_losses(
-                outputs, teacher_outputs, distill_old_class_ids or [],
-                score_threshold=distill_score_threshold,
-                max_queries_per_image=distill_max_queries)
+            with scope('distillation'):
+                distill_losses, distill_query_count = old_class_distillation_losses(
+                    outputs, teacher_outputs, distill_old_class_ids or [],
+                    score_threshold=distill_score_threshold,
+                    max_queries_per_image=distill_max_queries)
             loss_dict.update(distill_losses)
             weight_dict.update({
                 'loss_distill_cls': float(distill_class_coef),
@@ -124,7 +137,8 @@ def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
         losses = sum(loss_dict[k] * weight_dict[k] for k in loss_dict.keys() if k in weight_dict)
 
         # reduce losses over all GPUs for logging purposes
-        loss_dict_reduced = utils.reduce_dict(loss_dict)
+        with scope('loss_reduction'):
+            loss_dict_reduced = utils.reduce_dict(loss_dict)
         loss_dict_reduced_unscaled = {f'{k}_unscaled': v
                                       for k, v in loss_dict_reduced.items()}
         loss_dict_reduced_scaled = {k: v * weight_dict[k]
@@ -140,7 +154,8 @@ def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
                   'image_ids': [t['image_id'].detach().cpu().tolist() for t in targets]}, flush=True)
             sys.exit(1)
 
-        losses.backward()
+        with scope('backward'):
+            losses.backward()
         mask_inactive_adapter_gradients(model)
         try:
             if max_norm > 0:
@@ -153,12 +168,15 @@ def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
             print('Gradient failure context:', {'epoch': epoch,
                   'image_ids': [t['image_id'].detach().cpu().tolist() for t in targets]}, flush=True)
             raise
-        optimizer.step()
+        with scope('optimizer_step'):
+            optimizer.step()
         if discovery_teacher is not None:
             from models.graph_local.discovery import update_ema
             current_model = model.module if hasattr(model, 'module') else model
-            current_model.observe_training(criterion.evidence)
-            update_ema(discovery_teacher, current_model)
+            with scope('memory_update'):
+                current_model.observe_training(criterion.evidence)
+            with scope('ema_update'):
+                update_ema(discovery_teacher, current_model)
 
         # Log diagnostics from the same all-rank reduction as losses. Do not
         # hide new discovery diagnostics behind an explicit two-key allowlist.
@@ -176,7 +194,10 @@ def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
         # Release prior batch outputs before allocating the next forward graph.
         del outputs, teacher_outputs, losses, loss_dict, loss_dict_reduced
         del loss_dict_reduced_scaled, loss_dict_reduced_unscaled, losses_reduced_scaled
-        samples, targets = prefetcher.next()
+        with scope('prefetch_next'):
+            samples, targets = prefetcher.next()
+        if runtime_profile is not None:
+            runtime_profile.step()
     # gather the stats from all processes
     metric_logger.synchronize_between_processes()
     print("Averaged stats:", metric_logger)

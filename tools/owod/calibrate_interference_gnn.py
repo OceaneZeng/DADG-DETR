@@ -7,6 +7,7 @@ import argparse
 import gc
 import json
 import sys
+import time
 from pathlib import Path
 
 import torch
@@ -227,6 +228,13 @@ def run(args: argparse.Namespace) -> int:
         print("--force ignores existing sketch and harm-row cache files")
 
     device = torch.device(args.device)
+    def clock():
+        if device.type == 'cuda':
+            torch.cuda.synchronize(device)
+        return time.perf_counter()
+    started = clock()
+    timing = {}
+    cache_hits = dict(sketches=0, base_losses=0, harm_rows=0)
     print(json.dumps({
         "method": "empirical_train_loss_interference",
         "stage": args.stage,
@@ -245,17 +253,28 @@ def run(args: argparse.Namespace) -> int:
                                         lightweight=args.lightweight)
     model, criterion = load_detector(args, args.checkpoint, device)
     criterion.active_class_ids = class_ids
+    now = clock()
+    timing['dataset_and_detector_load'] = now - started
+    phase_start = now
 
     sketch_cache = args.output_dir / "sketches"
+    def sketch_progress(message):
+        if 'cache hit' in message:
+            cache_hits['sketches'] += 1
+        print(message)
     sketches, sketch_counts = compute_gradient_sketches(
         model, criterion, {class_id: dataset for class_id in class_ids}, class_ids,
         device, cache_dir=sketch_cache, reuse_cache=not args.force,
+        progress=sketch_progress,
         cache_identity={**identity, "checkpoint": str(args.checkpoint),
                         "annotation": str(annotation)},
         batch_size=args.batch_size,
         num_workers=args.num_workers, max_images=args.sketch_max_images,
         last_decoder_layers=args.last_decoder_layers)
     ordered_ids, features = compress_gradient_sketches(sketches, args.feature_dim)
+    now = clock()
+    timing['gradient_sketches'] = now - phase_start
+    phase_start = now
 
     base_loss_path = args.output_dir / "base_class_losses.json"
     base_losses: dict[int, float] = {}
@@ -274,6 +293,7 @@ def run(args: argparse.Namespace) -> int:
             base_counts = {int(key): int(value) for key, value in saved["matched_annotations"].items()}
     for position, class_id in enumerate(class_ids, start=1):
         if class_id in base_losses:
+            cache_hits['base_losses'] += 1
             print(f"Base loss [{position}/{len(class_ids)}] class={class_id} cache hit")
             continue
         print(f"Base loss [{position}/{len(class_ids)}] class={class_id} computing")
@@ -288,6 +308,9 @@ def run(args: argparse.Namespace) -> int:
             "cache_config": base_loss_config,
         })
 
+    now = clock()
+    timing['base_class_losses'] = now - phase_start
+    phase_start = now
     harm_dir = args.output_dir / "harm_rows"
     harm_dir.mkdir(parents=True, exist_ok=True)
     harm_rows: dict[int, dict[int, float]] = {}
@@ -305,6 +328,7 @@ def run(args: argparse.Namespace) -> int:
         if row_path.is_file() and not args.force:
             saved = read_json(row_path)
             if saved.get("cache_config") == harm_config:
+                cache_hits['harm_rows'] += 1
                 harm_rows[source_class] = {
                     int(key): float(value) for key, value in saved["harm"].items()}
                 print(f"Harm probe [{position}/{len(probe_sources)}] source={source_class} cache hit")
@@ -342,6 +366,10 @@ def run(args: argparse.Namespace) -> int:
         gc.collect()
         if device.type == "cuda":
             torch.cuda.empty_cache()
+
+    now = clock()
+    timing['source_probes_and_target_losses'] = now - phase_start
+    phase_start = now
 
     size = len(ordered_ids)
     index = {class_id: offset for offset, class_id in enumerate(ordered_ids)}
@@ -403,6 +431,9 @@ def run(args: argparse.Namespace) -> int:
         validation_model, artifact, validation_mask, args.validation_k)
     print("Held-out source validation:", json.dumps({
         "classes": held_out, **validation_metrics}, sort_keys=True))
+    now = clock()
+    timing['artifact_and_validation_gnn'] = now - phase_start
+    phase_start = now
 
     set_seed(args.seed)
     final_model = ClassInterferenceGNN(
@@ -413,6 +444,9 @@ def run(args: argparse.Namespace) -> int:
         final_model, [artifact], epochs=args.gnn_epochs, lr=args.gnn_lr,
         ranking_margin=ablation["ranking_margin"],
         ranking_weight=ablation["ranking_weight"])
+    now = clock()
+    timing['final_gnn_fit'] = now - phase_start
+    timing['total_before_save'] = now - started
     checkpoint_path = args.output_dir / f"gnn_stage{args.stage}{suffix}.pt"
     metadata = {
         **artifact["metadata"],
@@ -440,6 +474,8 @@ def run(args: argparse.Namespace) -> int:
         "validation_training_loss": validation_history[-1],
         "final_training_loss": final_history[-1],
         "gnn_ablation": ablation,
+        "timing_seconds": timing,
+        "cache_hits": cache_hits,
     }
     write_json(args.output_dir / f"calibration_summary{suffix}.json", summary)
     write_json(args.output_dir / f"gnn_history{suffix}.json", {

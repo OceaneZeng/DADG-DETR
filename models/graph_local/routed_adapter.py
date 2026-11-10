@@ -7,6 +7,7 @@ from torch import nn
 from torch.nn import functional as F
 
 from .lora import freeze_for_class_ids, target_decoder_layers
+from util.runtime_profile import scope
 
 
 class ClassAdapter(nn.Module):
@@ -40,6 +41,12 @@ class RiskRoutedStage(nn.Module):
                 or any(c < 0 or c >= head.out_features for c in self.class_ids + self.old_ids)):
             raise ValueError('Adapter classes must be disjoint, unique, nonempty seen-class IDs')
         self.beta = float(spec['risk_beta'])
+        self.risk_mode = spec.get('risk_mode', 'learned')
+        self.compute = spec.get('compute', 'loop')
+        if self.risk_mode not in ('learned', 'disabled') or self.compute not in ('loop', 'batched'):
+            raise ValueError('Unknown adapter risk or compute mode')
+        if self.risk_mode == 'disabled' and self.beta != 0:
+            raise ValueError('Disabled risk requires beta=0')
         self.routing = spec.get('routing', 'hard')
         if self.routing not in ('hard', 'soft'):
             raise ValueError('Unknown adapter routing rule')
@@ -53,6 +60,8 @@ class RiskRoutedStage(nn.Module):
                 or not torch.isfinite(risk).all() or (risk < 0).any() or (risk > 1).any()
                 or not math.isfinite(self.beta) or self.beta < 0 or spec['rank'] <= 0):
             raise ValueError('Invalid directed risk matrix or adapter configuration')
+        if self.risk_mode == 'disabled' and risk.count_nonzero():
+            raise ValueError('Disabled risk requires an all-zero placeholder matrix')
         self.register_buffer('risk', risk)
         with torch.no_grad():
             self.router.weight[:-1].copy_(head.weight[list(self.class_ids)])
@@ -66,17 +75,33 @@ class RiskRoutedStage(nn.Module):
         self.last_gates = None
 
     def forward(self, x):
+        with scope('class_adapter'):
+            return self._forward(x)
+
+    def _forward(self, x):
         # Router supervision should not rewrite the upstream representation.
         logits = self.router(x.detach())
         self.last_logits = logits
         probabilities = logits.softmax(-1)
         selected = (F.one_hot(probabilities.argmax(-1), probabilities.shape[-1])[..., :-1]
                     if self.routing == 'hard' else torch.ones_like(probabilities[..., :-1]))
-        old_probability = self.old_evidence(x.detach()).sigmoid()
-        # Maximum risk-weighted old evidence avoids dependence on old-class count.
-        risk_evidence = (old_probability.unsqueeze(-2) * self.risk).amax(-1)
-        gates = probabilities[..., :-1] * selected * torch.exp(-self.beta * risk_evidence)
+        gates = probabilities[..., :-1] * selected
+        if self.beta:
+            old_probability = self.old_evidence(x.detach()).sigmoid()
+            # Maximum risk-weighted old evidence avoids dependence on old-class count.
+            risk_evidence = (old_probability.unsqueeze(-2) * self.risk).amax(-1)
+            gates = gates * torch.exp(-self.beta * risk_evidence)
         self.last_gates = gates.detach()
+        if self.compute == 'batched':
+            # Keep individual Parameters/state_dict keys and DDP zero gradients.
+            # Stack factors, not effective BA matrices, to retain low-rank cost.
+            down = torch.stack([adapter.down.weight for adapter in self.adapters])
+            up = torch.stack([adapter.up.weight for adapter in self.adapters])
+            flat = x.reshape(-1, x.shape[-1])
+            hidden = torch.matmul(flat.unsqueeze(0), down.transpose(1, 2))
+            updates = torch.bmm(hidden, up.transpose(1, 2))
+            weighted = updates * gates.reshape(-1, len(self.adapters)).T.unsqueeze(-1)
+            return weighted.sum(0).reshape_as(x)
         updates = torch.stack([adapter(x) for adapter in self.adapters], dim=-2)
         return (updates * gates.unsqueeze(-1)).sum(-2)
 

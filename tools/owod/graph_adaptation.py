@@ -28,6 +28,27 @@ def validate_gnn_metadata(metadata, args, source_checkpoint):
 
 
 def build_stage_spec(model, criterion, args, source_checkpoint):
+    risk_mode = getattr(args, 'graph_risk_mode', 'learned')
+    compute = getattr(args, 'graph_adapter_compute', 'loop')
+    if risk_mode == 'disabled':
+        if args.graph_risk_beta != 0:
+            raise ValueError('Disabled risk requires beta=0')
+        _, files = experiment_files(args, args.owod_stage)
+        return {
+            'stage': args.owod_stage, 'class_ids': list(args.owod_current_class_ids),
+            'old_ids': list(args.owod_previous_class_ids),
+            'rank': args.graph_adapter_rank, 'last_n': args.graph_adapter_last_n,
+            'risk_mode': 'disabled', 'risk_beta': 0.,
+            'risk': [[0.] * len(args.owod_previous_class_ids) for _ in args.owod_current_class_ids],
+            'routing': getattr(args, 'graph_routing', 'hard'), 'compute': compute,
+            'gnn_sha256': None, 'source_checkpoint_sha256': file_sha256(Path(source_checkpoint)),
+            'training_annotation_sha256': {key: file_sha256(files[key])
+                                           for key in ('train', 'increment_train')},
+            'sketch_max_images': 0, 'sketch_counts': {},
+            'score_semantics': 'disabled_no_interference_controller',
+        }
+    if risk_mode != 'learned':
+        raise ValueError('Unknown graph risk mode')
     # Lazy import: calibration utilities import main for the checkpoint loader.
     from tools.owod.gnn_calibration import build_calibration_dataset, compute_gradient_sketches
     gnn, metadata = load_gnn_checkpoint(Path(args.graph_gnn_checkpoint), device='cpu')
@@ -59,7 +80,7 @@ def build_stage_spec(model, criterion, args, source_checkpoint):
         scores = gnn(features)['edge_prob']
     positions = {c: i for i, c in enumerate(ordered)}
     risk = scores[[positions[c] for c in current]][:, [positions[c] for c in old]]
-    return {
+    spec = {
         'stage': args.owod_stage, 'class_ids': current, 'old_ids': old,
         'rank': args.graph_adapter_rank, 'last_n': args.graph_adapter_last_n,
         'risk_beta': args.graph_risk_beta, 'risk': risk.tolist(),
@@ -71,6 +92,10 @@ def build_stage_spec(model, criterion, args, source_checkpoint):
         'sketch_max_images': args.graph_sketch_max_images, 'sketch_counts': counts,
         'score_semantics': 'relative_directed_train_loss_increase',
     }
+    # Leave legacy layout dictionaries unchanged at their default settings.
+    if compute != 'loop':
+        spec['compute'] = compute
+    return spec
 
 
 @torch.no_grad()

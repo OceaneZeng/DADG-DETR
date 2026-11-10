@@ -21,7 +21,8 @@ for arg in "$@"; do
     --resume) resume=true; runner_args+=("$arg") ;;
     --dry-run) dry_run=true; runner_args+=("$arg") ;;
     --full) pause_epochs=0 ;;
-    *) echo 'Accepted options: [ranking|guarded|combined] --resume --dry-run --full.' >&2; exit 2 ;;
+    --profile-runtime) runner_args+=(--profile-runtime-steps 50 --profile-runtime-warmup 20) ;;
+    *) echo 'Accepted options: [ranking|guarded|combined] --resume --dry-run --full --profile-runtime.' >&2; exit 2 ;;
   esac
 done
 cd "$(dirname "${BASH_SOURCE[0]}")/../.."

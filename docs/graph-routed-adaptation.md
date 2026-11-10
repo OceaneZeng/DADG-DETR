@@ -4,6 +4,9 @@
 这是项目研究方法，使用 M-OWODB / S-OWODB 作者数据协议；不是 ORE 或
 OW-DETR 原方法，也未证明论文创新性或实验提升。
 
+可选批量计算及完整跳过控制器的 `--graph-risk-mode disabled` 见
+[运行效率说明](owod-runtime-optimization-v3.md)。后者是独立消融，不改变默认 learned 链。
+
 ## 三个模块
 
 1. Class-Interference GNN：用类别梯度 sketch 预测有向干扰矩阵。

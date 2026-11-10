@@ -219,7 +219,7 @@ def test_controller_builds_correct_directed_slice_from_actual_gnn(tmp_path, monk
         supervision='empirical_train_loss_increase', production_ready=True, uses_validation_labels=False,
         manifest_sha256='manifest', checkpoint_sha256=file_sha256(source), stage=0,
         last_decoder_layers=1, training_classes=[1, 2]))
-    monkeypatch.setattr(controller, 'stage_files', lambda *a: ({'image_root': str(tmp_path)}, files))
+    monkeypatch.setattr(controller, 'experiment_files', lambda *a: ({'image_root': str(tmp_path)}, files))
     monkeypatch.setattr(calibration, 'build_calibration_dataset', lambda root, path: path)
     sketches = {c: torch.arange(8).float() * c + c * c for c in (1, 2, 3, 4)}
 

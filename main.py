@@ -29,6 +29,7 @@ from models.graph_local import (freeze_for_class_ids, inject_decoder_lora,
                                 merge_decoder_lora)
 from util.checkpoint import matching_state_dict
 from util.training_runtime import loader_worker_options, training_epoch_limit, write_training_status
+from util.runtime_profile import RuntimeProfile
 from util.experiment_log import (archive_log_file, experiment_log_path,
                                  prepare_log_file, start_file_logging,
                                  stop_file_logging)
@@ -60,7 +61,7 @@ def get_args_parser():
     parser.add_argument('--weight_decay', default=1e-4, type=float)
     parser.add_argument('--epochs', default=50, type=int)
     parser.add_argument('--pause-after-epochs', default=0, type=int,
-                        help='Pause full-data discovery Task 1 at this completed epoch count; 0 runs the full schedule')
+                        help='Pause full-data control/discovery Task 1 at this completed epoch count; 0 runs the full schedule')
     parser.add_argument('--lr_drop', default=40, type=int)
     parser.add_argument('--lr_drop_epochs', default=None, type=int, nargs='+')
     parser.add_argument('--clip_max_norm', default=0.1, type=float,
@@ -136,6 +137,10 @@ def get_args_parser():
     parser.add_argument('--graph-adapter-rank', type=int, default=8)
     parser.add_argument('--graph-adapter-last-n', type=int, default=2)
     parser.add_argument('--graph-risk-beta', type=float, default=2.0)
+    parser.add_argument('--graph-risk-mode', choices=('learned', 'disabled'), default='learned',
+                        help='Independent ablation: disabled skips GNN calibration/sketches and sets beta=0')
+    parser.add_argument('--graph-adapter-compute', choices=('loop', 'batched'), default='loop',
+                        help='Batched low-rank products for new runs; loop preserves legacy arithmetic')
     parser.add_argument('--graph-route-loss-coef', type=float, default=1.0)
     parser.add_argument('--graph-routing', choices=('hard', 'soft'), default='hard')
     parser.add_argument('--graph-localization', choices=('frozen', 'bbox-last'), default='frozen')
@@ -289,24 +294,33 @@ def get_args_parser():
                         help='Human-readable log; relative paths are placed under output_dir')
     parser.add_argument('--no-file-log', action='store_true',
                         help='Disable the rank-0 human-readable experiment log')
+    parser.add_argument('--profile-runtime-steps', type=int, default=0,
+                        help='Profile this many batches in the first executed epoch; 0 disables profiling')
+    parser.add_argument('--profile-runtime-warmup', type=int, default=20,
+                        help='Unrecorded profiler warmup batches; profiling never shortens training')
 
     return parser
 
 
 def main(args):
     configure_run(args)
+    if getattr(args, 'profile_runtime_steps', 0) < 0 or getattr(args, 'profile_runtime_warmup', 20) < 0:
+        raise ValueError('Runtime profile steps and warmup must be nonnegative')
     if args.paper_baseline == 'ew-detr' and (args.ew_current_samples <= 0 or args.ew_previous_samples < 0):
         raise ValueError('EW-DETR requires positive current and nonnegative previous sample counts')
     if args.paper_baseline == 'cat' and not Path(args.cat_proposals).is_file():
         raise ValueError('CAT requires an existing --cat-proposals file')
     utils.init_distributed_mode(args)
     args.training_runtime = {
-        'version': 2, 'worker_start_method': 'spawn' if args.num_workers > 0 else 'none',
+        'version': 3, 'worker_start_method': 'spawn' if args.num_workers > 0 else 'none',
         'persistent_workers': False, 'checkpoint_save': 'atomic-replace',
         'discovery_evidence': 'rank-ordered-tensors' if args.owod_discovery else 'not-used',
         'ema': 'foreach-mul-add' if args.owod_discovery else 'not-used',
         'discovery_warmup_forward': 'skip-unused' if args.owod_discovery else 'not-used',
         'adapter_activity': 'single-host-read' if args.graph_routed_adapter else 'not-used',
+        'teacher_outputs': 'purpose-specific-final-heads',
+        'adapter_compute': getattr(args, 'graph_adapter_compute', 'loop'),
+        'graph_risk_mode': getattr(args, 'graph_risk_mode', 'learned'),
     }
     file_log_state = start_file_logging(args, utils.is_main_process())
     if utils.is_main_process() and args.output_dir:
@@ -488,8 +502,12 @@ def main(args):
     if args.graph_routed_adapter and utils.is_main_process() and args.output_dir:
         output_dir.mkdir(parents=True, exist_ok=True)
         with (output_dir / 'graph_adapter_config.json').open('w', encoding='utf-8') as handle:
-            json.dump({'method': 'graph-risk-routed-class-adapters',
+            json.dump({'method': ('query-routed-class-adapters-no-interference-controller'
+                                 if getattr(args, 'graph_risk_mode', 'learned') == 'disabled'
+                                 else 'graph-risk-routed-class-adapters'),
                        'task1': 'dense bootstrap', 'specs': args.graph_adapter_specs,
+                       'risk_mode': getattr(args, 'graph_risk_mode', 'learned'),
+                       'adapter_compute': getattr(args, 'graph_adapter_compute', 'loop'),
                        'route_loss_coef': args.graph_route_loss_coef,
                        'phase': args.owod_phase}, handle, indent=2)
 
@@ -586,6 +604,9 @@ def main(args):
     data_loader_val = DataLoader(dataset_val, args.batch_size, sampler=sampler_val,
                                  drop_last=False, collate_fn=utils.collate_fn, num_workers=args.num_workers,
                                  pin_memory=True, **loader_worker_options(args.num_workers))
+    if getattr(args, 'profile_runtime_steps', 0) and len(data_loader_train) < (
+            args.profile_runtime_steps + args.profile_runtime_warmup):
+        raise ValueError('Runtime profile window exceeds the training epoch; reduce steps/warmup')
 
     # lr_backbone_names = ["backbone.0", "backbone.neck", "input_proj", "transformer.encoder"]
     def match_name_keywords(n, name_keywords):
@@ -751,31 +772,44 @@ def main(args):
             criterion.epoch = epoch
         if args.distributed:
             sampler_train.set_epoch(epoch)
-        train_stats = train_one_epoch(
-            model, criterion, data_loader_train, optimizer, device, epoch, args.clip_max_norm,
-            print_freq=args.print_freq, teacher=teacher_model,
-            distill_old_class_ids=args.distill_old_class_ids,
-            distill_class_coef=args.distill_class_coef,
-            distill_bbox_coef=args.distill_bbox_coef,
-            distill_score_threshold=args.distill_score_threshold,
-            distill_max_queries=args.distill_max_queries,
-            teacher_completion=args.teacher_completion,
-            teacher_old_class_ids=args.teacher_old_class_ids,
-            teacher_score_threshold=args.teacher_score_threshold,
-            teacher_duplicate_iou=args.teacher_duplicate_iou,
-            teacher_ground_truth_iou=args.teacher_ground_truth_iou,
-            teacher_max_per_image=args.teacher_max_per_image,
-            graph_local_class_ids=args.graph_local_class_ids,
-            local_margin_coef=args.local_margin_coef,
-            local_margin=args.local_margin,
-            off_neighborhood_basis=off_neighborhood_basis,
-            off_projection_coef=args.off_projection_coef,
-            discovery_teacher=discovery_teacher)
+        with RuntimeProfile(args.output_dir, device,
+                steps=getattr(args, 'profile_runtime_steps', 0) if epoch == args.start_epoch else 0,
+                warmup=getattr(args, 'profile_runtime_warmup', 20), epoch=epoch, rank=utils.get_rank(),
+                metadata={'manifest_sha256': getattr(args, 'owod_manifest_sha256', None),
+                          'stage': args.owod_stage, 'phase': args.owod_phase,
+                          'batch_per_rank': args.batch_size, 'world_size': utils.get_world_size(),
+                          'runtime': args.training_runtime}) as runtime_profile:
+            train_stats = train_one_epoch(
+                model, criterion, data_loader_train, optimizer, device, epoch, args.clip_max_norm,
+                print_freq=args.print_freq, teacher=teacher_model,
+                distill_old_class_ids=args.distill_old_class_ids,
+                distill_class_coef=args.distill_class_coef,
+                distill_bbox_coef=args.distill_bbox_coef,
+                distill_score_threshold=args.distill_score_threshold,
+                distill_max_queries=args.distill_max_queries,
+                teacher_completion=args.teacher_completion,
+                teacher_old_class_ids=args.teacher_old_class_ids,
+                teacher_score_threshold=args.teacher_score_threshold,
+                teacher_duplicate_iou=args.teacher_duplicate_iou,
+                teacher_ground_truth_iou=args.teacher_ground_truth_iou,
+                teacher_max_per_image=args.teacher_max_per_image,
+                graph_local_class_ids=args.graph_local_class_ids,
+                local_margin_coef=args.local_margin_coef,
+                local_margin=args.local_margin,
+                off_neighborhood_basis=off_neighborhood_basis,
+                off_projection_coef=args.off_projection_coef,
+                discovery_teacher=discovery_teacher, runtime_profile=runtime_profile)
         lr_scheduler.step()
         if args.output_dir:
             checkpoint_paths = [output_dir / 'checkpoint.pth']
-            # extra checkpoint before LR drop and every 5 epochs
+            # Keep every epoch of a bounded supervised control for input-response
+            # diagnosis, without changing its registered optimizer schedule.
+            bounded_control = (end_epoch < args.epochs
+                               and getattr(args, 'control_postprocess_version', None)
+                               and not args.with_tree)
+            # extra checkpoint before LR drop, every 5 epochs, and at a pause
             if ((epoch + 1) % args.lr_drop == 0 or (epoch + 1) % 5 == 0
+                    or bounded_control
                     or epoch + 1 == end_epoch < args.epochs):
                 checkpoint_paths.append(output_dir / f'checkpoint{epoch:04}.pth')
             for checkpoint_path in checkpoint_paths:

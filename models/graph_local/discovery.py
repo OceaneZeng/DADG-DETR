@@ -14,6 +14,7 @@ from util import box_ops
 from models.segmentation import sigmoid_focal_loss
 from util.misc import get_world_size, is_dist_avail_and_initialized
 from util.training_runtime import gather_evidence, foreach_ema_parameters, copy_model_buffers
+from util.runtime_profile import scope
 
 DISCOVERY_VERSION = 5
 DISCOVERY_RAMP_VERSION = 6
@@ -98,14 +99,34 @@ class DiscoveryDetector(nn.Module):
             layer.discovery_adapter = DiscoveryFFN(args.hidden_dim, args.graph_adapter_rank,
                                                    args.discovery_capacity)
 
-    def forward(self, samples):
+    def forward(self, samples, *, teacher_purpose=None):
         from util.misc import NestedTensor, nested_tensor_from_tensor_list
+        if teacher_purpose is not None:
+            if self.training or teacher_purpose not in ('distillation', 'discovery'):
+                raise ValueError('Teacher forward requires eval mode and a supported purpose')
         if not isinstance(samples, NestedTensor):
             samples = nested_tensor_from_tensor_list(samples)
-        outputs = self.detr(samples)
+        outputs = (self.detr(samples, final_only=True) if teacher_purpose is not None
+                   else self.detr(samples))
+        if teacher_purpose == 'distillation':
+            self._discovery_routes()  # Release transient per-layer references.
+            return {key: outputs[key] for key in ('pred_logits', 'pred_boxes')}
         features = outputs.pop('decoder_features')[-1]
         outputs['query_features'] = features
         outputs.update(self.affinity_graph(scale_gradient(features, self.feature_grad_scale), self.memory))
+        routes, route_inputs = self._discovery_routes()
+        if teacher_purpose is None:
+            outputs['discovery_routes'] = routes
+            outputs['discovery_inputs'] = route_inputs
+        masks = samples.mask
+        outputs['image_sizes'] = [(int((~mask).any(1).sum()), int((~mask).any(0).sum())) for mask in masks]
+        if teacher_purpose == 'discovery':
+            # Keep the graph embedding: cross-view consistency consumes it.
+            return {key: outputs[key] for key in ('pred_boxes', 'query_features',
+                    'attention_feature', 'padded_size', 'image_sizes', 'discovery_embedding')}
+        return outputs
+
+    def _discovery_routes(self):
         routes = []
         route_inputs = []
         for module in self.modules():
@@ -114,11 +135,11 @@ class DiscoveryDetector(nn.Module):
                 route_inputs.append(module.last_inputs)
                 module.last_logits = None
                 module.last_inputs = None
-        outputs['discovery_routes'] = routes
-        outputs['discovery_inputs'] = route_inputs
-        masks = samples.mask
-        outputs['image_sizes'] = [(int((~mask).any(1).sum()), int((~mask).any(0).sum())) for mask in masks]
-        return outputs
+        return routes, route_inputs
+
+    @torch.no_grad()
+    def forward_teacher(self, samples, *, purpose='discovery'):
+        return self(samples, teacher_purpose=purpose)
 
     def train_discovery(self):
         self.affinity_graph.requires_grad_(True)
@@ -285,8 +306,9 @@ class DiscoveryCriterion(nn.Module):
                     target['labels'].new_tensor(self.known_ids))]} for target in targets]
         indices = self.matcher(outputs, targets)
         teacher = outputs.get('discovery_teacher') if self.training and self.epoch >= self.warmup else None
-        candidates = mine_candidates(outputs, targets, indices, self.known_ids, teacher,
-                                     self.top_k, self.saliency_threshold, self.consistency_threshold)
+        with scope('candidates'):
+            candidates = mine_candidates(outputs, targets, indices, self.known_ids, teacher,
+                                         self.top_k, self.saliency_threshold, self.consistency_threshold)
         pseudo, background, confidence = (candidates[k] for k in ('pseudo', 'background', 'weights'))
         positive = torch.zeros_like(pseudo)
         semantic = torch.full_like(pseudo, -1, dtype=torch.long)

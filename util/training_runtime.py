@@ -89,12 +89,14 @@ def training_epoch_limit(args):
     budget = getattr(args, 'pause_after_epochs', 0)
     if budget < 0 or budget > args.epochs:
         raise ValueError('pause-after-epochs must be between 0 and the registered epoch count')
+    control = not any(getattr(args, name, False) for name in
+                      ('owod_discovery', 'graph_routed_adapter', 'paper_baseline', 'with_tree'))
     if budget and (not getattr(args, 'owod_manifest', '')
-                   or not getattr(args, 'owod_discovery', False)
+                   or not (control or getattr(args, 'owod_discovery', False))
                    or getattr(args, 'owod_stage', None) != 0
                    or getattr(args, 'owod_phase', None) != 'increment'
                    or getattr(args, 'owod_screening', '')):
-        raise ValueError('pause-after-epochs is restricted to full-data discovery Task 1')
+        raise ValueError('pause-after-epochs is restricted to full-data control/discovery Task 1')
     return budget or args.epochs
 
 

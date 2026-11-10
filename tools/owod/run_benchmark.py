@@ -26,9 +26,10 @@ def build_plan(args):
     no_distill = getattr(args, 'screen_no_distill', False)
     task1_only = getattr(args, 'task1_only', False)
     pause_after = getattr(args, 'pause_after_epochs', 0)
+    pause_method = getattr(args, 'method', 'control')
     if pause_after < 0 or (pause_after and (
-            not task1_only or not getattr(args, 'method', 'control').startswith('discovery'))):
-        raise ValueError('pause-after-epochs requires full-data discovery --task1-only and a nonnegative budget')
+            not task1_only or not (pause_method == 'control' or pause_method.startswith('discovery')))):
+        raise ValueError('pause-after-epochs requires full-data control/discovery --task1-only and a nonnegative budget')
     if task1_only and (screening or shared or shared_gnn):
         raise ValueError('task1-only is for fresh full-data Task 1, not screening/shared-parent runs')
     if no_distill and not (screening and shared and shared_gnn and args.method == 'discovery'):
@@ -57,6 +58,15 @@ def build_plan(args):
         raise FileNotFoundError(args.backbone_weights)
     image_root = Path(manifest['image_root'])
     method = getattr(args, 'method', 'control')
+    risk_mode = getattr(args, 'graph_risk_mode', 'learned')
+    compute = getattr(args, 'graph_adapter_compute', 'loop')
+    if risk_mode not in ('learned', 'disabled') or compute not in ('loop', 'batched'):
+        raise ValueError('Invalid graph risk or adapter compute mode')
+    if method == 'control' and (risk_mode != 'learned' or compute != 'loop'):
+        raise ValueError('Graph runtime/ablation options require graph-routed adapters')
+    if risk_mode == 'disabled' and shared:
+        raise ValueError('Disabled risk requires an independent task chain, not a shared GNN parent')
+    risk_beta = 0. if risk_mode == 'disabled' else getattr(args, 'graph_risk_beta', 2.)
     ramp_epochs = getattr(args, 'discovery_pseudo_ramp_epochs', 0)
     objectness_loss = getattr(args, 'discovery_objectness_loss', 'balanced-bce')
     pseudo_normalization = getattr(args, 'discovery_pseudo_normalization', 'weight-sum')
@@ -92,7 +102,7 @@ def build_plan(args):
         gnn_checkpoint = None
         if shared:
             gnn_checkpoint = shared_gnn
-        elif method != 'control' and stage > 0:
+        elif method != 'control' and stage > 0 and risk_mode == 'learned':
             calibration_dir = args.output_dir / manifest['protocol'] / f'seed_{args.seed}' / 'gnn' / f'stage_{stage - 1}'
             gnn_checkpoint = calibration_dir / f'gnn_stage{stage - 1}.pt'
             runs.append({'kind': 'calibration', 'stage': stage - 1, 'phase': 'calibration',
@@ -150,11 +160,15 @@ def build_plan(args):
             if method != 'control':
                 command += ['--graph-routed-adapter', '--graph-adapter-rank', str(args.graph_adapter_rank),
                             '--graph-adapter-last-n', str(args.graph_adapter_last_n),
-                            '--graph-risk-beta', str(args.graph_risk_beta),
+                            '--graph-risk-beta', str(risk_beta),
                             '--graph-route-loss-coef', str(args.graph_route_loss_coef),
                             '--graph-routing', getattr(args, 'graph_routing', 'hard'),
                             '--graph-localization', getattr(args, 'graph_localization', 'frozen'),
                             '--graph-sketch-max-images', str(args.graph_sketch_max_images)]
+                if risk_mode != 'learned':
+                    command += ['--graph-risk-mode', risk_mode]
+                if compute != 'loop':
+                    command += ['--graph-adapter-compute', compute]
                 if gnn_checkpoint:
                     command += ['--graph-gnn-checkpoint', str(gnn_checkpoint)]
                 if stage > 0 and not no_distill:
@@ -200,6 +214,8 @@ def build_plan(args):
         result['shared_task1'] = shared_identity
     if task1_only:
         result['scope'] = 'full-data Task 1 only; no automatic Task 2 transition'
+    if risk_mode == 'disabled':
+        result['interference_controller'] = 'disabled_no_interference_controller'
     return result
 
 
@@ -209,7 +225,7 @@ def main(argv=None):
     parser.add_argument('--task1-only', action='store_true',
                         help='Train only full-data Task 1 and stop before any increment/calibration')
     parser.add_argument('--pause-after-epochs', type=int, default=0,
-                        help='Pause discovery --task1-only at this completed epoch count without changing its plan')
+                        help='Pause control/discovery --task1-only at this completed epoch count without changing its plan')
     parser.add_argument('--owod-screening', type=Path)
     parser.add_argument('--screen-shared-task1', type=Path)
     parser.add_argument('--screen-shared-gnn', type=Path)
@@ -234,6 +250,8 @@ def main(argv=None):
     parser.add_argument('--graph-adapter-rank', type=int, default=8)
     parser.add_argument('--graph-adapter-last-n', type=int, default=2)
     parser.add_argument('--graph-risk-beta', type=float, default=2.0)
+    parser.add_argument('--graph-risk-mode', choices=('learned', 'disabled'), default='learned')
+    parser.add_argument('--graph-adapter-compute', choices=('loop', 'batched'), default='loop')
     parser.add_argument('--graph-route-loss-coef', type=float, default=1.0)
     parser.add_argument('--graph-routing', choices=('hard', 'soft'), default='hard')
     parser.add_argument('--graph-localization', choices=('frozen', 'bbox-last'), default='frozen')
@@ -245,9 +263,14 @@ def main(argv=None):
     parser.add_argument('--discovery-known-rank-coef', type=float, default=0.)
     parser.add_argument('--discovery-feature-grad-scale', type=float, default=1.)
     parser.add_argument('--graph-sketch-max-images', type=int, default=12)
+    parser.add_argument('--profile-runtime-steps', type=int, default=0,
+                        help='Record a bounded trace in each first executed epoch without changing the plan')
+    parser.add_argument('--profile-runtime-warmup', type=int, default=20)
     args = parser.parse_args(argv)
     if args.nproc_per_node < 1 or args.batch_size < 1 or (args.finetune_epochs is not None and args.finetune_epochs < 1):
         raise ValueError('Process count, batch size and finetuning epochs must be positive')
+    if args.profile_runtime_steps < 0 or args.profile_runtime_warmup < 0:
+        raise ValueError('Runtime profile steps and warmup must be nonnegative')
     args.manifest = args.manifest.resolve()
     if args.owod_screening:
         args.owod_screening = args.owod_screening.resolve()
@@ -263,6 +286,9 @@ def main(argv=None):
             command = list(run['command'])
             if args.pause_after_epochs and run.get('kind') != 'calibration':
                 command += ['--pause-after-epochs', str(args.pause_after_epochs)]
+            if args.profile_runtime_steps and run.get('kind') != 'calibration':
+                command += ['--profile-runtime-steps', str(args.profile_runtime_steps),
+                            '--profile-runtime-warmup', str(args.profile_runtime_warmup)]
             print(shlex.join(command))
         return 0
     root = args.output_dir / plan['protocol'] / f'seed_{args.seed}'
@@ -299,6 +325,9 @@ def main(argv=None):
             command += ['--resume', str(directory / 'checkpoint.pth')]
         if args.pause_after_epochs:
             command += ['--pause-after-epochs', str(args.pause_after_epochs)]
+        if args.profile_runtime_steps:
+            command += ['--profile-runtime-steps', str(args.profile_runtime_steps),
+                        '--profile-runtime-warmup', str(args.profile_runtime_warmup)]
         result = subprocess.run(command, cwd=ROOT, env=env)
         if result.returncode:
             return result.returncode
