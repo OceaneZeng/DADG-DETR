@@ -58,6 +58,14 @@ def build_plan(args):
         raise FileNotFoundError(args.backbone_weights)
     image_root = Path(manifest['image_root'])
     method = getattr(args, 'method', 'control')
+    control_lr_scale = getattr(args, 'control_lr_scale', 1.)
+    if not math.isfinite(control_lr_scale) or not 0 < control_lr_scale <= 1:
+        raise ValueError('control-lr-scale must be finite and in (0, 1]')
+    if control_lr_scale != 1.:
+        if (method != 'control' or not task1_only or screening or shared or shared_gnn
+                or args.recipe != 'ow-detr-paper' or manifest['protocol'] != 'm-owodb'):
+            raise ValueError('control-lr-scale requires a full-data M-OWODB control --task1-only diagnostic')
+        lr *= control_lr_scale
     risk_mode = getattr(args, 'graph_risk_mode', 'learned')
     compute = getattr(args, 'graph_adapter_compute', 'loop')
     if risk_mode not in ('learned', 'disabled') or compute not in ('loop', 'batched'):
@@ -214,6 +222,13 @@ def build_plan(args):
         result['shared_task1'] = shared_identity
     if task1_only:
         result['scope'] = 'full-data Task 1 only; no automatic Task 2 transition'
+    if control_lr_scale != 1.:
+        result['recipe_source'] = ('OW-DETR Appendix D schedule; project control learning-rate diagnostic '
+                                   f'(scale={control_lr_scale}); not the original optimization recipe')
+        result['control_optimization'] = {
+            'lr_scale': control_lr_scale,
+            'purpose': 'Single-factor optimizer stability diagnostic; not the original paper learning rate',
+        }
     if risk_mode == 'disabled':
         result['interference_controller'] = 'disabled_no_interference_controller'
     return result
@@ -247,6 +262,8 @@ def main(argv=None):
     parser.add_argument('--resume', action='store_true')
     parser.add_argument('--method', choices=('control', 'graph-adapter', 'discovery', 'discovery-scratch',
                                             'discovery-no-message'), default='control')
+    parser.add_argument('--control-lr-scale', type=float, default=1.,
+                        help='Scale all learning rates for a fresh full-data M Task 1 control diagnostic')
     parser.add_argument('--graph-adapter-rank', type=int, default=8)
     parser.add_argument('--graph-adapter-last-n', type=int, default=2)
     parser.add_argument('--graph-risk-beta', type=float, default=2.0)

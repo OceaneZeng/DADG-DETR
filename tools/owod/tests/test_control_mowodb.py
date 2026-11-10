@@ -50,6 +50,46 @@ def test_control_pause_keeps_recipe_and_rejects_discovery_or_partial_transition(
         validate_checkpoint(args, dict(args=saved, epoch=2))
 
 
+def test_lr_quarter_changes_only_optimization_and_is_bound_to_resume(inputs):
+    standard = control_args(inputs)
+    original = run_benchmark.build_plan(inputs)
+    inputs.control_lr_scale = 1.
+    assert run_benchmark.build_plan(inputs) == original
+    inputs.control_lr_scale = .25
+    plan = run_benchmark.build_plan(inputs)
+    quarter = configured(plan)
+    assert quarter.lr == 5e-5 and quarter.lr_backbone == 5e-6
+    assert quarter.epochs == quarter.lr_drop == 50
+    before = list(original['runs'][0]['command'])
+    for option in ('--lr', '--lr_backbone'):
+        before[before.index(option) + 1] = plan['runs'][0]['command'][before.index(option) + 1]
+    assert before == plan['runs'][0]['command']
+    assert plan['control_optimization']['lr_scale'] == .25
+    assert 'not the original optimization recipe' in plan['recipe_source']
+    validate_checkpoint(quarter, dict(args=copy.deepcopy(quarter), epoch=2), resume=True)
+    with pytest.raises(ValueError, match='cannot change lr'):
+        validate_checkpoint(quarter, dict(args=standard, epoch=2), resume=True)
+
+
+@pytest.mark.parametrize('value', [0., -1., 1.5, float('nan'), float('inf')])
+def test_lr_scale_rejects_invalid_values(inputs, value):
+    control_args(inputs)
+    inputs.control_lr_scale = value
+    with pytest.raises(ValueError, match='control-lr-scale'):
+        run_benchmark.build_plan(inputs)
+
+
+@pytest.mark.parametrize('change', [dict(method='discovery'), dict(method='graph-adapter'),
+                                  dict(task1_only=False)])
+def test_lr_scale_cannot_silently_change_other_experiments(inputs, change):
+    control_args(inputs)
+    inputs.control_lr_scale = .25
+    for key, value in change.items():
+        setattr(inputs, key, value)
+    with pytest.raises(ValueError, match='control-lr-scale'):
+        run_benchmark.build_plan(inputs)
+
+
 @pytest.mark.parametrize('field,value', [('owod_stage', 1), ('owod_phase', 'finetune'),
     ('owod_screening', 'screen.json'), ('owod_manifest', ''), ('graph_routed_adapter', True),
     ('paper_baseline', 'ew-detr'), ('with_tree', True), ('pause_after_epochs', -1),
@@ -62,7 +102,8 @@ def test_direct_control_pause_rejects_other_scopes(inputs, field, value):
         training_epoch_limit(args)
 
 
-def test_actual_control_loop_retains_each_epoch_and_resumes_same_optimizer(inputs, monkeypatch):
+@pytest.mark.parametrize('lr_scale', [1., .25])
+def test_actual_control_loop_retains_each_epoch_and_resumes_same_optimizer(inputs, monkeypatch, lr_scale):
     import main as training
 
     class TinyDetector(nn.Module):
@@ -93,6 +134,7 @@ def test_actual_control_loop_retains_each_epoch_and_resumes_same_optimizer(input
     monkeypatch.setattr(training, 'get_coco_api_from_dataset', lambda dataset: None)
     monkeypatch.setattr(training, 'train_one_epoch', train)
     monkeypatch.setattr(training, 'evaluate', lambda *args, **kwargs: ({}, SimpleNamespace(coco_eval={})))
+    inputs.control_lr_scale = lr_scale
     args = control_args(inputs)
     args.device = 'cpu'
     args.pause_after_epochs = 3
@@ -128,7 +170,8 @@ def test_actual_control_loop_retains_each_epoch_and_resumes_same_optimizer(input
                                    restored['optimizer']['state'][0][key], rtol=0, atol=0)
 
 
-def test_launcher_pins_control_budget_preserves_results_and_logs_failures(tmp_path):
+@pytest.mark.parametrize('variant', ['standard', 'lr-quarter'])
+def test_launcher_pins_control_budget_preserves_results_and_logs_failures(tmp_path, variant):
     bash = 'C:/Program Files/Git/bin/bash.exe' if os.name == 'nt' else shutil.which('bash')
     if not bash or not Path(bash).is_file():
         pytest.skip('Bash unavailable')
@@ -149,7 +192,7 @@ def test_launcher_pins_control_budget_preserves_results_and_logs_failures(tmp_pa
 
     def execute(*arguments):
         trace.write_text('')
-        return subprocess.run([bash, script.as_posix(), *arguments], env=env,
+        return subprocess.run([bash, script.as_posix(), variant, *arguments], env=env,
                               capture_output=True, text=True, timeout=20)
 
     result = execute('--dry-run')
@@ -161,10 +204,16 @@ def test_launcher_pins_control_budget_preserves_results_and_logs_failures(tmp_pa
         ('--manifest', 'data/owod/m-owodb/split_manifest.json')]:
         assert command[command.index(option) + 1] == expected
     assert '--task1-only' in command and '--activation-checkpointing' in command
+    assert ('--control-lr-scale' in command) == (variant == 'lr-quarter')
+    if variant == 'lr-quarter':
+        assert command[command.index('--control-lr-scale') + 1] == '0.25'
     assert not any('diagnose_control_inputs.py' in str(call) for call in calls)
     assert execute().returncode == 0
     assert 'diagnose_control_inputs.py' in trace.read_text()
-    directory = tmp_path / 'output/tree-detr-m-control-3090/m-owodb/seed_42'
+    probe = next(shlex.split(line) for line in trace.read_text().splitlines() if 'diagnose_control_inputs.py' in line)
+    assert probe[probe.index('--images') + 1] == '256'
+    run_name = 'tree-detr-m-control-3090' if variant == 'standard' else 'tree-detr-m-control-lr-quarter-3090'
+    directory = tmp_path / 'output' / run_name / 'm-owodb/seed_42'
     (directory / 'stage_0/increment').mkdir(parents=True)
     checkpoint = directory / 'stage_0/increment/checkpoint.pth'
     checkpoint.write_bytes(b'Existing checkpoint')
@@ -183,7 +232,7 @@ def test_launcher_pins_control_budget_preserves_results_and_logs_failures(tmp_pa
     assert execute('--resume').returncode == 9
     assert 'diagnose_control_inputs.py' not in trace.read_text()
     assert 'pause_after_epochs=3 schedule=50' in (tmp_path /
-        'output/tree-detr-m-control-3090-logs/console.log').read_text()
+        f'output/{run_name}-logs/console.log').read_text()
 
 
 class InputDetector(nn.Module):
@@ -221,12 +270,27 @@ def test_input_probe_detects_image_blindness_and_keeps_model_state(ignore_input)
         summary = result['summary_mean_abs'][comparison]
         assert (summary['outputs']['pred_boxes'] == 0) == ignore_input
         assert (summary['encoder']['encoder_block_2'] == 0) == ignore_input
+        assert (result['distributions'][comparison]['outputs']['pred_boxes']['fraction_below_1e_6'] == 1) == ignore_input
     assert model.training
     assert len(result['rows']) == 4
     assert all(row['image_id'] != row['other_image_id'] for row in result['rows'])
     for key, value in previous.items():
         torch.testing.assert_close(model.state_dict()[key], value, rtol=0, atol=0)
     assert all(not module._forward_hooks for module in model.modules())
+
+
+def test_input_probe_uses_256_unique_training_images_and_reports_the_distribution():
+    dataset = [(torch.full((3, 8, 8), float(index + 1)), {'image_id': torch.tensor(index)})
+               for index in range(1024)]
+    indices = diagnostic.probe_indices(len(dataset), 256)
+    assert len(set(indices)) == len(indices) == 256
+    assert indices[0] == 0 and max(indices) > .9 * len(dataset)
+    assert diagnostic.probe_indices(len(dataset), 4) == [0, 7, 15, 23]
+    result = diagnostic.probe_inputs(InputDetector(), dataset, 'cpu', indices=indices)
+    assert len(result['rows']) == 256
+    assert [row['image_id'] for row in result['rows']] == indices
+    assert result['distributions']['mean_color']['outputs']['pred_boxes']['fraction_below_1e_6'] == 0
+    assert result['distributions']['different_real_image']['outputs']['pred_boxes']['median'] > 0
 
 
 def test_input_probe_cli_binds_epoch_reports_to_unchanged_checkpoints(inputs, monkeypatch):
@@ -238,7 +302,7 @@ def test_input_probe_cli_binds_epoch_reports_to_unchanged_checkpoints(inputs, mo
     content = {path.name: path.read_bytes() for path in directory.glob('*.pth')}
     monkeypatch.setattr('tools.owod.gnn_calibration.build_calibration_dataset', lambda *a: image_fixture())
     monkeypatch.setattr('tools.owod.gnn_calibration.load_detector', lambda *a: (InputDetector(), None))
-    assert diagnostic.main(['--run-dir', str(directory), '--device', 'cpu']) == 0
+    assert diagnostic.main(['--run-dir', str(directory), '--device', 'cpu', '--images', '4']) == 0
     reports = list(directory.glob('input_diagnostics/*/summary.json'))
     assert len(reports) == 1
     result = json.loads(reports[0].read_text())

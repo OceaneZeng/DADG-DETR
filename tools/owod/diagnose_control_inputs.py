@@ -16,7 +16,19 @@ def differences(first, second):
             for key, value in first.items()}
 
 
-def probe_inputs(model, dataset, device, indices=(0, 7, 15, 23)):
+def probe_indices(dataset_size, images):
+    """Keep the legacy four-image probe or spread across the released train set."""
+    if images < 4 or images > dataset_size or dataset_size < 24:
+        raise ValueError('images must be between 4 and the training dataset size (at least 24)')
+    if images == 4:
+        return [0, 7, 15, 23]
+    if images == dataset_size:
+        return list(range(dataset_size))
+    # Leave room for the next distinct image; matches the 256-image control audit.
+    return [i * (dataset_size - 2) // (images - 1) for i in range(images)]
+
+
+def probe_inputs(model, dataset, device, indices=(0, 7, 15, 23), progress=False):
     """Hold geometry fixed; compare real pixels with mean color and another image.
 
     Only released training images are used. Encoder traces sample every 64th
@@ -50,7 +62,7 @@ def probe_inputs(model, dataset, device, indices=(0, 7, 15, 23)):
             handles.append(layer.norm2.register_forward_hook(capture(f'encoder_block_{index}')))
         model.eval()
         with torch.inference_mode():
-            for index in indices:
+            for order, index in enumerate(indices, 1):
                 other_index = (index + 1) % len(dataset)
                 samples, targets = collate_fn([dataset[index]])
                 other, other_targets = collate_fn([dataset[other_index]])
@@ -68,27 +80,44 @@ def probe_inputs(model, dataset, device, indices=(0, 7, 15, 23)):
                                    'encoder': differences(real_traces, neutral_traces)},
                     'different_real_image': {'outputs': differences(real, pair),
                                              'encoder': differences(real_traces, pair_traces)}})
+                if progress and (order % 64 == 0 or order == len(indices)):
+                    print(f'Control input images: {order}/{len(indices)}', flush=True)
     finally:
         for handle in handles:
             handle.remove()
         model.train(training)
     summary = {}
+    distributions = {}
     for comparison in ('mean_color', 'different_real_image'):
         summary[comparison] = {
             group: {key: sum(row[comparison][group][key]['mean_abs'] for row in rows) / len(rows)
                     for key in rows[0][comparison][group]}
             for group in ('outputs', 'encoder')}
-    return {'summary_mean_abs': summary, 'rows': rows}
+        distributions[comparison] = {}
+        for group in ('outputs', 'encoder'):
+            distributions[comparison][group] = {}
+            for key in rows[0][comparison][group]:
+                values = sorted(row[comparison][group][key]['mean_abs'] for row in rows)
+                count = len(values)
+                median = (values[(count - 1) // 2] + values[count // 2]) / 2
+                distributions[comparison][group][key] = {
+                    'median': median, 'maximum': values[-1],
+                    'fraction_below_1e_6': sum(value < 1e-6 for value in values) / count}
+    return {'summary_mean_abs': summary, 'distributions': distributions, 'rows': rows}
 
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--run-dir', type=Path, required=True)
     parser.add_argument('--completed-epochs', type=int, default=3)
+    parser.add_argument('--images', type=int, default=256,
+                        help='Deterministic training images per epoch; not a replacement evaluation split')
     parser.add_argument('--device', default='cuda')
     args = parser.parse_args(argv)
     if args.completed_epochs < 1:
         raise ValueError('completed-epochs must be positive')
+    if args.images < 4:
+        raise ValueError('images must be at least 4')
 
     import torch
     from main import load_local_checkpoint
@@ -139,21 +168,25 @@ def main(argv=None):
             dataset = build_calibration_dataset(Path(manifest['image_root']), files['increment_train'])
         model, criterion = load_detector(saved, checkpoint, torch.device(args.device))
         model.eval()
-        result = probe_inputs(model, dataset, args.device)
+        indices = probe_indices(len(dataset), args.images)
+        result = probe_inputs(model, dataset, args.device, indices=indices, progress=True)
         if file_sha256(checkpoint) != digest:
             raise RuntimeError('Checkpoint changed during read-only input probe')
         report['epochs'].append({'epoch': epoch, 'completed_epochs': epoch + 1,
+                                 'images': len(indices),
                                  'checkpoint': str(checkpoint), 'checkpoint_sha256': digest,
                                  'inputs': identity, **result})
         means = result['summary_mean_abs']
         last_encoder = list(means['mean_color']['encoder'])[-1]
         print(f'Control input probe: completed_epochs={epoch + 1} '
+              f'images={len(indices)} '
               f'mean_color_box_delta={means["mean_color"]["outputs"]["pred_boxes"]:.8g} '
               f'mean_color_logits_delta={means["mean_color"]["outputs"]["pred_logits"]:.8g} '
               f'mean_color_encoder_last_delta={means["mean_color"]["encoder"][last_encoder]:.8g} '
               f'real_pair_box_delta={means["different_real_image"]["outputs"]["pred_boxes"]:.8g} '
               f'real_pair_logits_delta={means["different_real_image"]["outputs"]["pred_logits"]:.8g} '
-              f'real_pair_encoder_last_delta={means["different_real_image"]["encoder"][last_encoder]:.8g}',
+              f'real_pair_encoder_last_delta={means["different_real_image"]["encoder"][last_encoder]:.8g} '
+              f'real_pair_box_fraction_below_1e_6={result["distributions"]["different_real_image"]["outputs"]["pred_boxes"]["fraction_below_1e_6"]:.6f}',
               flush=True)
         del model, criterion
         if torch.cuda.is_available():
