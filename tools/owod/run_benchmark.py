@@ -66,6 +66,15 @@ def build_plan(args):
                 or args.recipe != 'ow-detr-paper' or manifest['protocol'] != 'm-owodb'):
             raise ValueError('control-lr-scale requires a full-data M-OWODB control --task1-only diagnostic')
         lr *= control_lr_scale
+    discovery_lr_scale = getattr(args, 'discovery_lr_scale', 1.)
+    if not math.isfinite(discovery_lr_scale) or not 0 < discovery_lr_scale <= 1:
+        raise ValueError('discovery-lr-scale must be finite and in (0, 1]')
+    if discovery_lr_scale != 1.:
+        if (not method.startswith('discovery') or screening or shared or shared_gnn
+                or args.recipe != 'ow-detr-paper' or manifest['protocol'] != 'm-owodb'):
+            raise ValueError('discovery-lr-scale requires full-data M-OWODB discovery with the OW-DETR schedule')
+        lr *= discovery_lr_scale
+        ft_lr *= discovery_lr_scale
     risk_mode = getattr(args, 'graph_risk_mode', 'learned')
     compute = getattr(args, 'graph_adapter_compute', 'loop')
     if risk_mode not in ('learned', 'disabled') or compute not in ('loop', 'batched'):
@@ -229,6 +238,15 @@ def build_plan(args):
             'lr_scale': control_lr_scale,
             'purpose': 'Single-factor optimizer stability diagnostic; not the original paper learning rate',
         }
+    if discovery_lr_scale != 1.:
+        result['recipe_source'] = ('OW-DETR Appendix D schedule; project discovery learning-rate adaptation '
+                                   f'(scale={discovery_lr_scale}); not the original optimization recipe')
+        result['discovery_optimization'] = {
+            'lr_scale': discovery_lr_scale,
+            'increment_lr': lr,
+            'finetune_lr': ft_lr,
+            'purpose': 'Optimizer stability adaptation from the M control; full discovery effects unverified',
+        }
     if risk_mode == 'disabled':
         result['interference_controller'] = 'disabled_no_interference_controller'
     return result
@@ -264,6 +282,8 @@ def main(argv=None):
                                             'discovery-no-message'), default='control')
     parser.add_argument('--control-lr-scale', type=float, default=1.,
                         help='Scale all learning rates for a fresh full-data M Task 1 control diagnostic')
+    parser.add_argument('--discovery-lr-scale', type=float, default=1.,
+                        help='Scale increment and finetune learning rates for a fresh full-data M discovery chain')
     parser.add_argument('--graph-adapter-rank', type=int, default=8)
     parser.add_argument('--graph-adapter-last-n', type=int, default=2)
     parser.add_argument('--graph-risk-beta', type=float, default=2.0)

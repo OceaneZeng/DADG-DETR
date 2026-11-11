@@ -1,5 +1,9 @@
 # Discovery v8：已知／未知评分约束与发现梯度对照
 
+2026-11-11：用户启动的 M-OWODB 低学习率四任务全量链见
+[全量启动与 Task 2 新类观察](owod-discovery-mowodb-full.md)。本页旧启动器的
+`--full` 仍只完成 Task 1；新的全任务入口使用独立目录，不接续旧诊断权重。
+
 教师计算精简和 `--profile-runtime` 的日志位置、恢复边界，以及独立的新链计算／
 风险消融，见[运行效率说明](owod-runtime-optimization-v3.md)。
 
