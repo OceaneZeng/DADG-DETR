@@ -1,5 +1,8 @@
 # Discovery v8：已知／未知评分约束与发现梯度对照
 
+2026-11-13：当前低学习率 ranking 日志的复核、Task 1 AP 优化对照和正式 Task 1/2
+只读权重诊断，见[低学习率与发现梯度对照](owod-task1-low-lr-optimization.md)。
+
 2026-11-11：用户启动的 M-OWODB 低学习率四任务全量链见
 [全量启动与 Task 2 新类观察](owod-discovery-mowodb-full.md)。本页旧启动器的
 `--full` 仍只完成 Task 1；新的全任务入口使用独立目录，不接续旧诊断权重。
