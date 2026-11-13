@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-"""Read-only Task 1/2 discovery probes on released training labels, never test AP."""
+"""Read-only Task 1/2 probes on released training labels, with optional Task 1 score audit."""
 import argparse
 from contextlib import contextmanager
 import hashlib
@@ -152,6 +152,8 @@ def main(argv=None):
     parser.add_argument('--images', type=int, default=256)
     parser.add_argument('--seed', type=int, default=42)
     parser.add_argument('--device', default='cuda:0')
+    parser.add_argument('--score-audit', action='store_true',
+                        help='Compare existing scores with one-to-one training-subset AP (Task 1 only)')
     options = parser.parse_args(argv)
     if options.images < 1:
         parser.error('images must be positive')
@@ -175,6 +177,8 @@ def main(argv=None):
     payload = torch.load(options.checkpoint, map_location='cpu', weights_only=False)
     saved = payload['args']
     manifest, annotation = checked_inputs(saved, options.manifest)
+    if options.score_audit and saved.owod_stage != 0:
+        raise ValueError('Score audit requires Task 1 increment training labels')
     identities[str(annotation)] = file_sha256(annotation)
     known, current = list(saved.owod_known_class_ids), list(saved.owod_current_class_ids)
     dataset = build_calibration_dataset(Path(manifest['image_root']), annotation)
@@ -184,6 +188,11 @@ def main(argv=None):
     selection = select_training_indices(dataset, classes, options.images, options.seed)
     if not selection:
         raise ValueError('No training images available')
+    audit = None
+    if options.score_audit:
+        from tools.owod.scoring_probe import TrainingScoreAudit
+        audit = TrainingScoreAudit(dataset.coco, [dataset.ids[i] for i in selection],
+                                   saved, manifest['evaluation'])
     device = torch.device(options.device)
     model, criterion = load_detector(saved, options.checkpoint, device)
     model.eval()
@@ -201,6 +210,8 @@ def main(argv=None):
             targets = move_targets(targets, device)
             samples = samples.to(device)
             outputs = model(samples)
+            if audit is not None:
+                audit.add(outputs, targets)
             image_id = int(targets[0]['image_id'].item())
             image_ids.append(image_id)
             indices = criterion.matcher(outputs, targets)
@@ -248,10 +259,12 @@ def main(argv=None):
         recorded_promotion=[s.get('promotion', []) for s in getattr(saved, 'graph_adapter_specs', [])],
         ema_candidates=dict(available=teacher is not None, images=candidates,
             pseudo_enabled_at_checkpoint=payload['epoch'] >= saved.discovery_warmup),
-        note='No optimizer, AP measurement, test-label selection, EMA update or memory update. '
+        note='No optimizer, official AP measurement, test-label selection, EMA update or memory update. '
              'Deterministic train views do not replay augmented training batches. Coverage is not '
              'one-to-one AP/U-Recall. Candidate validity is not known from missing annotations. '
              'Nonzero route gates are not proof of parameter updates.')
+    if audit is not None:
+        report['score_audit'] = audit.summarize()
     serialized = json.dumps(report, indent=2, allow_nan=False)
     options.output.parent.mkdir(parents=True, exist_ok=True)
     with options.output.open('x', encoding='utf-8') as handle:

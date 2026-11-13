@@ -128,7 +128,8 @@ def test_cli_refuses_non_json_and_existing_outputs_before_loading(tmp_path):
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason='CUDA unavailable')
-def test_cli_real_cuda_checkpoint_ema_and_consumed_routes_are_read_only(inputs, monkeypatch):
+@pytest.mark.parametrize('stage', [0, 1])
+def test_cli_real_cuda_checkpoint_ema_and_consumed_routes_are_read_only(inputs, monkeypatch, stage):
     """Synthetic input verifies execution only, never a formal AP experiment."""
     from PIL import Image
     from datasets.coco import CocoDetection
@@ -150,9 +151,9 @@ def test_cli_real_cuda_checkpoint_ema_and_consumed_routes_are_read_only(inputs, 
     inputs.manifest.write_text(json.dumps(manifest))
     Image.new('RGB', (64, 64), (100, 140, 180)).save(root / '100001.jpg')
     saved = configured(run_benchmark.build_plan(inputs))
-    saved.owod_stage = 1
-    saved.owod_known_class_ids = manifest['stages'][1]['active_classes']
-    saved.owod_current_class_ids = manifest['stages'][1]['classes']
+    saved.owod_stage = stage
+    saved.owod_known_class_ids = manifest['stages'][stage]['active_classes']
+    saved.owod_current_class_ids = manifest['stages'][stage]['classes']
     saved.no_pretrained_backbone, saved.backbone_weights = True, ''
     saved.hidden_dim, saved.dim_feedforward = 64, 128
     saved.enc_layers, saved.dec_layers, saved.num_queries = 1, 2, 8
@@ -160,9 +161,10 @@ def test_cli_real_cuda_checkpoint_ema_and_consumed_routes_are_read_only(inputs, 
     spec = dict(stage=1, class_ids=saved.owod_current_class_ids,
         old_ids=manifest['stages'][0]['classes'], rank=8, last_n=1, risk_beta=2.,
         risk=[[.2] * 20 for _ in range(20)], promotion=[dict(inherited=False)])
-    saved.graph_adapter_specs = [spec]
+    saved.graph_adapter_specs = [spec] if stage else []
     model, _, _ = build(saved)
-    append_stage(model, spec)
+    if stage:
+        append_stage(model, spec)
     checkpoint = root / 'checkpoint0009.pth'
     torch.save(dict(args=saved, epoch=9, model=model.state_dict(),
                     discovery_ema=make_ema(model).state_dict()), checkpoint)
@@ -184,13 +186,22 @@ def test_cli_real_cuda_checkpoint_ema_and_consumed_routes_are_read_only(inputs, 
     output = root / 'probe.json'
     common = ['--checkpoint', str(checkpoint), '--manifest', str(inputs.manifest),
               '--images', '1', '--device', 'cuda:0', '--output']
-    report = main(common + [str(output)])
+    report = main(common + [str(output)] + (['--score-audit'] if stage == 0 else []))
     assert report == json.loads(output.read_text())
-    assert report['task'] == 2 and report['epoch'] == 10
+    assert report['task'] == stage + 1 and report['epoch'] == 10
     assert report['optimization_steps'] == 0 and report['ema_candidates']['available']
     assert report['supervision']['gt_count'] == 20
-    assert len(report['routing_observations']) == 8  # Matcher selected 8 of 20 GT.
-    assert report['recorded_promotion'] == [[dict(inherited=False)]]
+    assert len(report['routing_observations']) == (8 if stage else 0)
+    assert report['recorded_promotion'] == ([[dict(inherited=False)]] if stage else [])
+    if stage == 0:
+        assert report['score_audit']['train_subset_only']
+        assert set(report['score_audit']['metrics']) == {'hierarchical', 'focal', 'known_sigmoid_only'}
+        assert all(0 <= m['train_known_ap50'] <= 1 for m in report['score_audit']['metrics'].values())
+    else:
+        assert 'score_audit' not in report
+        with pytest.raises(ValueError, match='Task 1'):
+            main(common + [str(root / 'task2-audit.json'), '--score-audit'])
+        assert len(loaded) == 1  # Reject before a detector is loaded.
     assert file_sha256(checkpoint) == before
     for name, value in loaded[0].state_dict().items():
         assert torch.equal(value.cpu(), model.state_dict()[name])

@@ -1,5 +1,11 @@
 # Discovery v8：已知／未知评分约束与发现梯度对照
 
+2026-11-13 后续：γ=0.1 的 8 轮 AP 未改善。服务器完成相同训练图的第 5 轮权重
+诊断后，新增低学习率 Task 1 启动器的显式 `focal` 模式（γ=1、排序权重 1），见
+[同轮诊断与 focal 评分对照](owod-task1-focal-followup-20261113.md)。原入口默认
+不变。下文历史模式表中的评分均为 hierarchical；新评分和对应排序损失使用
+已有实现，仍登记 v8，禁止跨模式续训。
+
 2026-11-13：当前低学习率 ranking 日志的复核、Task 1 AP 优化对照和正式 Task 1/2
 只读权重诊断，见[低学习率与发现梯度对照](owod-task1-low-lr-optimization.md)。
 
@@ -52,7 +58,8 @@ L_rank = mean_GT softplus(log(S_u / S_y))
 目标。同时降低匹配已知槽位的 novelty，提高正确类别条件概率。原密集 sigmoid
 focal 类别监督、辅助层和框监督保留。伪未知／未匹配槽位不参与此项，不要求真实
 未知物体排在其他位置的已知目标之后。若明确使用原 `focal` 评分，按相应实际分数
-的 log 比值计算；启动器仍用 hierarchical。Task 4 无 unknown 输出，此损失为 0。
+的 log 比值计算；旧启动器仍用 hierarchical，低学习率入口显式 `focal` 模式除外。
+Task 4 无 unknown 输出，此损失为 0。
 
 `--discovery-feature-grad-scale γ` 默认为 1，实验值为 0.1，范围为 [0, 1]：
 
