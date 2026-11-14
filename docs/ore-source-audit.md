@@ -35,11 +35,12 @@
 README 指向的 [数据说明](https://github.com/JosephKJ/OWOD/issues/59#issuecomment-897747744)
 给出 `datasets/VOC2007/{Annotations,JPEGImages,ImageSets/Main}` 布局。
 这里的 VOC2007 是合并数据目录名，并不表示只包含 VOC2007 数据。
-本项目对应 `data/raw/ore/{Annotations,JPEGImages}`，固定清单由 configs 管理。
+本项目对应 `data/raw/ore/{Annotations,JPEGImages}`，固定清单由
+`data/owod/m-owodb/split_manifest.json` 管理。
 
 ## 与当前项目的 M 协议比较
 
-比较官方 `datasets/OWOD_imagesets` 与 `configs/owod/m-owodb/ImageSets`：
+比较官方 `datasets/OWOD_imagesets` 与 M manifest 的 `splits`：
 
 | 文件 | 行数 | 图片身份、顺序、重复次数 |
 | --- | ---: | --- |
@@ -82,7 +83,7 @@ ORE 模型复现；官方 ORE 是独立架构和按 iteration 的训练配置。
 - 所需图片在官方 JSON 中缺失 0，在本机 JPEG 目录缺失 0，无标注图片 0。
 - 加上已整理的 21,503 张 VOC 图片，共需 124,129 张唯一图片。
 
-这些结果证明现有 VOC/COCO 原始资源具有重建所需的图片和标注覆盖。
-本次完成的是源代码与数据覆盖审计，尚未批量生成 M 的 COCO XML 或正式
-schema-3 manifest，也未执行完整 M 训练。后续应固定作者转换器，保留 VOC
-原始 XML，发布 COCO XML/图像引用并记录来源，再运行 manage_data prepare/verify。
+这些结果证明 COCO 官方 JSON 具有重建所需的图片和标注覆盖。M 的 schema-3
+manifest 已生成并把作者清单内嵌为协议源；本机 `data/raw/ore` 仍只有 VOC
+部分，缺少 COCO 合并后的图像/XML，完整 M 训练前仍需按固定转换器补齐数据，
+再运行 `manage_data verify --benchmark m-owodb`。

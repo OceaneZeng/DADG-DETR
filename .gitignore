@@ -11,9 +11,13 @@ dist/
 
 exps/
 checkpoints/
-/data/
+/data/**
+!/data/owod/
+!/data/owod/m-owodb/
+!/data/owod/s-owodb/
+!/data/owod/m-owodb/split_manifest.json
+!/data/owod/s-owodb/split_manifest.json
 /pretrained/
-configs/data/owod.local.json
 
 # Generated papers, plots, temporary work and document exports
 /output/
@@ -59,4 +63,3 @@ configs/data/owod.local.json
 *.txt
 !requirements.txt
 !CMakeLists.txt
-!configs/owod/*/ImageSets/*.txt

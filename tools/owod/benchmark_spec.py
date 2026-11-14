@@ -1,16 +1,21 @@
-"""Author-defined OWOD category orders and immutable released image lists.
+"""Author-defined OWOD specifications loaded from the released manifests.
 
-M: Joseph et al., CVPR 2021, Sec. 5.1/5.2.
-S: Gupta et al., CVPR 2022, Appendix A.2/Table 7.
-The ImageSets are vendored from the pinned OW-DETR author repository.
+The schema-3 manifests under ``data/owod/<protocol>/`` are the single local
+source of the M-OWODB and S-OWODB protocol.  They contain the author class
+order, evaluation rules, and the exact ordered image lists used by every
+training/evaluation phase.  Keeping this loader independent of generated
+stage annotations makes ``plan`` usable from a clean checkout as well.
 """
 from __future__ import annotations
 
 import hashlib
 import json
+from functools import lru_cache
 from pathlib import Path
 
-SPEC_ROOT = Path(__file__).resolve().parents[2] / 'configs' / 'owod'
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+MANIFEST_ROOT = PROJECT_ROOT / 'data' / 'owod'
+PROTOCOLS = ('m-owodb', 's-owodb')
 COCO_NAMES = (
     'person,bicycle,car,motorcycle,airplane,bus,train,truck,boat,traffic light,'
     'fire hydrant,stop sign,parking meter,bench,bird,cat,dog,horse,sheep,cow,'
@@ -32,58 +37,78 @@ ALIASES = dict(zip(['aeroplane', 'diningtable', 'motorbike', 'pottedplant',
                    'sofa', 'tvmonitor'],
                   ['airplane', 'dining table', 'motorcycle', 'potted plant',
                    'couch', 'tv']))
-TASK_NAMES = {
-    'm-owodb': [
-        'airplane,bicycle,bird,boat,bottle,bus,car,cat,chair,cow,dining table,dog,'
-        'horse,motorcycle,person,potted plant,sheep,couch,train,tv',
-        'truck,traffic light,fire hydrant,stop sign,parking meter,bench,elephant,'
-        'bear,zebra,giraffe,backpack,umbrella,handbag,tie,suitcase,microwave,oven,'
-        'toaster,sink,refrigerator',
-        'frisbee,skis,snowboard,sports ball,kite,baseball bat,baseball glove,'
-        'skateboard,surfboard,tennis racket,banana,apple,sandwich,orange,'
-        'broccoli,carrot,hot dog,pizza,donut,cake',
-        'bed,toilet,laptop,mouse,remote,keyboard,cell phone,book,clock,vase,'
-        'scissors,teddy bear,hair drier,toothbrush,wine glass,cup,fork,knife,spoon,bowl',
-    ],
-    's-owodb': [
-        'airplane,bicycle,bird,boat,bus,car,cat,cow,dog,horse,motorcycle,sheep,'
-        'train,elephant,bear,zebra,giraffe,truck,person',
-        'traffic light,fire hydrant,stop sign,parking meter,bench,chair,dining table,'
-        'potted plant,backpack,umbrella,handbag,tie,suitcase,microwave,oven,toaster,'
-        'sink,refrigerator,bed,toilet,couch',
-        'frisbee,skis,snowboard,sports ball,kite,baseball bat,baseball glove,'
-        'skateboard,surfboard,tennis racket,banana,apple,sandwich,orange,'
-        'broccoli,carrot,hot dog,pizza,donut,cake',
-        'laptop,mouse,remote,keyboard,cell phone,book,clock,vase,scissors,teddy bear,'
-        'hair drier,toothbrush,wine glass,cup,fork,knife,spoon,bowl,tv,bottle',
-    ],
-}
+def manifest_path(protocol: str) -> Path:
+    """Return the checked-in schema-3 manifest for ``protocol``."""
+    if protocol not in PROTOCOLS:
+        raise ValueError(f'Unsupported OWOD benchmark: {protocol}')
+    return MANIFEST_ROOT / protocol / 'split_manifest.json'
+
+
+def split_digest(values: list[str]) -> str:
+    """Hash an ordered split independent of the source file line ending."""
+    payload = json.dumps(values, ensure_ascii=False, separators=(',', ':')).encode('utf-8')
+    return hashlib.sha256(payload).hexdigest()
+
+
+@lru_cache(maxsize=len(PROTOCOLS))
+def load_manifest(protocol: str) -> dict:
+    """Load one canonical protocol manifest and validate its basic shape."""
+    path = manifest_path(protocol)
+    if not path.is_file():
+        raise FileNotFoundError(
+            f'Missing canonical OWOD manifest: {path}. '
+            'Prepare data/owod/<protocol>/split_manifest.json first.')
+    manifest = json.loads(path.read_text(encoding='utf-8'))
+    if (manifest.get('schema_version') != 3 or manifest.get('protocol') != protocol
+            or not manifest.get('official_annotations')
+            or not manifest.get('paper_comparable')):
+        raise ValueError(f'Invalid canonical OWOD manifest: {path}')
+    evaluation = manifest.get('evaluation', {})
+    required = ('protocol', 'task_class_ids', 'ap_mode', 'wi_recall',
+                'iou_threshold', 'test_split', 'source_paper', 'image_source_ids')
+    missing = [key for key in required if key not in evaluation]
+    if missing:
+        raise ValueError(f'Canonical manifest is missing evaluation fields: {missing}')
+    splits = manifest.get('splits')
+    if not isinstance(splits, dict):
+        raise ValueError(
+            f'Canonical manifest has no embedded ordered splits: {path}. '
+            'Regenerate the schema-3 manifest before using this benchmark.')
+    split_hashes = manifest.get('split_hashes')
+    if not isinstance(split_hashes, dict):
+        raise ValueError(f'Canonical manifest has no embedded split hashes: {path}')
+    for name, values in splits.items():
+        if not isinstance(values, list) or any(not isinstance(value, str) for value in values):
+            raise ValueError(f'Invalid embedded split {protocol}/{name}')
+        if split_hashes.get(name) != split_digest(values):
+            raise ValueError(f'Embedded split was modified: {protocol}/{name}')
+    if evaluation['test_split'] not in splits:
+        raise ValueError(f'Canonical manifest is missing test split {evaluation["test_split"]!r}')
+    if splits[evaluation['test_split']] != evaluation['image_source_ids']:
+        raise ValueError('Manifest test sequence differs from its embedded split')
+    return manifest
 
 
 def specification(protocol: str) -> dict:
-    if protocol not in TASK_NAMES:
-        raise ValueError(f'Unsupported OWOD benchmark: {protocol}')
-    return {
-        'protocol': protocol,
-        'task_class_ids': [[NAME_TO_ID[n] for n in task.split(',')]
-                           for task in TASK_NAMES[protocol]],
-        'ap_mode': 'integral' if protocol == 'm-owodb' else 'voc2007_11point',
-        'wi_recall': 0.8,
-        'iou_threshold': 0.5,
-        'test_split': 'all_task_test' if protocol == 'm-owodb' else 'test',
-        'source_paper': ('Joseph et al. CVPR 2021 Sec.5.1/5.2' if protocol == 'm-owodb'
-                         else 'Gupta et al. CVPR 2022 Appendix A.2/Table 7'),
-    }
+    """Return the author protocol definition recorded in its manifest."""
+    evaluation = load_manifest(protocol)['evaluation']
+    result = {key: evaluation[key] for key in (
+        'protocol', 'task_class_ids', 'ap_mode', 'wi_recall',
+        'iou_threshold', 'test_split', 'source_paper')}
+    result['task_class_ids'] = [list(task) for task in result['task_class_ids']]
+    return result
 
 
 def official_split(protocol: str, name: str) -> list[str]:
-    """Keep released ordering AND multiplicity; never randomly rebuild a split."""
-    metadata = json.loads((SPEC_ROOT / 'sources.json').read_text(encoding='utf-8'))
-    record = metadata[protocol]['files'][name]
-    data = (SPEC_ROOT / record['path']).read_bytes()
-    if hashlib.sha256(data).hexdigest() != record['sha256']:
-        raise ValueError(f'Official split was modified: {protocol}/{name}')
-    return data.decode('utf-8').split()
+    """Return an exact ordered author split, preserving duplicate entries."""
+    splits = load_manifest(protocol)['splits']
+    try:
+        values = splits[name]
+    except KeyError as error:
+        raise KeyError(f'Unknown {protocol} author split: {name}') from error
+    if not isinstance(values, list) or any(not isinstance(value, str) for value in values):
+        raise ValueError(f'Invalid embedded split {protocol}/{name}')
+    return list(values)
 
 
 def categories() -> list[dict]:

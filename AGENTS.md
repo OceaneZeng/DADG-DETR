@@ -2,7 +2,7 @@
 
 ## 实验协议与数据
 
-- 正式实验只用两套作者协议：M-OWODB 来自 ORE（CVPR 2021），S-OWODB 补充采用 OW-DETR（CVPR 2022）附录 A.2 / Table 7；S 不是 ORE 定义的。以 `configs/owod/` 和 [协议说明](docs/owod-benchmarks.md) 为准。
+- 正式实验只用两套作者协议：M-OWODB 来自 ORE（CVPR 2021），S-OWODB 补充采用 OW-DETR（CVPR 2022）附录 A.2 / Table 7；S 不是 ORE 定义的。以 `data/owod/m-owodb/split_manifest.json`、`data/owod/s-owodb/split_manifest.json` 和 [协议说明](docs/owod-benchmarks.md) 为准。
 - 保持作者 ImageSets、图像身份和类别顺序；M 新类数为 20/20/20/20，S 为 19/21/20/20。禁止随机、启发式、S 的 20×4 或 DEUS 替代划分。允许作者清单的跨任务图像重叠，禁止重复标注记录和未来类别监督。
 - 四个 Task 对应七个训练阶段：Task 1 increment，随后 Task 2–4 各 increment → balanced finetune；代码 stage 从 0 开始。使用作者发布的均衡记忆清单，不换成历史自定义 replay exposure / budget。
 - 数据统一由 `tools/owod/manage_data.py` 的 `plan/check/prepare/verify` 管理，原始源路径与生成目录分别配置。正式训练要求 schema-3 manifest 和输入哈希核验；缺少作者数据时报告缺口，不拼造替代数据，不使用 `allow-unverified`。
@@ -39,7 +39,7 @@ python tools/owod/run_benchmark.py --help
 
 数据准备时查 [数据指南](docs/data-preparation.md)，整理文件时查 [项目目录](docs/project-layout.md)。全量启动/恢复按对应版本文档与脚本核对；当前正式入口见 [discovery v5](docs/owod-discovery-v5.md)，实验性 v6 的范围与限制见 [调试记录](docs/owod-discovery-v6-debug.md)。不要从聊天旧命令直接启动。
 
-- `baselines/` 集中保存外部源码；`tools/analysis/` 只读历史日志、绘图和汇总，不启动旧实验。不要恢复已删除的 pilot 启动器、旧 setting 或论文导出文件。
-- Git 保留源码、运行配置、固定作者 ImageSets、必要 Markdown 和许可证；生成文档、图像、压缩包、权重和日志保持忽略，不 force-add。清理时保留原始数据、权重、指标日志、外部源码版本及无关用户改动；论文压缩包不随意解压进实验仓库。
+- `baselines/` 外部源码已移除；`tools/analysis/` 只读历史日志、绘图和汇总，不启动旧实验。不要恢复已删除的 pilot 启动器、旧 setting 或论文导出文件。
+- Git 保留源码、运行配置、两份 schema-3 协议 manifest、必要 Markdown 和许可证；生成的阶段标注、文档、图像、压缩包、权重和日志保持忽略，不 force-add。清理时保留原始数据、权重、指标日志及无关用户改动；论文压缩包不随意解压进实验仓库。
 
 规则证据、历史取舍与阶段快照见 [research/selection.md](research/selection.md)，其中运行状态不作为实时配置。通用沟通、自主范围与检查范围沿用全局 AGENTS.md，不在此重复。

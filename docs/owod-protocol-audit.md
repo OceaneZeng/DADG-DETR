@@ -20,8 +20,7 @@ M/S 是后续文献的常用简称。这里的来源归属指协议，不主张�
 ## 实现位置
 
 - `tools/owod/benchmark_spec.py`：精确类别顺序、原始 COCO ID、指标约定。
-- `configs/owod/{m-owodb,s-owodb}/ImageSets/`：固定作者图片身份与顺序。
-- `configs/owod/sources.json`：固定源 commit、原始文件 SHA-256 和行数。
+- `data/owod/{m-owodb,s-owodb}/split_manifest.json`：固定作者图片身份、顺序、源 commit、原始文件 SHA-256 和行数。
 - `tools/owod/prepare_benchmarks.py`：原始标注转项目格式，保留原始 VOC 框；
   增量只暴露当前类，微调只暴露已知类，测试保留未来标注。
 - `tools/owod/manage_data.py`：plan/check/prepare/verify 数据入口。
@@ -41,8 +40,8 @@ M/S 是后续文献的常用简称。这里的来源归属指协议，不主张�
 作者完整测试清单共 4,952 张。Table 7 的测试图片数对应含本任务当前类别的
 图片，不是四个互斥测试集合。保留原始完整测试清单，不能按这些数字自行抽样。
 
-四任务类别顺序逐项匹配本地作者源码
-`baselines/ow-detr/datasets/torchvision_datasets/open_world.py` 的
+四任务类别顺序逐项匹配已核验的 OW-DETR 作者源码
+`split_source` 所记录版本中的
 `VOC_CLASS_NAMES/T2_CLASS_NAMES/T3_CLASS_NAMES/T4_CLASS_NAMES`，先转换
 VOC/COCO 同义名后比较；该源文件 SHA-256 为
 `1a3b0bcc7c38e08b3c33b22172f5c1c4c6297242847875f7491c1fd77fa70bc2`。
@@ -50,7 +49,9 @@ VOC/COCO 同义名后比较；该源文件 SHA-256 为
 评测测试还直接调用本地作者 `voc_eval`，核对积分/11 点 AP、A-OSE 与 WI。
 
 S schema-3 manifest SHA-256：
-`3cd052b37a6d0bb539435c89c9cfeb41d22fc5b47e8d9e257f8ce1812983aaaf`。
+`0060c5f7b080ea417f88295fdcabd7308cc745610319a160ce9787e219d87640`。
+M schema-3 manifest SHA-256：
+`a5bd4b44dbded3f7f5e62bc3e95e2f69ac9f3eedcead3b3daeb64c32a59daa94`。
 实际审计结果保存在忽略目录 `output/discovery/s-table7-audit.json` 与
 `output/discovery/s-class-order-audit.json`。
 
@@ -61,9 +62,10 @@ S 的数据划分、类别顺序、关键表格统计及相关实现检查一致
 本机 batch 2、encoder activation checkpointing 与短程更新预算属于项目
 资源/可行性设置，不是作者完整训练实验的复现。
 
-M 的类别顺序、作者清单和协议代码已实现并有对应测试；21,503 对必需 VOC
-图像/XML 已准备。完整 M 的 COCO 合并图像/XML 和 schema-3 manifest 仍缺失，
-因此本次没有对真实完整 M 数据统计作出“全部与 Table 1 一致”的结论。
+M 的类别顺序、作者清单和协议代码已实现并有对应测试，schema-3 manifest
+已经把全部作者清单和来源哈希内嵌为唯一协议源。21,503 对必需 VOC 图像/XML
+已准备；本机 ORE 仍缺少 102,626 张 COCO 图像/XML，因此 `verify` 会报告数据
+缺口，不能把 M 标记为可训练完成。
 
 ORE 的 held-out unknown 验证与 EBUI 是原方法训练机制。项目当前不自行
 抽样作者未发布的 held-out 身份，也不使用测试 future GT 调阈值。benchmark

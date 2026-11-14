@@ -1,8 +1,8 @@
 # 实验数据准备
 
-数据管理入口为 `tools/owod/manage_data.py`。它只按 `configs/owod/` 的
-作者 ImageSets 选择数据，不生成随机划分，不根据类别 ID 大小重排任务。
-两套基准分别准备、分别训练和报告。
+数据管理入口为 `tools/owod/manage_data.py`。它只按
+`data/owod/<protocol>/split_manifest.json` 中嵌入的作者清单选择数据，不生成随机
+划分，不根据类别 ID 大小重排任务。两套基准分别准备、分别训练和报告。
 
 ## 1. 准备原始数据
 
@@ -54,9 +54,9 @@ data/
     s-owodb/
 ```
 
-`configs/data/owod.example.json` 是路径模板。可以复制为本地配置后修改
-`ore_root`、`coco_root`、`output_root`；相对路径按项目根目录解析，Windows
-绝对路径建议写成 `D:/datasets/coco`。本地配置中的数据必须是真实原始数据。
+数据路径可以直接通过 `--ore-root`、`--coco-root` 和 `--output-root` 传入；相对
+路径按项目根目录解析，Windows 绝对路径建议写成 `D:/datasets/coco`。这些路径
+必须指向真实原始数据。
 
 已下载的 VOC 原始 TAR 可以这样整理：
 
@@ -109,9 +109,9 @@ python tools/owod/manage_data.py verify --benchmark both --ore-root data/raw/ore
 
 ```bash
 python tools/owod/manage_data.py plan
-python tools/owod/manage_data.py check --config configs/data/owod.example.json
-python tools/owod/manage_data.py prepare --config configs/data/owod.example.json
-python tools/owod/manage_data.py verify --config configs/data/owod.example.json --decode-images
+python tools/owod/manage_data.py check --benchmark both --ore-root data/raw/ore --coco-root data/raw/coco
+python tools/owod/manage_data.py prepare --benchmark both --ore-root data/raw/ore --coco-root data/raw/coco --output-root data/owod
+python tools/owod/manage_data.py verify --benchmark both --ore-root data/raw/ore --coco-root data/raw/coco --output-root data/owod --decode-images
 ```
 
 - `plan`：核验发布清单哈希，列出每任务的新类、已知类和图片数量，无需原始数据。
@@ -149,7 +149,7 @@ python tools/owod/manage_data.py prepare --benchmark s-owodb --coco-root D:/data
 | `instances_train2017.json` | Task 1 为首任务训练集；Task 2–4 为作者均衡微调集，含全部已知类标签 |
 | `instances_val2017.json` | 同一作者测试图片，仅已知类标注的视图 |
 | `instances_val2017_full.json` | 同一作者测试图片、完整 80 类标注，用于开放世界评估 |
-| `split_manifest.json`（基准根目录） | 协议、类别顺序、作者测试序列、阶段路径、数据来源与哈希 |
+| `split_manifest.json`（基准根目录） | 协议、类别顺序、全部作者清单、阶段路径、数据来源与哈希 |
 
 任务间的作者图片重叠保留。M 的作者测试清单重复行也保留于 manifest，评估按
 原始次数处理，JSON 图片记录本身保持唯一。未知类标签不进入增量/均衡训练，

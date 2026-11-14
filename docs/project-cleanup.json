@@ -60,7 +60,6 @@
     "docs/paper-baselines.md": "Current boundary documentation for the retained optional local paper-baseline implementations (2026-11-08)"
   },
   "preserved": [
-    "baselines",
     "exps",
     "output",
     "tmp",
@@ -93,5 +92,9 @@
       "weights",
       "logs"
     ]
-  }
+  },
+  "removed_directories": [
+    "baselines",
+    "configs"
+  ]
 }

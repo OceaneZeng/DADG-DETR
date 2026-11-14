@@ -2,10 +2,9 @@
 
 | 路径 | 职责 |
 | --- | --- |
-| `configs/owod/` | M/S 作者 ImageSets、固定协议来源与哈希 |
-| `configs/data/` | 原始数据路径配置模板 |
 | `data/raw/` 或外部数据磁盘 | 完整 ORE release 与 COCO2017，保持原始数据 |
-| `data/owod/<benchmark>/` | 四任务标注与 schema-3 manifest，Git 忽略 |
+| `data/owod/<benchmark>/split_manifest.json` | Git 跟踪的 schema-3 协议、类别顺序、完整作者清单与来源哈希 |
+| `data/owod/<benchmark>/stage_*/` | 四任务生成标注，Git 忽略 |
 | `datasets/` | 数据 loader、增强、采样代码 |
 | `models/` | Detector、GNN、LoRA、蒸馏和其他研究组件 |
 | `tools/owod/manage_data.py` | 推荐数据入口：plan/check/prepare/verify |
@@ -14,7 +13,7 @@
 | `tools/analysis/` | 已有结果的读取、绘图与汇总，不启动实验 |
 | `tools/windows/build_extension.ps1`、`tools/setup_linux.sh` | 平台环境与 CUDA 扩展构建 |
 | `tools/run_dist_launch.sh`、`tools/run_dist_slurm.sh` | 通用分布式执行工具 |
-| `baselines/` | 外部方法源码，保留现有本地改动 |
+| `baselines/` | 已删除；外部源码不再作为本项目运行时依赖 |
 | `pretrained/` | 预训练权重，实验记录其来源与哈希 |
 | `exps/` | Checkpoint、日志、指标与运行计划 |
 | `output/` | 新生成的图表和导出产物，Git 忽略 |

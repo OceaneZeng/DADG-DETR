@@ -1,2 +1,2 @@
-configs/owod/*/ImageSets/*.txt -text
+data/owod/*/split_manifest.json -text
 tools/owod/*.sh text eol=lf
