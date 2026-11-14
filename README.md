@@ -55,6 +55,10 @@ PDF、图片、论文文稿、压缩包、权重、日志与临时输出均忽�
 
 ## 双 RTX 3090 服务器实验
 
+当前 S Task 2 后续实验见[新类学习诊断与 hard/soft 配对对照](docs/sowodb-task2-routing-experiment.md)。
+Git同步后在服务器运行 `tmux new -s s-task2 'bash tools/owod/run_sowodb_task2_routing.sh'`，
+入口先做同权重诊断，再从同一完整Task1分别新建v7两组、各三轮，固定总batch2并自动恢复。
+
 详见 [GPU 0/1 环境、数据迁移、自检与完整消融](docs/server-3090.md)。
 `python tools/owod/run_server_experiment.py` 核验计划；加 `--execute` 后依次运行
 硬路由、软路由及受限定位更新对照。

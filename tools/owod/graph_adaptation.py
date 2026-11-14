@@ -4,7 +4,7 @@ import torch
 
 from models.graph_local.gnn import load_gnn_checkpoint, compress_gradient_sketches
 from models.graph_local.lora import target_base_weights
-from tools.owod.protocol import file_sha256
+from tools.owod.protocol import file_sha256, resolve_image_root
 from tools.owod.screening_data import experiment_files
 
 
@@ -37,8 +37,9 @@ def build_stage_spec(model, criterion, args, source_checkpoint):
     old = list(args.owod_previous_class_ids)
     # Released balanced memory supplies old-class controller evidence. It never
     # changes the increment loader, optimizer exposure, or author image budget.
-    old_dataset = build_calibration_dataset(Path(manifest['image_root']), files['train'])
-    new_dataset = build_calibration_dataset(Path(manifest['image_root']), files['increment_train'])
+    image_root = resolve_image_root(Path(args.owod_manifest), manifest)
+    old_dataset = build_calibration_dataset(image_root, files['train'])
+    new_dataset = build_calibration_dataset(image_root, files['increment_train'])
     datasets = {c: old_dataset for c in old}
     datasets.update({c: new_dataset for c in current})
     weights = target_base_weights(model, args.graph_adapter_last_n)
@@ -78,7 +79,8 @@ def collect_promotion_features(model, criterion, args):
     """Use only newly released train labels; no historical instance overlap required."""
     from tools.owod.gnn_calibration import build_calibration_dataset, class_loader, move_targets, target_for_class
     manifest, files = experiment_files(args, args.owod_stage)
-    dataset = build_calibration_dataset(Path(manifest['image_root']), files['increment_train'])
+    dataset = build_calibration_dataset(resolve_image_root(Path(args.owod_manifest), manifest),
+                                        files['increment_train'])
     means, route_means = {}, {}
     model.eval()
     device = next(model.parameters()).device

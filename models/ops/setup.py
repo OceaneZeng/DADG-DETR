@@ -54,6 +54,12 @@ def get_extensions():
     cuda_target_include = os.path.join(CUDA_HOME, "include", "targets", "x64")
     if os.path.isdir(cuda_target_include):
         include_dirs.append(cuda_target_include)
+    # Linux Conda CUDA 12.1 keeps toolkit headers/libraries in targets/.
+    # The Python environment root itself has no include/cuda_runtime.h.
+    cuda_linux_target = os.path.join(CUDA_HOME, "targets", "x86_64-linux")
+    if os.name != "nt" and os.path.isdir(os.path.join(cuda_linux_target, "include")):
+        include_dirs.append(os.path.join(cuda_linux_target, "include"))
+        library_dirs.append(os.path.join(cuda_linux_target, "lib"))
     cuda_conda_lib = os.path.join(CUDA_HOME, "lib")
     if os.path.isdir(cuda_conda_lib):
         library_dirs.append(cuda_conda_lib)

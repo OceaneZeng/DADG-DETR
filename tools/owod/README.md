@@ -15,6 +15,13 @@ files and launchers have been deleted. Read-only historical reporting lives in
 
 See [the data guide](../../docs/data-preparation.md) for raw sources and commands.
 
+The current full-data S Task 2 follow-up is
+[`run_sowodb_task2_routing.sh`](../../docs/sowodb-task2-routing-experiment.md):
+read-only measurements on the completed v7 reference, then fresh paired v7
+hard/soft three-epoch diagnostics from the same complete Task 1 parent, two
+3090s, batch 1 per rank. It verifies exact old/canonical manifest equivalence,
+records all input/code identities, and resumes only its unchanged plan.
+
 `download_data.py --benchmark both` resumes official COCO/ORE sources and DINO
 backbone weights. It records sources/hashes and safely extracts ZIPs; ORE Drive
 access requires gdown. An empty/unavailable author folder is a failure, not permission

@@ -86,7 +86,7 @@ def make_optimizer(model, args):
     ], lr=args.lr, weight_decay=args.weight_decay)
 
 
-def run_policy(opt, identity, policy):
+def run_policy(opt, identity, policy, *, variant=None, provenance=None):
     import numpy as np
     import torch
     from torch.utils.data import DataLoader, RandomSampler, SequentialSampler, DistributedSampler
@@ -107,7 +107,9 @@ def run_policy(opt, identity, policy):
         if rank == 0:
             dump(path, value)
 
-    directory = opt.output / f'v{policy}'
+    if variant is not None and (variant not in ('hard', 'soft') or policy != 7 or provenance is None):
+        raise ValueError('Routing comparison requires an explicit verified v7 diagnostic fork')
+    directory = opt.output / (variant or f'v{policy}')
     directory.mkdir(exist_ok=True)
     parent = torch.load(opt.checkpoint, map_location='cpu', weights_only=False)
     source = parent['args']
@@ -126,7 +128,6 @@ def run_policy(opt, identity, policy):
     args.pretrained = str(opt.checkpoint)
     args.resume = ''
     args.output_dir = str(directory)
-    args.coco_path = manifest['image_root']
     args.epochs = 3
     args.start_epoch = 0
     args.batch_size = 2 // world
@@ -144,8 +145,23 @@ def run_policy(opt, identity, policy):
     args.device = 'cuda'
     args.discovery_policy = 'v5'
     configure_run(args)
+    args.coco_path = args.owod_image_root
     # Strictly validate the unmodified v5 parent before the explicit diagnostic fork.
-    validate_checkpoint(args, parent)
+    if provenance is None:
+        validate_checkpoint(args, parent)
+        initialization_args = args
+    else:
+        from tools.owod.task2_parent_provenance import legacy_validation_arguments
+        initialization_args = legacy_validation_arguments(args, parent, opt.manifest, provenance)
+        args.diagnostic_parent_provenance = provenance
+    if variant is not None:
+        # Only after strict validation: Task 1 has no class bank, so both new
+        # banks can be initialized identically with different routing rules.
+        args.graph_routing = initialization_args.graph_routing = variant
+        args.graph_localization = initialization_args.graph_localization = 'frozen'
+        # Calibration uses deterministic transforms. Do not fork workers after
+        # CUDA initialization in its class-by-class loaders on Linux.
+        initialization_args.num_workers = 0
     if args.discovery_warmup >= 3:
         raise ValueError('Three epochs would contain no unknown-learning updates')
     if args.seed != 42 or args.lightweight or args.no_augmentation:
@@ -161,6 +177,8 @@ def run_policy(opt, identity, policy):
     resuming = restored is not None
     if restored:
         validate_diagnostic_resume(restored, identity, policy)
+        if variant is not None and restored.get('variant') != variant:
+            raise ValueError('Routing diagnostic variant changed on resume')
         if (restored['epoch'] == 2 and (directory / 'training_complete.json').is_file()
                 and (directory / 'final_metrics.json').is_file()):
             print(f'v{policy} already completed; preserving its results.', flush=True)
@@ -171,7 +189,7 @@ def run_policy(opt, identity, policy):
         args.rank, args.gpu = rank, gpu
     else:
         model, criterion = load_detector(source, opt.checkpoint, device)
-        layout, means, routes = prepare_task2(model, criterion, args, opt.checkpoint)
+        layout, means, routes = prepare_task2(model, criterion, initialization_args, opt.checkpoint)
         if distributed:
             # Every rank enters calibration, whose criterion uses collectives.
             packet = [(layout, means, routes)]
@@ -229,6 +247,11 @@ def run_policy(opt, identity, policy):
                         owod_current_class_ids=args.owod_current_class_ids,
                         owod_specification=args.owod_evaluation, print_freq=100)[0]
 
+    def learning_probe(phase):
+        from tools.owod.task2_learning_probe import probe
+        write(directory / f'{phase}_learning_probe.json',
+              probe(model, criterion, args, opt.manifest, rank, world))
+
     start = 0
     if restored:
         optimizer.load_state_dict(restored['optimizer'])
@@ -237,8 +260,24 @@ def run_policy(opt, identity, policy):
         restore_rank_state(restored['rank_states'][rank] if distributed else restored, generator)
         del restored
     else:
+        if variant is not None:
+            from tools.owod.task2_learning_probe import state_sha256
+            digest = state_sha256(model)
+            if distributed:
+                digests = [None] * world
+                torch.distributed.all_gather_object(digests, digest)
+                if len(set(digests)) != 1:
+                    raise ValueError('Task 2 initialization differs across ranks')
+            if variant == 'soft':
+                initial = json.loads((opt.output / 'hard' / 'initialization.json').read_text())
+                if initial['state_sha256'] != digest:
+                    raise ValueError('hard/soft must start with identical weights and memory')
+            write(directory / 'initialization.json', dict(state_sha256=digest, routing=variant,
+                  diagnostic_only=True, parent_checkpoint_sha256=identity['checkpoint_sha256']))
         criterion.epoch = 0
         write(directory / 'initial_metrics.json', evaluate_now())
+        if variant is not None:
+            learning_probe('initial')
         torch.manual_seed(args.seed)
         np.random.seed(args.seed)
         random.seed(args.seed)
@@ -265,6 +304,8 @@ def run_policy(opt, identity, policy):
         payload = dict(diagnostic_only=True, diagnostic_identity=identity, policy=policy,
                        epoch=epoch, args=args, model=model.state_dict(), optimizer=optimizer.state_dict(),
                        discovery_ema=teacher.state_dict(), **capture_rank_state(generator))
+        if variant is not None:
+            payload['variant'] = variant
         if distributed:
             states = [None] * world
             torch.distributed.all_gather_object(states, capture_rank_state(generator))
@@ -279,6 +320,11 @@ def run_policy(opt, identity, policy):
             torch.distributed.barrier()
     criterion.epoch = 2
     write(directory / 'final_metrics.json', evaluate_now())
+    if variant is not None:
+        from tools.owod.task2_learning_probe import parameter_audit
+        learning_probe('final')
+        write(directory / 'parameter_audit.json', parameter_audit(
+            model, frozen.state_dict(), args.owod_current_class_ids, args.owod_previous_class_ids))
     write(directory / 'training_complete.json', dict(diagnostic_only=True, epoch=2, policy=policy))
     if distributed:
         torch.distributed.barrier()
