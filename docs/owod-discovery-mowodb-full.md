@@ -1,7 +1,8 @@
-# M-OWODB 全任务训练：v8 ranking 与低学习率配方
+# M-OWODB 全任务训练：v8 ranking / focal 与低学习率配方
 
-2026-11-11：用户要求开始 M-OWODB 全量实验，重点观察 Task 2 新类学习。
-本入口运行完整作者 M 数据及四任务七阶段；保留 v8 ranking 方法与原有数据/阶段校验，
+2026-11-14：focal Task 1 第 8 轮 Known AP50=42.1399%，高于 ranking 同轮
+36.0015%。用户要求继续进行 M-OWODB 全量实验，重点观察 Task 2 新类学习。
+本入口运行完整作者 M 数据及四任务七阶段；支持 v8 ranking 或 focal 评分与原有数据/阶段校验，
 将所有检测训练阶段的学习率缩小至原配方的 1/4。低学习率的前 8 轮 control 证据见
 [结果分析](owod-control-lr-quarter-epoch8-analysis-20261111.md)。
 
@@ -14,7 +15,7 @@ OW-DETR Appendix D，学习率属于本项目稳定性适配，不能称为 OW-D
 - 作者 M-OWODB：每个任务新释放 20 类，schema-3 manifest 与输入哈希核验。
 - DINO ResNet-50、100 queries、seed 42、GPU 0/1、每卡 batch 2、全局 batch 4、
   activation checkpointing；沿用既有 Linux `tree-detr` 环境。
-- v8 ranking：hierarchical 评分、balanced-bce objectness、count novelty 归一化、
+- v8 ranking：hierarchical 评分；v8 focal：已有 focal 评分；两者均使用 balanced-bce objectness、count novelty 归一化、
   3 轮 pseudo ramp、排序权重 1、发现输入梯度系数 1。
 - hard routing、frozen 定位策略、图风险控制、discovery adapter、原型与快照继承、
   旧类蒸馏和作者均衡微调保持当前实现。
@@ -52,6 +53,11 @@ OW-DETR Appendix D，学习率属于本项目稳定性适配，不能称为 OW-D
 新入口不会在第 8 轮暂停，会完成整条任务链。训练故障时返回错误码并保留日志，
 不要绕过阶段/版本/哈希校验强行进入 Task 2。
 
+本次 focal Task 1 的 8 轮结果已经高于 ranking 同轮，但该暂停权重属于 Task 1-only
+计划，不能直接改成全链计划或跨目录续训 Task 2。正式全量 focal 链使用独立的
+`tree-detr-m-v8-focal-lr-quarter-3090-full` 目录，从 DINO 重新开始 Task 1，保证
+七个阶段共用同一份完整计划和评分配置。原 `...-task1` 权重和日志保留为优化对照。
+
 ## 启动和恢复
 
 先在本地 Windows 仓库提交并推送本次源码和文档，用户通过 Git 同步服务器。
@@ -62,28 +68,28 @@ cd /home/top/disks/new-hdd/zhy/Tree-DETR
 conda activate /home/top/disks/new-hdd/conda_envs/tree-detr
 git pull --ff-only origin mowodb
 nvidia-smi
-bash tools/owod/run_discovery_mowodb_3090_full.sh --dry-run
+bash tools/owod/run_discovery_mowodb_3090_full.sh focal --dry-run
 ```
 
 确认物理 GPU 0、1 没有其他训练；检查 dry-run 共打印 7 个训练阶段和 3 个校准命令，
 增量/微调主 lr 分别为 5e-5/5e-6，Task 2 路径为 `stage_1`。启动：
 
 ```bash
-tmux new-session -d -s tree-m-full 'bash tools/owod/run_discovery_mowodb_3090_full.sh'
-tail -n 50 -F output/tree-detr-m-v8-ranking-lr-quarter-3090-full-logs/console.log
+tmux new-session -d -s tree-m-full-focal 'bash tools/owod/run_discovery_mowodb_3090_full.sh focal'
+tail -n 50 -F output/tree-detr-m-v8-focal-lr-quarter-3090-full-logs/console.log
 ```
 
 `Ctrl+C` 退出这里的 tail 不会停止 tmux 内训练。进入训练终端：
 
 ```bash
-tmux attach-session -t tree-m-full
+tmux attach-session -t tree-m-full-focal
 ```
 
 在 tmux 中按 Ctrl+B，松开后按 D 离开。中断后，同一 tmux 训练已结束、GPU 空闲时恢复：
 
 ```bash
-tmux new-session -d -s tree-m-full-resume 'bash tools/owod/run_discovery_mowodb_3090_full.sh --resume'
-tail -n 50 -F output/tree-detr-m-v8-ranking-lr-quarter-3090-full-logs/console.log
+tmux new-session -d -s tree-m-full-focal-resume 'bash tools/owod/run_discovery_mowodb_3090_full.sh focal --resume'
+tail -n 50 -F output/tree-detr-m-v8-focal-lr-quarter-3090-full-logs/console.log
 ```
 
 恢复跳过已有有效完成标记的训练阶段，重新核验/复用校准缓存，并接续当前阶段的
@@ -111,7 +117,7 @@ finetune 使用作者均衡数据，开放全部已知类别 bank/分类行。
 python - <<'PY'
 import json
 from pathlib import Path
-root = Path('output/tree-detr-m-v8-ranking-lr-quarter-3090-full/m-owodb/seed_42/stage_1')
+root = Path('output/tree-detr-m-v8-focal-lr-quarter-3090-full/m-owodb/seed_42/stage_1')
 for phase in ('increment', 'finetune'):
     path = root / phase / 'metrics.jsonl'
     print('\nTask 2', phase)

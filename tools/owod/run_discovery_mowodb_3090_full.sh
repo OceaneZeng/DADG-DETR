@@ -1,13 +1,20 @@
 #!/usr/bin/env bash
-# Full M-OWODB discovery v8 ranking: independent lr-quarter four-task chain.
+# Full M-OWODB discovery v8 chain: ranking or focal scoring.
 set -euo pipefail
+variant=ranking
+if [[ $# -gt 0 && $1 != --* ]]; then variant=$1; shift; fi
+case "$variant" in
+  ranking) scoring=hierarchical ;;
+  focal) scoring=focal ;;
+  *) echo 'Variant must be ranking (default) or focal.' >&2; exit 2 ;;
+esac
 resume=false
 dry_run=false
 for arg in "$@"; do
   case "$arg" in
     --resume) resume=true ;;
     --dry-run) dry_run=true ;;
-    *) echo 'Accepted options: --resume --dry-run. The full four-task configuration is fixed.' >&2; exit 2 ;;
+    *) echo 'Accepted options: [ranking|focal] --resume --dry-run. The full four-task configuration is fixed.' >&2; exit 2 ;;
   esac
 done
 cd "$(dirname "${BASH_SOURCE[0]}")/../.."
@@ -16,13 +23,13 @@ export CUDA_VISIBLE_DEVICES=0,1
 export OMP_NUM_THREADS=2
 export PYTHONUNBUFFERED=1
 export PYTHONPATH="$PWD/models/ops:$PWD${PYTHONPATH:+:$PYTHONPATH}"
-result_dir=output/tree-detr-m-v8-ranking-lr-quarter-3090-full
+result_dir=output/tree-detr-m-v8-${variant}-lr-quarter-3090-full
 log_dir="${result_dir}-logs"
 plan="$result_dir/m-owodb/seed_42/benchmark_plan.json"
 checkpoint="$result_dir/m-owodb/seed_42/stage_0/increment/checkpoint.pth"
 mkdir -p "$log_dir"
 {
-  printf 'Discovery v8 ranking full M-OWODB GPU=0,1 batch_per_rank=2 seed=42 lr_scale=0.25 increment_lr=5e-5 finetune_lr=5e-6 tasks=4 training_phases=7 schedule=50/20\n'
+  printf 'Discovery v8 %s full M-OWODB scoring=%s GPU=0,1 batch_per_rank=2 seed=42 lr_scale=0.25 increment_lr=5e-5 finetune_lr=5e-6 tasks=4 training_phases=7 schedule=50/20\n' "$variant" "$scoring"
   if [[ $dry_run == false ]]; then
     if [[ $resume == true && ! -s "$plan" ]]; then
       echo "Cannot resume: missing or empty full-chain plan $plan" >&2
@@ -42,6 +49,6 @@ mkdir -p "$log_dir"
     --gpus 0,1 --nproc-per-node 2 --batch-size 2 --num-workers 4 \
     --seed 42 --activation-checkpointing --discovery-lr-scale 0.25 \
     --graph-routing hard --graph-localization frozen \
-    --discovery-scoring hierarchical --discovery-pseudo-ramp-epochs 3 \
+    --discovery-scoring "$scoring" --discovery-pseudo-ramp-epochs 3 \
     --discovery-pseudo-normalization count --discovery-known-rank-coef 1.0 "$@"
 } 2>&1 | tee -a "$log_dir/console.log"

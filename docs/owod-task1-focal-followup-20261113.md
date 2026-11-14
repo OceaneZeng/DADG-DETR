@@ -1,12 +1,44 @@
 # M-OWODB Task 1：同轮诊断与 focal 评分对照
 
-2026-11-13。用户授权按建议继续优化实验。本轮已在服务器读取两份真实第 5 轮
-权重，完成相同训练图的只读诊断；本地新增独立 `focal` 启动模式和可复用的评分
-审计。**新组的 8 轮训练尚未运行，尚无正式 AP 提升结论。**
+2026-11-14 更新。用户已完成 focal Task 1 的 8 轮暂停实验。本页先前的服务器
+第 5 轮只读诊断和实现说明仍保留；新增正式日志结果见下方。接下来可启动独立的
+focal 七阶段全量链。
 
 推荐下一组固定为：**γ=1、focal 评分、排序权重 1、主 lr=5e-5，从 DINO 独立
 训练，先完成 8 轮即暂停。** 原 combined γ=0.1 保留暂停状态。依据是当前 M
 训练图上的评分精度差距，不继续扫描 γ，也不更换数据协议或发现模块。
+
+## 新 focal 8 轮正式结果
+
+日志 `C:/Users/23642/Downloads/console.log` 的 SHA256 为
+`2b51af64611f0dceefea71d01e478d72f128d239dd08737ec04f3231528f19a3`，记录的配置为
+`variant=focal`、`scoring=focal`、γ=1、rank coefficient=1、主 lr=5e-5、seed 42、
+双 3090、每卡 batch 2，正常完成 8/50 轮并保留 checkpoint。第 8 轮使用作者 M
+VOC 积分 AP50：
+
+| Task 1 第 8 轮 | focal | 原 ranking | 原 combined |
+| --- | ---: | ---: | ---: |
+| Known / Current AP50 (%) | **42.1399** | 36.0015 | 34.0246 |
+| U-Recall (%) | 9.1338 | 8.2890 | 8.9494 |
+| Unknown Precision (%) | 1.0220 | 0.9263 | 0.9780 |
+| WI@recall=0.8 | 0.079876 | 0.069896 | 0.061788 |
+| A-OSE | 25,992 | 24,530 | 21,424 |
+| H-Score (%) | 15.0134 | 13.4754 | 14.1713 |
+
+focal 相对原 ranking 同轮 AP 提高 **6.1383 个百分点**，U-Recall 提高 0.8448
+个百分点，Unknown Precision 提高 0.0957 个百分点；WI 增加 0.009980，A-OSE
+增加 1,462，未知误检侧的改善并不一致。相对 combined，AP 提高 8.1152 个百分点，
+但 WI/A-OSE 同样更高。该结果支持 focal 进入正式全量验证，不能据第 8 轮替代固定
+第 50 轮，也不把 AP 改善归因于某一个损失项。
+
+## 当前全量决策
+
+正式全量实验选择 focal，运行 Task 1 increment、Task 2–4 increment 及各自 balanced
+finetune，共 7 个训练阶段和 3 个 GNN 校准阶段。`run_discovery_mowodb_3090_full.sh`
+现在接受 `ranking`（默认）或 `focal`。由于已有 focal 8 轮目录是 `--task1-only`
+计划，不能用 `--resume` 把它改成七阶段计划；正式全量 focal 链使用新目录
+`output/tree-detr-m-v8-focal-lr-quarter-3090-full`，从 DINO 重新开始，保留原
+`...-task1` 作为 8 轮对照。具体启动命令见全量训练说明。
 
 ## 已完成的真实权重诊断
 
@@ -66,8 +98,9 @@ ranking 的 focal 相比同权重 hierarchical 高 11.4177 个百分点；combin
 足以构造一个可归因的对照。历史 S 协议上的 focal 结果没有显示普遍收益，不能
 从当前 M 子集推广出跨协议有效结论。
 
-以上数值来自训练图和已训练的 hierarchical 权重，**不是正式测试成绩，也不
-预测重新训练 focal 后将获得相同增益**。只支持投入一组固定 8 轮预算验证假设。
+早期评分审计数值来自训练图和已训练的 hierarchical 权重，**不是正式测试成绩，
+也不预测重新训练 focal 后将获得相同增益**。新 focal 日志已提供正式 Task 1 第
+8 轮结果，但仍需完成完整七阶段验证。
 
 ## 实际配置与损失对应
 
@@ -205,8 +238,9 @@ ranking checkpoint f4eb0130387fd5922b96a37e2fcac65a78758c41e1bdc7a97daaa7c4ff96b
 combined checkpoint 903a97fadab678f4d7a19e366eb4f1ebccbb41460076e2f4935f50e4d7c37e3c
 ```
 
-本地工具验证使用合成输入和小模型，真实服务器的上述诊断使用完整权重和合法
-训练图。两者都不构成新 focal 配置在正式测试集上的提升证据。
+本地工具验证使用合成输入和小模型，真实服务器的第 5 轮诊断使用完整权重和合法
+训练图；新 focal 日志为用户服务器的正式第 8 轮评估。两者都不替代完整七阶段
+结果。
 
 本地直接相关检查 **72 passed**：新三模式与旧默认行为、独立输出和失败保护、
 跨评分/γ 续训拒绝、真实 CUDA Task 1/2 checkpoint/EMA/路由前向、评分审计的一对一

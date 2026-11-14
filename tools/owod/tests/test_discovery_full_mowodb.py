@@ -77,7 +77,8 @@ def test_discovery_lr_scale_does_not_modify_other_methods(inputs, method):
         run_benchmark.build_plan(inputs)
 
 
-def test_launcher_full_chain_protects_results_and_logs_failures(tmp_path):
+@pytest.mark.parametrize('variant,scoring', [('ranking', 'hierarchical'), ('focal', 'focal')])
+def test_launcher_full_chain_protects_results_and_logs_failures(tmp_path, variant, scoring):
     bash = 'C:/Program Files/Git/bin/bash.exe' if os.name == 'nt' else shutil.which('bash')
     if not bash or not Path(bash).is_file():
         pytest.skip('Bash unavailable')
@@ -98,7 +99,7 @@ def test_launcher_full_chain_protects_results_and_logs_failures(tmp_path):
 
     def execute(*args):
         trace.write_text('')
-        return subprocess.run([bash, script.as_posix(), *args], env=env,
+        return subprocess.run([bash, script.as_posix(), variant, *args], env=env,
                               capture_output=True, text=True, timeout=20)
 
     result = execute('--dry-run')
@@ -107,11 +108,13 @@ def test_launcher_full_chain_protects_results_and_logs_failures(tmp_path):
     assert '--task1-only' not in command and '--pause-after-epochs' not in command
     for option, expected in [('--discovery-lr-scale', '0.25'), ('--method', 'discovery'),
         ('--gpus', '0,1'), ('--nproc-per-node', '2'), ('--batch-size', '2'),
-        ('--discovery-known-rank-coef', '1.0'), ('--discovery-pseudo-normalization', 'count')]:
+        ('--discovery-known-rank-coef', '1.0'), ('--discovery-pseudo-normalization', 'count'),
+        ('--discovery-scoring', scoring), ('--output-dir',
+         f'output/tree-detr-m-v8-{variant}-lr-quarter-3090-full')]:
         assert command[command.index(option) + 1] == expected
     assert execute('--resume').returncode == 2
     assert not trace.read_text()
-    root = tmp_path / 'output/tree-detr-m-v8-ranking-lr-quarter-3090-full/m-owodb/seed_42'
+    root = tmp_path / f'output/tree-detr-m-v8-{variant}-lr-quarter-3090-full/m-owodb/seed_42'
     checkpoint = root / 'stage_0/increment/checkpoint.pth'
     checkpoint.parent.mkdir(parents=True)
     checkpoint.write_bytes(b'existing formal chain')
@@ -128,5 +131,5 @@ def test_launcher_full_chain_protects_results_and_logs_failures(tmp_path):
     env['TEST_FAIL_TRAIN'] = '1'
     assert execute('--resume').returncode == 9
     assert execute('--full').returncode == 2
-    logfile = tmp_path / 'output/tree-detr-m-v8-ranking-lr-quarter-3090-full-logs/console.log'
-    assert 'tasks=4 training_phases=7 schedule=50/20' in logfile.read_text()
+    logfile = tmp_path / f'output/tree-detr-m-v8-{variant}-lr-quarter-3090-full-logs/console.log'
+    assert f'Discovery v8 {variant} full M-OWODB scoring={scoring}' in logfile.read_text()
