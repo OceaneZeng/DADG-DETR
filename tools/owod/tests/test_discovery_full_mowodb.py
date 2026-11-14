@@ -107,14 +107,14 @@ def test_launcher_full_chain_protects_results_and_logs_failures(tmp_path, varian
     command = next(shlex.split(line) for line in trace.read_text().splitlines() if 'run_benchmark.py' in line)
     assert '--task1-only' not in command and '--pause-after-epochs' not in command
     for option, expected in [('--discovery-lr-scale', '0.25'), ('--method', 'discovery'),
-        ('--gpus', '0,1'), ('--nproc-per-node', '2'), ('--batch-size', '2'),
+        ('--gpus', '0'), ('--nproc-per-node', '1'), ('--batch-size', '4'),
         ('--discovery-known-rank-coef', '1.0'), ('--discovery-pseudo-normalization', 'count'),
         ('--discovery-scoring', scoring), ('--output-dir',
-         f'output/tree-detr-m-v8-{variant}-lr-quarter-3090-full')]:
+         f'output/tree-detr-m-v8-{variant}-lr-quarter-a40-full')]:
         assert command[command.index(option) + 1] == expected
     assert execute('--resume').returncode == 2
     assert not trace.read_text()
-    root = tmp_path / f'output/tree-detr-m-v8-{variant}-lr-quarter-3090-full/m-owodb/seed_42'
+    root = tmp_path / f'output/tree-detr-m-v8-{variant}-lr-quarter-a40-full/m-owodb/seed_42'
     checkpoint = root / 'stage_0/increment/checkpoint.pth'
     checkpoint.parent.mkdir(parents=True)
     checkpoint.write_bytes(b'existing formal chain')
@@ -131,5 +131,5 @@ def test_launcher_full_chain_protects_results_and_logs_failures(tmp_path, varian
     env['TEST_FAIL_TRAIN'] = '1'
     assert execute('--resume').returncode == 9
     assert execute('--full').returncode == 2
-    logfile = tmp_path / f'output/tree-detr-m-v8-{variant}-lr-quarter-3090-full-logs/console.log'
-    assert f'Discovery v8 {variant} full M-OWODB scoring={scoring}' in logfile.read_text()
+    logfile = tmp_path / f'output/tree-detr-m-v8-{variant}-lr-quarter-a40-full-logs/console.log'
+    assert f'Discovery v8 {variant} full M-OWODB scoring={scoring} GPU=0 device=A40 batch_per_rank=4 effective_batch=4 nproc=1' in logfile.read_text()

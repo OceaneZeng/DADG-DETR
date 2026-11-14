@@ -37,7 +37,7 @@ focal 相对原 ranking 同轮 AP 提高 **6.1383 个百分点**，U-Recall 提�
 finetune，共 7 个训练阶段和 3 个 GNN 校准阶段。`run_discovery_mowodb_3090_full.sh`
 现在接受 `ranking`（默认）或 `focal`。由于已有 focal 8 轮目录是 `--task1-only`
 计划，不能用 `--resume` 把它改成七阶段计划；正式全量 focal 链使用新目录
-`output/tree-detr-m-v8-focal-lr-quarter-3090-full`，从 DINO 重新开始，保留原
+`output/tree-detr-m-v8-focal-lr-quarter-a40-full`，从 DINO 重新开始，保留原
 `...-task1` 作为 8 轮对照。具体启动命令见全量训练说明。
 
 ## 已完成的真实权重诊断
