@@ -2,7 +2,7 @@
 
 这是独立诊断，采用作者完整 S-OWODB 数据和 VOC2007 11 点 AP50，非正式四任务成绩。
 沿用已有完整 v5 Task 1 第50轮及其 GNN，两张3090、每卡 batch1、总 batch2、seed42。
-默认只比较 v7 hard/frozen 与 v7 soft/frozen，各3轮 increment，不做 balanced finetune。
+默认只比较 v7 hard/frozen 与 v7 soft/frozen，各8轮 increment，不做 balanced finetune。
 本页的 v7 是 main 的旧类补标、发现路由平衡和受约束原型回收，不是 M 分支的 objectness focal v7。
 
 ## 实验依据与顺序
@@ -10,15 +10,19 @@
 服务器旧双卡对照 `output/task2-v5-v7-diagnostic-3epochs-2gpu/results/comparison.json`
 已经完整结束。v5/v7 的 Previous AP50 为21.83%/59.80%，Current AP50 为2.48%/2.88%，
 Known AP50 为11.67%/29.92%。该结果支持优先定位新类瓶颈，尚不支持启动 v7 正式链。
+三轮适合发现明显失败，但含一轮discovery warmup，只有两轮匿名未知学习更新；
+八轮含七轮匿名未知学习更新，新类监督则从第一轮就参与。
+八轮提供更长的固定观察窗口，不能预先证明改善。历史正式v5的Task2第八轮Current AP50
+也只有约3.64%，且该运行总batch4，本次总batch2，不能把它当作本次hard/soft配对控制。
 
 入口依次完成：
 
 1. 核验当前数据、Task1、GNN、历史v7诊断来源，记录独立运行计划。
 2. 只读历史v7第三轮：在当前实现下完整评估作者测试集，并测量已释放Task2训练标注上的
    框覆盖、评分候选竞争、匹配query的正确路由/null路由及实际gate。诊断不更新权重。
-3. 从同一完整Task1独立新建 hard/frozen、soft/frozen 两组，各3轮，初始化权重和原型哈希必须相同。
-4. 每组初始化、固定第三轮末评估完整作者测试集，另记训练标注诊断和参数变化。
-   只在第三轮结束后作配对比较，不选最优测试epoch或更改评分阈值。
+3. 从同一完整Task1独立新建 hard/frozen、soft/frozen 两组，各8轮，初始化权重和原型哈希必须相同。
+4. 每组初始化、固定第3和第8轮末评估完整作者测试集，另记训练标注诊断和最终参数变化。
+   第3轮用于观察学习速度，第8轮用于本次最终配对比较，不选最优测试epoch或更改评分阈值。
 
 训练标注诊断按当前21类分别取作者训练序列中最先出现的12张图像，再去重并保序，最多252张。
 它只保证检查各类有输入，不产生新benchmark划分，不是代表性召回或AP。
@@ -30,7 +34,7 @@ Known AP50 为11.67%/29.92%。该结果支持优先定位新类瓶颈，尚不�
 
 除类别adapter的hard/soft路由外两组保持一致：hierarchical评分、冻结定位、v7发现机制、
 旧类蒸馏、完整作者清单、初始化、增强、warmup1轮、AdamW lr=2e-4、backbone lr=2e-5、
-weight_decay=1e-4、masked classifier零decay，三轮内无学习率衰减。
+weight_decay=1e-4、masked classifier零decay，八轮内无学习率衰减。
 相同初始权重不保证两种路由的优化轨迹相同；对照测量的就是该差异。
 仍使用v5 Task1的同一匿名记忆，不检验v7从Task1学习后能否改善unknown到新类的转化。
 定位消融和学习率消融暂不启动。
@@ -55,7 +59,7 @@ GNN仍核验其原始Task1权重、训练标注、类别、层数及无验证标
 ```bash
 cd ~/disks/new-hdd/zhy/Tree-DETR
 git pull --ff-only origin main
-tmux new -s s-task2 'bash tools/owod/run_sowodb_task2_routing.sh'
+tmux new -s s-task2-8e 'bash tools/owod/run_sowodb_task2_routing.sh'
 ```
 
 脚本自动使用已核实的 `/home/top/disks/new-hdd/conda_envs/tree-detr/bin/python`，无需另建环境。
@@ -78,39 +82,55 @@ bash tools/owod/run_sowodb_task2_routing.sh --check
 
 首次运行新目录；再次执行同一脚本会在计划完全一致时自动恢复，跳过已完成的参考诊断和组别，
 从最近完整轮checkpoint恢复优化器、EMA及每rank随机/loader状态，未完成轮重跑。
+第3轮评估前保存checkpoint，评估和训练标注诊断前后还原每rank的训练随机状态，避免中途测量
+改变后续增强和dropout流。评估完成标记最后写入；若在评估期间中断，恢复先用该轮checkpoint
+补完测量，再进入下一轮。缺失较早里程碑但checkpoint已经更晚时拒绝补造旧轮结果。
 源码或输入改变时拒绝续跑；不要删计划强接旧checkpoint。
-同时运行同一目录会由`flock`拒绝。`Ctrl+B`再按`D`离开tmux，`tmux attach -t s-task2`返回。
+八轮计划使用新suite身份和新目录，不能续接旧三轮checkpoint；已有三轮计划、权重和日志保留。
+同时运行同一目录会由`flock`拒绝。`Ctrl+B`再按`D`离开tmux，`tmux attach -t s-task2-8e`返回。
 若原tmux会话已结束，用相同启动命令重新建立；仍存在时先attach，不另启第二份。
 
 ## 输出与预算
 
-根目录 `output/sowodb-task2-v7-routing-3epochs-2gpu/`：
+根目录 `output/sowodb-task2-v7-routing-8epochs-2gpu/`：
 
 - `console.log`：来源、完整训练/评估日志，恢复时追加。
 - `results/diagnostic_plan.json`、`parent_provenance.json`：计划及manifest等价证明。
 - `results/reference/`：旧权重当前完整评估、训练标注诊断及不改权重证明。
-- `results/hard/`、`results/soft/`：初始化身份、初始/末轮指标、训练标注诊断、
+- `results/hard/`、`results/soft/`：初始化身份、初始指标、`metrics_epoch_3.json`、
+  `metrics_epoch_8.json`、对应训练标注诊断及评估完成标记、
   每轮训练统计、checkpoint、最终参数审计。
-- `results/comparison.json`：固定第三轮的Previous/Current/Known AP50、U-Recall、
-  unknown precision/数量、WI@0.8、A-OSE和soft减hard差值。AP/recall/precision为0–1值。
+- 两组完成后生成`results/comparison_epoch_3.json`和`comparison_epoch_8.json`，区分中途与末轮。
+- `results/comparison.json`：固定第八轮的Previous/Current/Known AP50、U-Recall、
+  unknown precision/数量、WI@0.8、A-OSE、soft减hard差值，以及各组第3至8轮的变化。
+  AP/recall/precision为0–1值。
 
 ```bash
-tail -f output/sowodb-task2-v7-routing-3epochs-2gpu/console.log
-cat output/sowodb-task2-v7-routing-3epochs-2gpu/results/comparison.json
+tail -f output/sowodb-task2-v7-routing-8epochs-2gpu/console.log
+cat output/sowodb-task2-v7-routing-8epochs-2gpu/results/comparison.json
 ```
 
-历史双卡三轮训练约4.8–4.9小时/组。两组约10小时纯训练，连同初始化、参考诊断和评估预留12–16小时，
+历史双卡三轮训练约4.8–4.9小时/组。按比例外推八轮两组约26小时纯训练，
+连同初始化、参考诊断和第3/8轮评估预留28–36小时，
 实际以首轮`epoch_0.json`的`seconds`修正。出现OOM、非有限loss/梯度、来源失败或初始化不一致立即停。
-三轮末若soft改善Current且Previous/Known和未知指标可接受，再决定更长预算；框覆盖低时单独设计
-`bbox-last`定位消融。最终验收必须完成独立的Task2 increment＋作者balanced finetune和正式新链，
+第3轮低AP本身不提前终止；按固定预算训练到第8轮。如果两组第3至8轮都上升，说明三轮不足以
+评估此配置的学习程度；若soft在第8轮改善Current且Previous/Known和未知表现可接受，
+再安排独立的完整Task2验证。若两组第8轮仍低，不单靠追加轮数解释：结合框覆盖、评分候选竞争、
+匹配query路由和adapter更新定位问题；框覆盖低时单独设计`bbox-last`定位消融。
+以上单seed结果用于决定后续实验，不能证明统计显著性或收敛。
+最终验收必须完成独立的Task2 increment＋作者balanced finetune和正式新链，
 本诊断权重不能作为正式链父节点，不会自动开始Task3/4。
 
 ## 本次验证范围（2026-11-14）
 
-本地30项相关检查通过，覆盖历史manifest逐字节还原、内容变化拒绝、正式入口仍拒绝跨manifest及
+此前三轮版本的本地30项相关检查通过，覆盖历史manifest逐字节还原、内容变化拒绝、正式入口仍拒绝跨manifest及
 诊断checkpoint、路由/评分覆盖计数、配对身份、旧分类行保护、真实检测器CUDA反向及权重恢复。
 既有一项Windows双进程Gloo检查超时；在目标Linux服务器同一项检查通过。
 另在服务器两张3090上运行了本次新增的hard/soft随机输入检查，前后向、NCCL、EMA、原型同步
 及每rank随机状态恢复均通过；真实v7权重完成一张训练图的诊断，模型权重状态哈希未改变。
 Task1/GNN及16份阶段文件已在服务器只读核验；扩展已用现有CUDA12.1/GCC12编译并通过前向。
-这些检查不证明AP提升。本次完整参考评估、三轮hard/soft训练及其端到端恢复仍待用户启动。
+八轮版本本地39项相关检查通过，另1项既有Windows双进程Gloo检查未重跑。
+新增覆盖固定第3/8轮调度、三轮与八轮计划隔离、中途评估随机流保持及评估中断后的恢复顺序。
+目标Linux服务器两张3090还通过新评估函数的双进程检查：固定调度、每rank的CPU/CUDA/loader
+随机状态保持、已完成评估跳过和中断重试；测试源码经内存传入，没有改动服务器源码或启动长训练。
+这些检查不证明AP提升。本次完整参考评估、八轮hard/soft训练及其端到端恢复仍待用户启动。

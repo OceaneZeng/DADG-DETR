@@ -7,6 +7,7 @@ from models.graph_local.discovery_memory import PrototypeMemory
 from tools.owod.train_task2_diagnostic import (
     make_optimizer, validate_diagnostic_resume, diagnostic_identity,
     capture_rank_state, restore_rank_state,
+    diagnostic_evaluation_epochs, pending_diagnostic_evaluations, evaluate_diagnostic_milestone,
 )
 from tools.owod.strict_setting import validate_checkpoint
 
@@ -92,6 +93,7 @@ def test_two_gpu_plan_keeps_effective_batch_and_rejects_single_gpu_resume(tmp_pa
     assert single['batch_size'] * single['world_size'] == 2
     assert dual['batch_size'] == 1 and dual['world_size'] == 2
     assert dual['effective_batch_size'] == 2
+    assert single['epochs'] == dual['epochs'] == 3  # Existing v5/v7 CLI keeps its budget.
     with pytest.raises(ValueError, match='identity'):
         validate_diagnostic_resume(dict(diagnostic_only=True, diagnostic_identity=single,
                                         policy=7, epoch=0), dual, 7)
@@ -129,6 +131,93 @@ def test_rank_random_state_restores_training_and_loader_streams():
     assert torch.equal(expected[0], actual[0])
     assert torch.equal(expected[1], actual[1])
     assert np.array_equal(expected[2], actual[2]) and expected[3] == actual[3]
+
+
+def test_eight_epoch_resume_accepts_only_its_own_budget():
+    state = capture_rank_state(torch.Generator())
+    identity = dict(epochs=8, evaluation_epochs=[3, 8])
+    payload = dict(diagnostic_only=True, diagnostic_identity=identity, policy=7, epoch=7,
+                   model={}, optimizer={}, discovery_ema={}, args={}, **state)
+    validate_diagnostic_resume(payload, identity, 7)
+    with pytest.raises(ValueError, match='identity'):
+        validate_diagnostic_resume(dict(payload, epoch=8), identity, 7)
+    old = dict(epochs=3)
+    legacy = dict(payload, diagnostic_identity=old, epoch=2)
+    validate_diagnostic_resume(legacy, old, 7)
+    with pytest.raises(ValueError, match='identity'):
+        validate_diagnostic_resume(legacy, identity, 7)
+    with pytest.raises(ValueError, match='identity'):
+        validate_diagnostic_resume(dict(legacy, epoch=3), old, 7)
+
+
+@pytest.mark.parametrize('milestones', [[], [8, 3], [3, 3, 8], [3], [3, 9], [0, 8]])
+def test_diagnostic_rejects_invalid_evaluation_schedule(milestones):
+    with pytest.raises(ValueError, match='evaluations'):
+        diagnostic_evaluation_epochs(dict(epochs=8, evaluation_epochs=milestones))
+    assert diagnostic_evaluation_epochs(dict(epochs=3)) == (3,)
+
+
+def test_midpoint_measurement_preserves_training_rng_and_fixed_schedule(tmp_path):
+    import json
+    import random
+    import numpy as np
+    identity = dict(epochs=8, evaluation_epochs=[3, 8])
+    generator = torch.Generator().manual_seed(43)
+    before = capture_rank_state(generator)
+
+    def draw():
+        return (torch.rand(3), torch.rand(3, generator=generator),
+                np.random.rand(3), random.random())
+
+    expected = draw()
+    restore_rank_state(before, generator)
+    calls = []
+
+    def measure():
+        calls.append(True)
+        draw()  # Simulate evaluation/probe worker creation and other random work.
+        return {'owod_current_ap50': .02}
+
+    for epoch in range(1, 9):
+        evaluate_diagnostic_milestone(tmp_path, identity, epoch, generator, measure, measure)
+    actual = draw()
+    assert torch.equal(expected[0], actual[0]) and torch.equal(expected[1], actual[1])
+    assert np.array_equal(expected[2], actual[2]) and expected[3] == actual[3]
+    assert len(calls) == 4  # AP + probe, at epochs 3 and 8 only.
+    assert json.loads((tmp_path / 'metrics_epoch_3.json').read_text())['owod_current_ap50'] == .02
+    assert (tmp_path / 'epoch_8_learning_probe.json').is_file()
+    evaluate_diagnostic_milestone(tmp_path, identity, 8, generator, measure, measure)
+    assert len(calls) == 4  # Completed measurements are not repeated on resume.
+
+
+def test_interrupted_midpoint_retries_before_checkpoint_advances(tmp_path):
+    identity = dict(epochs=8, evaluation_epochs=[3, 8])
+    generator = torch.Generator().manual_seed(42)
+    before = capture_rank_state(generator)
+    calls = []
+
+    def evaluate():
+        calls.append(True)
+        torch.rand(3, generator=generator)
+        return {'owod_current_ap50': .02}
+
+    def interrupted_probe():
+        torch.rand(3)
+        raise RuntimeError('interrupted measurement')
+
+    with pytest.raises(RuntimeError, match='interrupted'):
+        evaluate_diagnostic_milestone(tmp_path, identity, 3, generator, evaluate, interrupted_probe)
+    assert torch.equal(before['loader_rng'], generator.get_state())
+    assert torch.equal(before['torch_rng'], torch.get_rng_state())
+    assert pending_diagnostic_evaluations(tmp_path, identity, 3, with_probe=True) == [3]
+    assert not (tmp_path / 'evaluation_epoch_3_complete.json').exists()
+    with pytest.raises(ValueError, match='Cannot reconstruct fixed epoch 3'):
+        pending_diagnostic_evaluations(tmp_path, identity, 4, with_probe=True)
+    # Resume uses the still-current epoch-3 checkpoint, finishing evaluation first.
+    evaluate_diagnostic_milestone(tmp_path, identity, 3, generator, evaluate, lambda: {'matched': 1})
+    assert len(calls) == 2
+    assert pending_diagnostic_evaluations(tmp_path, identity, 4, with_probe=True) == []
+    assert pending_diagnostic_evaluations(tmp_path, identity, 8, with_probe=True) == [8]
 
 
 def test_two_process_checkpoint_restores_each_rank_rng():

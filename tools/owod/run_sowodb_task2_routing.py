@@ -13,25 +13,33 @@ from tools.owod.protocol import file_sha256
 from tools.owod.task2_parent_provenance import verify_parent_inputs, verify_reference
 from tools.owod.train_task2_diagnostic import diagnostic_identity, dump, run_policy
 
+EPOCHS = 8
+EVALUATION_EPOCHS = (3, 8)
+
 
 def routing_identity(manifest, checkpoint, gnn, proof, reference, world_size, gpu_selection):
-    identity = diagnostic_identity(manifest, checkpoint, gnn, world_size)
-    identity.update(suite='sowodb-task2-v7-routing-v1', policies=[7],
+    identity = diagnostic_identity(manifest, checkpoint, gnn, world_size, epochs=EPOCHS)
+    identity.update(suite='sowodb-task2-v7-routing-v2', policies=[7],
+                    evaluation_epochs=list(EVALUATION_EPOCHS),
                     variants=['hard', 'soft'], localization='frozen',
                     parent_provenance=proof, reference=reference, probe_images_per_class=12,
                     cuda_visible_devices=gpu_selection)
     return identity
 
 
-def paired_report(hard, soft):
+def paired_report(hard, soft, *, epoch=EPOCHS):
+    if epoch not in EVALUATION_EPOCHS:
+        raise ValueError('Report requires a predeclared evaluation epoch')
     metrics = ('owod_previous_ap50', 'owod_current_ap50', 'owod_known_ap50', 'owod_u_recall',
                'owod_unknown_precision', 'owod_unknown_predictions', 'owod_wi', 'owod_a_ose')
-    return dict(diagnostic_only=True, epochs=3, finetune=False,
+    return dict(diagnostic_only=True, epochs=EPOCHS, evaluation_epoch=epoch,
+                evaluation_epochs=list(EVALUATION_EPOCHS), interim=epoch < EPOCHS, finetune=False,
                 ap_convention='VOC2007 11-point AP50; AP/recall/precision in [0,1]',
                 hard={k: hard[k] for k in metrics if k in hard},
                 soft={k: soft[k] for k in metrics if k in soft},
                 soft_minus_hard={k: soft[k] - hard[k] for k in metrics if k in hard and k in soft},
-                note='Fixed third-epoch results, not selected best epochs. Short diagnostic, '
+                note=f'Predeclared epoch {epoch} results; final comparison is epoch {EPOCHS}. '
+                     'Increment-only diagnostic, '
                      'not formal Task 2 or evidence of successful Task 1 unknown-to-new transfer.')
 
 
@@ -44,7 +52,7 @@ def main():
     previous = Path('output/task2-v5-v7-diagnostic-3epochs-2gpu/results')
     parser.add_argument('--reference-checkpoint', type=Path, default=previous / 'v7/checkpoint.pth')
     parser.add_argument('--reference-plan', type=Path, default=previous / 'diagnostic_plan.json')
-    parser.add_argument('--output', type=Path, default=Path('output/sowodb-task2-v7-routing-3epochs-2gpu/results'))
+    parser.add_argument('--output', type=Path, default=Path('output/sowodb-task2-v7-routing-8epochs-2gpu/results'))
     parser.add_argument('--preflight', action='store_true', help='CPU-only provenance checks; writes no experiment state')
     parser.add_argument('--resume', action='store_true')
     opt = parser.parse_args()
@@ -56,7 +64,8 @@ def main():
     reference = verify_reference(opt.reference_checkpoint, opt.reference_plan, proof)
     if opt.preflight:
         print(json.dumps(dict(parent_provenance=proof, reference=reference,
-                              variants=['hard', 'soft'], epochs=3, effective_batch_size=2), indent=2))
+                              variants=['hard', 'soft'], epochs=EPOCHS,
+                              evaluation_epochs=list(EVALUATION_EPOCHS), effective_batch_size=2), indent=2))
         return
     opt.world_size = int(os.environ.get('WORLD_SIZE', 1))
     opt.rank = int(os.environ.get('RANK', 0))
@@ -94,7 +103,7 @@ def main():
     gc.collect()
     torch.cuda.empty_cache()
     for variant in ('hard', 'soft'):
-        print(f'v7 Task 2 paired experiment: {variant}, 3 increment epochs, frozen localization', flush=True)
+        print(f'v7 Task 2 paired experiment: {variant}, {EPOCHS} increment epochs, frozen localization', flush=True)
         run_policy(opt, identity, 7, variant=variant, provenance=proof)
     for path, expected in [(opt.checkpoint, proof['checkpoint_sha256']), (opt.gnn, proof['gnn_sha256']),
                            (opt.reference_checkpoint, reference['checkpoint_sha256']),
@@ -102,8 +111,17 @@ def main():
         if file_sha256(path) != expected:
             raise ValueError(f'Input changed during experiment: {path}')
     if opt.rank == 0:
-        finals = [json.loads((opt.output / v / 'final_metrics.json').read_text()) for v in ('hard', 'soft')]
-        report = paired_report(*finals)
+        comparisons = {}
+        for epoch in EVALUATION_EPOCHS:
+            metrics = [json.loads((opt.output / variant / f'metrics_epoch_{epoch}.json').read_text())
+                       for variant in ('hard', 'soft')]
+            comparisons[epoch] = paired_report(*metrics, epoch=epoch)
+            dump(opt.output / f'comparison_epoch_{epoch}.json', comparisons[epoch])
+        report = comparisons[EPOCHS]
+        report['change_from_epoch_3_to_8'] = {
+            variant: {key: value - comparisons[3][variant][key]
+                      for key, value in report[variant].items() if key in comparisons[3][variant]}
+            for variant in ('hard', 'soft')}
         dump(opt.output / 'comparison.json', report)
         print(json.dumps(report, indent=2), flush=True)
     torch.distributed.barrier()

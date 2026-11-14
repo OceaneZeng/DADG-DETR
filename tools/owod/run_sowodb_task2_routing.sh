@@ -7,7 +7,7 @@ if (( $# )) && [[ $# != 1 || $1 != --check ]]; then
 fi
 cd "$(dirname "${BASH_SOURCE[0]}")/../.."
 python_bin="${TREE_DETR_PYTHON:-/home/top/disks/new-hdd/conda_envs/tree-detr/bin/python}"
-output="${SOWODB_TASK2_OUTPUT:-output/sowodb-task2-v7-routing-3epochs-2gpu}"
+output="${SOWODB_TASK2_OUTPUT:-output/sowodb-task2-v7-routing-8epochs-2gpu}"
 export CUDA_DEVICE_ORDER=PCI_BUS_ID
 export CUDA_VISIBLE_DEVICES="${SOWODB_GPUS:-0,1}"
 export LOCAL_SIZE=2
@@ -42,7 +42,7 @@ git status --short
 if [[ ${1:-} == --check ]]; then
   exit 0
 fi
-[[ -n ${TMUX:-} ]] || { echo 'Run in tmux: tmux new -s s-task2 "bash tools/owod/run_sowodb_task2_routing.sh"' >&2; exit 1; }
+[[ -n ${TMUX:-} ]] || { echo 'Run in tmux: tmux new -s s-task2-8e "bash tools/owod/run_sowodb_task2_routing.sh"' >&2; exit 1; }
 nvidia-smi --query-gpu=index,uuid,pci.bus_id,name,memory.free --format=csv
 "$python_bin" - <<'PY'
 import torch

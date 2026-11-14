@@ -18,9 +18,11 @@ See [the data guide](../../docs/data-preparation.md) for raw sources and command
 The current full-data S Task 2 follow-up is
 [`run_sowodb_task2_routing.sh`](../../docs/sowodb-task2-routing-experiment.md):
 read-only measurements on the completed v7 reference, then fresh paired v7
-hard/soft three-epoch diagnostics from the same complete Task 1 parent, two
-3090s, batch 1 per rank. It verifies exact old/canonical manifest equivalence,
-records all input/code identities, and resumes only its unchanged plan.
+hard/soft eight-epoch diagnostics from the same complete Task 1 parent, two
+3090s, batch 1 per rank. Fixed evaluations at epochs 3 and 8 preserve training RNG;
+epoch 8 is the final comparison. It verifies exact old/canonical manifest equivalence,
+records all input/code identities, and resumes only its unchanged plan in a new
+eight-epoch output directory, preserving historical three-epoch runs.
 
 `download_data.py --benchmark both` resumes official COCO/ORE sources and DINO
 backbone weights. It records sources/hashes and safely extracts ZIPs; ORE Drive

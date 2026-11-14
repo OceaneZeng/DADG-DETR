@@ -1,6 +1,7 @@
-"""Three-epoch full-author-data Task 2 diagnostic; never a formal-chain parent."""
+"""Full-author-data Task 2 diagnostics; never a formal-chain parent."""
 import argparse
 import copy
+from contextlib import contextmanager
 import gc
 import json
 import os
@@ -21,13 +22,13 @@ def dump(path, value):
     temporary.replace(path)
 
 
-def diagnostic_identity(manifest, checkpoint, gnn, world_size=1):
+def diagnostic_identity(manifest, checkpoint, gnn, world_size=1, *, epochs=3):
     # Include implementation changes so --resume cannot silently change methods.
     sources = [ROOT / 'main.py', ROOT / 'engine.py']
     for folder in ('models', 'datasets', 'util', 'tools/owod'):
         sources.extend(p for p in sorted((ROOT / folder).rglob('*.py')) if 'tests' not in p.parts)
     return dict(manifest_sha256=file_sha256(manifest), checkpoint_sha256=file_sha256(checkpoint),
-                gnn_sha256=file_sha256(gnn), epochs=3, batch_size=2 // world_size,
+                gnn_sha256=file_sha256(gnn), epochs=epochs, batch_size=2 // world_size,
                 world_size=world_size, effective_batch_size=2,
                 policies=[5, 7], diagnostic_only=True, finetune=False,
                 sources={p.relative_to(ROOT).as_posix(): file_sha256(p) for p in sources})
@@ -37,7 +38,7 @@ def validate_diagnostic_resume(checkpoint, identity, policy):
     if (checkpoint.get('diagnostic_only') is not True
             or checkpoint.get('diagnostic_identity') != identity
             or checkpoint.get('policy') != policy
-            or not 0 <= checkpoint.get('epoch', -1) < 3):
+            or not 0 <= checkpoint.get('epoch', -1) < identity.get('epochs', 3)):
         raise ValueError('Diagnostic resume identity/policy/epoch mismatch')
     required = {'model', 'optimizer', 'discovery_ema', 'torch_rng', 'cuda_rng',
                 'numpy_rng', 'python_rng', 'loader_rng', 'args'}
@@ -66,6 +67,77 @@ def restore_rank_state(state, generator):
     np.random.set_state(state['numpy_rng'])
     random.setstate(state['python_rng'])
     generator.set_state(state['loader_rng'])
+
+
+@contextmanager
+def preserve_training_rng(generator):
+    """Measurements must not change the next training/augmentation random draws."""
+    state = capture_rank_state(generator)
+    try:
+        yield
+    finally:
+        restore_rank_state(state, generator)
+
+
+def diagnostic_evaluation_epochs(identity):
+    epochs = identity.get('epochs', 3)
+    milestones = identity.get('evaluation_epochs', [epochs])
+    if (type(epochs) is not int or epochs < 1 or not milestones
+            or any(type(epoch) is not int or not 1 <= epoch <= epochs for epoch in milestones)
+            or list(milestones) != sorted(set(milestones)) or milestones[-1] != epochs):
+        raise ValueError('Diagnostic evaluations must be ordered, unique and include the final epoch')
+    return tuple(milestones)
+
+
+def pending_diagnostic_evaluations(directory, identity, completed_epochs, *, with_probe=False):
+    pending = []
+    for epoch in diagnostic_evaluation_epochs(identity):
+        if epoch > completed_epochs:
+            continue
+        required = [f'metrics_epoch_{epoch}.json', f'evaluation_epoch_{epoch}_complete.json']
+        if with_probe:
+            required.append(f'epoch_{epoch}_learning_probe.json')
+        if all((directory / name).is_file() for name in required):
+            continue
+        if epoch != completed_epochs:
+            raise ValueError(f'Cannot reconstruct fixed epoch {epoch} evaluation from epoch '
+                             f'{completed_epochs} checkpoint; preserve the existing run')
+        pending.append(epoch)
+    return pending
+
+
+def evaluate_diagnostic_milestone(directory, identity, completed_epochs, generator,
+                                  evaluate_metrics, measure_probe=None, *, rank=0, world=1):
+    """Finish a checkpoint's scheduled measurements, including after an interrupted evaluation."""
+    import torch
+    decision = [None]
+    if rank == 0:
+        try:
+            decision[0] = dict(pending=pending_diagnostic_evaluations(
+                directory, identity, completed_epochs, with_probe=measure_probe is not None))
+        except ValueError as error:
+            decision[0] = dict(error=str(error))
+    if world > 1:
+        # Only rank zero decides: a rank must not skip collectives because it
+        # sees a just-written marker before the other rank does.
+        torch.distributed.broadcast_object_list(decision, src=0)
+    if 'error' in decision[0]:
+        raise ValueError(decision[0]['error'])
+    for epoch in decision[0]['pending']:
+        print(f'Fixed diagnostic evaluation after epoch {epoch}/{identity["epochs"]}', flush=True)
+        with preserve_training_rng(generator):
+            metrics = evaluate_metrics()
+            measurements = measure_probe() if measure_probe is not None else None
+        if rank == 0:
+            dump(directory / f'metrics_epoch_{epoch}.json', metrics)
+            if measurements is not None:
+                dump(directory / f'epoch_{epoch}_learning_probe.json', measurements)
+            # Commit last. A crash before this marker re-runs the measurement
+            # from the saved checkpoint, without advancing training first.
+            dump(directory / f'evaluation_epoch_{epoch}_complete.json',
+                 dict(diagnostic_only=True, completed_epochs=epoch))
+        if world > 1:
+            torch.distributed.barrier()
 
 
 def make_optimizer(model, args):
@@ -102,6 +174,7 @@ def run_policy(opt, identity, policy, *, variant=None, provenance=None):
 
     rank, world, gpu = opt.rank, opt.world_size, opt.gpu
     distributed = world > 1
+    diagnostic_evaluation_epochs(identity)
 
     def write(path, value):
         if rank == 0:
@@ -128,7 +201,7 @@ def run_policy(opt, identity, policy, *, variant=None, provenance=None):
     args.pretrained = str(opt.checkpoint)
     args.resume = ''
     args.output_dir = str(directory)
-    args.epochs = 3
+    args.epochs = identity['epochs']
     args.start_epoch = 0
     args.batch_size = 2 // world
     args.num_workers = 2
@@ -162,8 +235,8 @@ def run_policy(opt, identity, policy, *, variant=None, provenance=None):
         # Calibration uses deterministic transforms. Do not fork workers after
         # CUDA initialization in its class-by-class loaders on Linux.
         initialization_args.num_workers = 0
-    if args.discovery_warmup >= 3:
-        raise ValueError('Three epochs would contain no unknown-learning updates')
+    if args.discovery_warmup >= args.epochs:
+        raise ValueError('Diagnostic budget would contain no unknown-learning updates')
     if args.seed != 42 or args.lightweight or args.no_augmentation:
         raise ValueError('Diagnostic requires seed42 and ordinary full-resolution augmentation')
     del parent
@@ -179,8 +252,12 @@ def run_policy(opt, identity, policy, *, variant=None, provenance=None):
         validate_diagnostic_resume(restored, identity, policy)
         if variant is not None and restored.get('variant') != variant:
             raise ValueError('Routing diagnostic variant changed on resume')
-        if (restored['epoch'] == 2 and (directory / 'training_complete.json').is_file()
-                and (directory / 'final_metrics.json').is_file()):
+        if (restored['epoch'] == args.epochs - 1 and (directory / 'training_complete.json').is_file()
+                and (directory / 'final_metrics.json').is_file()
+                and (variant is None or all((directory / name).is_file() for name in
+                     ('final_learning_probe.json', 'parameter_audit.json')))
+                and not pending_diagnostic_evaluations(directory, identity, args.epochs,
+                                                       with_probe=variant is not None)):
             print(f'v{policy} already completed; preserving its results.', flush=True)
             return
         # Reconstruct the diagnostic model from its own complete saved bank.
@@ -247,10 +324,15 @@ def run_policy(opt, identity, policy, *, variant=None, provenance=None):
                         owod_current_class_ids=args.owod_current_class_ids,
                         owod_specification=args.owod_evaluation, print_freq=100)[0]
 
-    def learning_probe(phase):
+    def learning_probe():
         from tools.owod.task2_learning_probe import probe
-        write(directory / f'{phase}_learning_probe.json',
-              probe(model, criterion, args, opt.manifest, rank, world))
+        return probe(model, criterion, args, opt.manifest, rank, world)
+
+    def measure_completed_epoch(completed_epochs):
+        criterion.epoch = completed_epochs - 1
+        evaluate_diagnostic_milestone(directory, identity, completed_epochs, generator,
+                                      evaluate_now, learning_probe if variant is not None else None,
+                                      rank=rank, world=world)
 
     start = 0
     if restored:
@@ -277,7 +359,7 @@ def run_policy(opt, identity, policy, *, variant=None, provenance=None):
         criterion.epoch = 0
         write(directory / 'initial_metrics.json', evaluate_now())
         if variant is not None:
-            learning_probe('initial')
+            write(directory / 'initial_learning_probe.json', learning_probe())
         torch.manual_seed(args.seed)
         np.random.seed(args.seed)
         random.seed(args.seed)
@@ -288,7 +370,11 @@ def run_policy(opt, identity, policy, *, variant=None, provenance=None):
         np.random.seed(args.seed + rank)
         random.seed(args.seed + rank)
         torch.cuda.manual_seed_all(args.seed + rank)
-    for epoch in range(start, 3):
+    if resuming:
+        # The latest checkpoint is saved before evaluation. Finish a missing
+        # milestone before the next epoch can overwrite that checkpoint.
+        measure_completed_epoch(start)
+    for epoch in range(start, args.epochs):
         if distributed:
             train_sampler.set_epoch(epoch)
         criterion.epoch = epoch
@@ -318,14 +404,17 @@ def run_policy(opt, identity, policy, *, variant=None, provenance=None):
         del payload
         if distributed:
             torch.distributed.barrier()
-    criterion.epoch = 2
-    write(directory / 'final_metrics.json', evaluate_now())
+        measure_completed_epoch(epoch + 1)
+    write(directory / 'final_metrics.json', json.loads(
+        (directory / f'metrics_epoch_{args.epochs}.json').read_text()))
     if variant is not None:
         from tools.owod.task2_learning_probe import parameter_audit
-        learning_probe('final')
+        write(directory / 'final_learning_probe.json', json.loads(
+            (directory / f'epoch_{args.epochs}_learning_probe.json').read_text()))
         write(directory / 'parameter_audit.json', parameter_audit(
             model, frozen.state_dict(), args.owod_current_class_ids, args.owod_previous_class_ids))
-    write(directory / 'training_complete.json', dict(diagnostic_only=True, epoch=2, policy=policy))
+    write(directory / 'training_complete.json', dict(diagnostic_only=True,
+                                                    epoch=args.epochs - 1, policy=policy))
     if distributed:
         torch.distributed.barrier()
     for hook in hooks:

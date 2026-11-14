@@ -68,6 +68,7 @@ def test_routing_identity_binds_both_fresh_variants_reference_and_gpu_selection(
     identity = routing_identity(*files, {'proof': 'exact'}, {'checkpoint_sha256': 'old-v7'}, 2, '0,1')
     assert identity['variants'] == ['hard', 'soft'] and identity['policies'] == [7]
     assert identity['batch_size'] == 1 and identity['effective_batch_size'] == 2
+    assert identity['epochs'] == 8 and identity['evaluation_epochs'] == [3, 8]
     assert identity != routing_identity(*files, {'proof': 'exact'}, {'checkpoint_sha256': 'other'}, 2, '0,1')
     assert identity != routing_identity(*files, {'proof': 'exact'}, {'checkpoint_sha256': 'old-v7'}, 2, '1,2')
 
@@ -142,6 +143,11 @@ def test_short_comparison_reports_actual_ap_units_and_missing_metrics_are_not_ze
     assert result['soft_minus_hard']['owod_current_ap50'] == pytest.approx(.01)
     assert 'owod_previous_ap50' not in result['hard']
     assert result['diagnostic_only'] and not result['finetune']
+    assert result['epochs'] == result['evaluation_epoch'] == 8 and not result['interim']
+    interim = paired_report({}, {}, epoch=3)
+    assert interim['interim'] and interim['evaluation_epoch'] == 3
+    with pytest.raises(ValueError, match='predeclared'):
+        paired_report({}, {}, epoch=4)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason='Real detector CUDA check')
