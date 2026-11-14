@@ -12,7 +12,7 @@ from pathlib import Path
 from typing import Iterable, Mapping
 
 from tools.owod.benchmark_spec import (COCO_IDS, NAME_TO_ID, ALIASES,
-                                       official_split, specification)
+                                       official_split, specification, split_digest)
 
 PROTOCOLS = {'m-owodb': 'M-OWODB', 's-owodb': 'S-OWODB'}
 SOURCE_PLACEHOLDERS = ('<', '>', 'replace', 'placeholder', 'todo', '替换')
@@ -36,6 +36,16 @@ def annotation_image_ids(payload: Mapping) -> set[int]:
 def resolve_manifest_path(manifest_path: Path, value: str) -> Path:
     path = Path(value)
     return path.resolve() if path.is_absolute() else (manifest_path.parent / path).resolve()
+
+
+def resolve_image_root(manifest_path: Path, manifest: Mapping, override: Path | None = None) -> Path:
+    """Resolve the raw image root, optionally using a machine-local override."""
+    if override is not None:
+        return Path(override).resolve()
+    value = manifest.get('image_root')
+    if not value:
+        raise ValueError('Author manifest must record image_root or receive an image-root override')
+    return resolve_manifest_path(manifest_path, str(value))
 
 
 def file_sha256(path: Path) -> str:
@@ -113,7 +123,11 @@ def build_official_manifest(annotation_root: Path, protocol: str, source_referen
     reject_retired_local_split(annotation_root)
     records, prior_ids = [], set()
     order = [c for task in spec['task_class_ids'] for c in task]
-    full_split = official_split(protocol, spec['test_split'])
+    split_names = [spec['test_split']]
+    split_names.extend(f't{task}_train' for task in range(1, 5))
+    split_names.extend(f't{task}_ft' for task in range(2, 5))
+    splits = {name: official_split(protocol, name) for name in split_names}
+    full_split = splits[spec['test_split']]
     for index, current in enumerate(spec['task_class_ids']):
         active = [c for task in spec['task_class_ids'][:index + 1] for c in task]
         stage_dir = annotation_root / f'stage_{index}'
@@ -123,8 +137,8 @@ def build_official_manifest(annotation_root: Path, protocol: str, source_referen
             'known_val': _find_stage_file(stage_dir, ('instances_val2017.json',)),
             'full_val': _find_stage_file(stage_dir, ('instances_val2017_full.json',)),
         }
-        train_split = official_split(protocol, f't{index + 1}_train')
-        ft_split = train_split if index == 0 else official_split(protocol, f't{index + 1}_ft')
+        train_split = splits[f't{index + 1}_train']
+        ft_split = train_split if index == 0 else splits[f't{index + 1}_ft']
         payloads = {key: read_json(path) for key, path in files.items()}
         for key, allowed, names in [('increment_train', set(current), train_split),
                                     ('train', set(active), ft_split),
@@ -163,6 +177,10 @@ def build_official_manifest(annotation_root: Path, protocol: str, source_referen
         'annotation_root': str(annotation_root), 'category_order_source_ids': order,
         'evaluation': {**spec, 'image_source_ids': full_split,
                        'duplicate_test_entries': len(full_split) - len(set(full_split))},
+        # Keep the exact author ordering in the manifest itself so the
+        # generated protocol remains self-contained.
+        'splits': splits,
+        'split_hashes': {name: split_digest(values) for name, values in splits.items()},
         'stages': records,
         'integrity': {'category_count': 80, 'stage_count': 4,
                       'task_class_counts': list(map(len, spec['task_class_ids'])),
@@ -184,8 +202,11 @@ def stage_files(manifest_path: Path, stage: int,
     spec = specification(manifest['protocol'])
     if any(manifest.get('evaluation', {}).get(key) != value for key, value in spec.items()):
         raise ValueError('Manifest evaluation does not match the author protocol')
-    if manifest['evaluation'].get('image_source_ids') != official_split(manifest['protocol'], spec['test_split']):
-        raise ValueError('Manifest test sequence differs from the author release')
+    splits = manifest.get('splits')
+    if not isinstance(splits, dict) or spec['test_split'] not in splits:
+        raise ValueError('Manifest is missing embedded author splits')
+    if manifest['evaluation'].get('image_source_ids') != splits[spec['test_split']]:
+        raise ValueError('Manifest test sequence differs from its embedded split')
     stages = manifest.get('stages', [])
     order = [c for task in spec['task_class_ids'] for c in task]
     if len(stages) != 4 or manifest.get('category_order_source_ids') != order:
@@ -206,9 +227,9 @@ def stage_files(manifest_path: Path, stage: int,
             raise FileNotFoundError(path)
         if file_sha256(path) != record['sha256'].get(key):
             raise ValueError(f'Annotation changed after registration: {path}')
-        names = (official_split(manifest['protocol'], f't{stage + 1}_train') if key == 'increment_train'
-                 else official_split(manifest['protocol'], f't{stage + 1}_ft') if key == 'train' and stage
-                 else official_split(manifest['protocol'], 't1_train') if key == 'train'
+        names = (splits[f't{stage + 1}_train'] if key == 'increment_train'
+                 else splits[f't{stage + 1}_ft'] if key == 'train' and stage
+                 else splits['t1_train'] if key == 'train'
                  else manifest['evaluation']['image_source_ids'])
         allowed = (set(record['classes']) if key == 'increment_train' else set(COCO_IDS)
                    if key == 'full_val' else set(record['active_classes']))

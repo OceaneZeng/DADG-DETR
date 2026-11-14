@@ -1,9 +1,0 @@
-[submodule "baselines/prob"]
-	path = baselines/prob
-	url = https://github.com/orrzohar/PROB.git
-[submodule "baselines/owobj"]
-	path = baselines/owobj
-	url = https://github.com/AI4Math-ShanZhang/OWOBJ.git
-[submodule "baselines/ow-detr"]
-	path = baselines/ow-detr
-	url = https://github.com/akshitac8/OW-DETR.git

@@ -2,7 +2,8 @@
 from pathlib import Path
 import math
 
-from tools.owod.protocol import file_sha256, stage_files, RETIRED_MESSAGE
+from tools.owod.protocol import (file_sha256, resolve_image_root, stage_files,
+                                 RETIRED_MESSAGE)
 
 
 def configure_run(args):
@@ -85,10 +86,7 @@ def configure_run(args):
         if supplied is not None and set(supplied) != set(values):
             raise ValueError(f'{field} differs from the author-defined stage')
         setattr(args, field, values)
-    image_root = manifest.get('image_root')
-    if not image_root:
-        raise ValueError('Author manifest must record image_root; re-register with --image-root')
-    args.owod_image_root = str(Path(image_root).resolve())
+    args.owod_image_root = str(resolve_image_root(Path(args.owod_manifest), manifest))
     if not Path(args.owod_image_root).is_dir():
         raise FileNotFoundError(f'Benchmark images missing: {args.owod_image_root}')
     if args.lightweight or args.no_augmentation or args.replay_sampling_fraction:

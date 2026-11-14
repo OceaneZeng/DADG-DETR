@@ -13,8 +13,8 @@ ROOT = Path(__file__).resolve().parents[2]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from tools.owod.benchmark_spec import (ALIASES, NAME_TO_ID, SPEC_ROOT, categories,
-                                      official_split, specification)
+from tools.owod.benchmark_spec import (ALIASES, NAME_TO_ID, categories,
+                                      load_manifest, official_split, specification)
 from tools.owod.protocol import build_official_manifest, file_sha256
 
 
@@ -134,7 +134,8 @@ def prepare(protocol, data_root, output, check_images=True):
             ('instances_val2017_full.json', test, set(NAME_TO_ID.values())),
         ]:
             (stage_dir / filename).write_text(json.dumps(subset(selected, labels, cache)) + '\n', encoding='utf-8')
-    sources = json.loads((SPEC_ROOT / 'sources.json').read_text(encoding='utf-8'))[protocol]
+    # Provenance and split hashes are carried by the canonical manifest.
+    sources = load_manifest(protocol)['split_source']
     reference = sources['repository'] + '/tree/' + sources['commit']
     manifest = build_official_manifest(output, protocol, reference)
     manifest.update({'image_root': str(image_root.resolve()), 'source_hashes': source_hashes,

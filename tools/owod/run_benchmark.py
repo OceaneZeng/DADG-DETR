@@ -15,7 +15,7 @@ ROOT = Path(__file__).resolve().parents[2]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from tools.owod.protocol import file_sha256, read_json, stage_files
+from tools.owod.protocol import file_sha256, read_json, resolve_image_root, stage_files
 
 
 def build_plan(args):
@@ -56,7 +56,7 @@ def build_plan(args):
         raise ValueError('S-OWODB original recipe requires DINO backbone pretraining')
     if args.backbone_weights and not args.backbone_weights.is_file():
         raise FileNotFoundError(args.backbone_weights)
-    image_root = Path(manifest['image_root'])
+    image_root = resolve_image_root(args.manifest, manifest)
     method = getattr(args, 'method', 'control')
     control_lr_scale = getattr(args, 'control_lr_scale', 1.)
     if not math.isfinite(control_lr_scale) or not 0 < control_lr_scale <= 1:

@@ -7,7 +7,8 @@ See [the active author protocol](../../docs/owod-benchmarks.md).
 3. `prepare_protocol.py`: register already-serialized author annotations with an image root.
 4. `run_benchmark.py`: preflight and run four tasks with separate balanced finetuning.
 
-The released lists and their pinned hashes are under `configs/owod/`.
+The released lists and their pinned hashes are embedded in
+`data/owod/{m-owodb,s-owodb}/split_manifest.json`.
 Custom/pilot manifests and unverified overrides are rejected. Historical setting
 files and launchers have been deleted. Read-only historical reporting lives in
 `tools/analysis/`; model components remain in `models/`.

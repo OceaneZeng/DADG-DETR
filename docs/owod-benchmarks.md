@@ -33,11 +33,10 @@ M 第一任务包括 bottle、sofa 等，因此相同超类会出现在不同任
 一次引入。例如 truck、elephant、bear、zebra、giraffe 在 M 的 Task 2，
 在 S 的 Task 1。这是类别/超类协议差异，不等于要求图片在任务间互斥。
 
-`configs/owod/{m-owodb,s-owodb}/ImageSets/` 保存作者原始清单，来自
-OW-DETR 官方仓库 commit `3515ff8c36687a4f582ef6a2c83866966b56ce23`；
-其中 OWOD 目录提供 ORE 划分，OWDETR 目录提供作者新划分。
-`configs/owod/sources.json` 记录源路径、字节 SHA-256、行数和唯一图片数。
-清单由 Git 原始 blob 导入，`.gitattributes` 防止换行转换损坏哈希。
+`data/owod/{m-owodb,s-owodb}/split_manifest.json` 内嵌作者原始清单，来源为
+OW-DETR 官方仓库 commit `3515ff8c36687a4f582ef6a2c83866966b56ce23`；其中
+`split_source` 保留上游路径、字节 SHA-256、行数和唯一图片数，`splits` 保留原始
+顺序与重复项。`.gitattributes` 固定 manifest 的文本字节，避免换行转换损坏哈希。
 
 官方清单中存在跨任务共用图片，必须保留。M 测试清单也存在重复行，原始作者
 评测会受其影响。项目序列化 JSON 时保存唯一图片记录，但在作者评测中恢复
@@ -119,9 +118,9 @@ S 使用 COCO2017 的 `train2017/`、`val2017/` 及两个 `instances_*.json`。
 
 ```bash
 python tools/owod/manage_data.py plan
-python tools/owod/manage_data.py check --config configs/data/owod.example.json
-python tools/owod/manage_data.py prepare --config configs/data/owod.example.json
-python tools/owod/manage_data.py verify --config configs/data/owod.example.json --decode-images
+python tools/owod/manage_data.py check --benchmark both --ore-root data/raw/ore --coco-root data/raw/coco
+python tools/owod/manage_data.py prepare --benchmark both --ore-root data/raw/ore --coco-root data/raw/coco --output-root data/owod
+python tools/owod/manage_data.py verify --benchmark both --ore-root data/raw/ore --coco-root data/raw/coco --output-root data/owod --decode-images
 ```
 
 完整操作指南见 [data-preparation.md](data-preparation.md)。工具不会移动原始图像、生成随机划分或覆盖旧目录。它会完整检查缺失数据，

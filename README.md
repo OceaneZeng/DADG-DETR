@@ -15,9 +15,9 @@
 ```bash
 python tools/owod/manage_data.py plan
 python tools/owod/download_data.py --benchmark both
-python tools/owod/manage_data.py check --config configs/data/owod.example.json
-python tools/owod/manage_data.py prepare --config configs/data/owod.example.json
-python tools/owod/manage_data.py verify --config configs/data/owod.example.json
+python tools/owod/manage_data.py check --benchmark both --ore-root data/raw/ore --coco-root data/raw/coco
+python tools/owod/manage_data.py prepare --benchmark both --ore-root data/raw/ore --coco-root data/raw/coco --output-root data/owod
+python tools/owod/manage_data.py verify --benchmark both --ore-root data/raw/ore --coco-root data/raw/coco --output-root data/owod
 python tools/owod/run_benchmark.py --help
 ```
 
@@ -45,10 +45,10 @@ python tools/owod/run_discovery_study.py --benchmark both
 `output/discovery/full-study/`；数据/权重均断点续传，不加入 Git。
 
 旧 setting 的启动器、配置及说明文件已删除，清理记录见
-[project-cleanup.json](docs/project-cleanup.json)。已有日志、checkpoint 和外部源码保留。
+[project-cleanup.json](docs/project-cleanup.json)。已有日志和 checkpoint 保留。
 已有绘图代码位于 `tools/analysis/`，仅分析历史结果。
 
-Git 只保存源码、运行配置、作者 ImageSets、必要说明和许可证。
+Git 只保存源码、运行配置、两份协议 manifest、必要说明和许可证。
 PDF、图片、论文文稿、压缩包、权重、日志与临时输出均忽略；不要使用
 `git add -f` 将这些生成产物加入仓库。
 

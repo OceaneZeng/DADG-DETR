@@ -18,7 +18,7 @@ if str(ROOT) not in sys.path:
 
 from tools.owod.benchmark_spec import COCO_IDS, COCO_NAMES, official_split, specification
 from tools.owod.prepare_benchmarks import prepare
-from tools.owod.protocol import file_sha256, read_json, stage_files
+from tools.owod.protocol import file_sha256, read_json, resolve_image_root, stage_files
 
 PROTOCOLS = ('m-owodb', 's-owodb')
 
@@ -104,17 +104,17 @@ def verify_dataset(directory, protocol, source=None, decode_images=False):
     directory = Path(directory).resolve()
     manifest_path = directory / 'split_manifest.json'
     image_paths, tasks = set(), []
+    manifest = None
     for stage in range(4):
         manifest, files = stage_files(manifest_path, stage)
         if manifest['protocol'] != protocol:
             raise ValueError(f'Expected {protocol}, received {manifest["protocol"]}')
-        image_root = Path(manifest['image_root']).resolve()
+        expected = None
         if source is not None:
             expected = Path(source).resolve()
             if protocol == 'm-owodb':
                 expected /= 'JPEGImages'
-            if image_root != expected:
-                raise ValueError('Existing dataset uses another raw source root; use a new output root')
+        image_root = resolve_image_root(manifest_path, manifest, expected)
         for key in ('increment_train', 'train', 'full_val'):
             payload = read_json(files[key])
             image_paths.update(image_root / image['file_name'] for image in payload['images'])
@@ -137,7 +137,16 @@ def verify_dataset(directory, protocol, source=None, decode_images=False):
                 digest.update((image_root.parent / 'Annotations' / (stem + '.xml')).read_bytes())
             actual = digest.hexdigest()
         else:
-            actual = file_sha256(Path(name))
+            source_path = Path(name)
+            if not source_path.is_absolute():
+                source_path = (manifest_path.parent / source_path).resolve()
+            # Prepared manifests may have been created on another machine.
+            # When a raw source override is supplied, resolve the two COCO
+            # annotation names against that local root instead of trusting an
+            # absolute path embedded in the provenance record.
+            if source is not None and protocol == 's-owodb':
+                source_path = Path(source).resolve() / 'annotations' / source_path.name
+            actual = file_sha256(source_path)
         if actual != expected_hash:
             raise ValueError(f'Raw source annotation changed: {name}')
     return {'protocol': protocol, 'ready': True, 'manifest': str(manifest_path),

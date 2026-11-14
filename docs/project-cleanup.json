@@ -57,7 +57,6 @@
     "tools/owod/plot_replay_comparison.py": "tools/analysis/plot_replay_comparison.py"
   },
   "preserved": [
-    "baselines",
     "exps",
     "output",
     "tmp",
@@ -90,5 +89,9 @@
       "weights",
       "logs"
     ]
-  }
+  },
+  "removed_directories": [
+    "baselines",
+    "configs"
+  ]
 }
