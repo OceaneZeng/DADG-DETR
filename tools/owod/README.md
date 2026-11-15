@@ -15,6 +15,12 @@ files and launchers have been deleted. Read-only historical reporting lives in
 
 See [the data guide](../../docs/data-preparation.md) for raw sources and commands.
 
+`run_mowodb_background_pair.sh` runs a fresh paired full-data Task 1 diagnostic
+on physical RTX 3090 GPUs 0/1: focal v8 reference, then v9 trusted-background
+novelty negatives, eight epochs each. It binds initialization/source/plan,
+rejects occupied GPUs, resumes unchanged runs and writes `comparison.json`.
+See [settings, launch and evidence limits](../../docs/mowodb-background-experiment.md).
+
 `download_data.py --benchmark both` resumes official COCO/ORE sources and DINO
 backbone weights. It records sources/hashes and safely extracts ZIPs; ORE Drive
 access requires gdown. An empty/unavailable author folder is a failure, not permission

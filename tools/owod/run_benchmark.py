@@ -89,6 +89,12 @@ def build_plan(args):
     pseudo_normalization = getattr(args, 'discovery_pseudo_normalization', 'weight-sum')
     known_rank_coef = getattr(args, 'discovery_known_rank_coef', 0.)
     feature_grad_scale = getattr(args, 'discovery_feature_grad_scale', 1.)
+    background_negative = getattr(args, 'discovery_background_negative', False)
+    initialization_audit = getattr(args, 'initialization_audit', '')
+    if background_negative and not method.startswith('discovery'):
+        raise ValueError('Discovery background negatives require discovery')
+    if initialization_audit and not (task1_only and pause_after and method.startswith('discovery')):
+        raise ValueError('Initialization audit requires bounded discovery --task1-only')
     if (not math.isfinite(known_rank_coef) or known_rank_coef < 0
             or not math.isfinite(feature_grad_scale) or not 0 <= feature_grad_scale <= 1):
         raise ValueError('Invalid discovery stability configuration: rank coefficient >= 0, gradient scale in [0, 1]')
@@ -209,6 +215,10 @@ def build_plan(args):
                     command += ['--discovery-known-rank-coef', str(known_rank_coef)]
                 if feature_grad_scale != 1.:
                     command += ['--discovery-feature-grad-scale', str(feature_grad_scale)]
+                if background_negative:
+                    command += ['--discovery-background-negative']
+                if initialization_audit:
+                    command += ['--initialization-audit', str(initialization_audit)]
                 if method == 'discovery-scratch':
                     command += ['--discovery-no-transfer']
                 if method == 'discovery-no-message':
@@ -252,7 +262,7 @@ def build_plan(args):
     return result
 
 
-def main(argv=None):
+def get_args_parser():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--manifest', required=True, type=Path)
     parser.add_argument('--task1-only', action='store_true',
@@ -299,10 +309,17 @@ def main(argv=None):
     parser.add_argument('--discovery-pseudo-normalization', choices=('weight-sum', 'count'), default='weight-sum')
     parser.add_argument('--discovery-known-rank-coef', type=float, default=0.)
     parser.add_argument('--discovery-feature-grad-scale', type=float, default=1.)
+    parser.add_argument('--discovery-background-negative', action='store_true')
+    parser.add_argument('--initialization-audit', default='')
     parser.add_argument('--graph-sketch-max-images', type=int, default=12)
     parser.add_argument('--profile-runtime-steps', type=int, default=0,
                         help='Record a bounded trace in each first executed epoch without changing the plan')
     parser.add_argument('--profile-runtime-warmup', type=int, default=20)
+    return parser
+
+
+def main(argv=None):
+    parser = get_args_parser()
     args = parser.parse_args(argv)
     if args.nproc_per_node < 1 or args.batch_size < 1 or (args.finetune_epochs is not None and args.finetune_epochs < 1):
         raise ValueError('Process count, batch size and finetuning epochs must be positive')

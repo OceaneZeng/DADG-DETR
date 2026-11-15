@@ -20,6 +20,7 @@ DISCOVERY_VERSION = 5
 DISCOVERY_RAMP_VERSION = 6
 DISCOVERY_LOSS_VERSION = 7
 DISCOVERY_STABILITY_VERSION = 8
+DISCOVERY_BACKGROUND_VERSION = 9
 
 
 def scale_gradient(value, scale):
@@ -277,6 +278,7 @@ class DiscoveryCriterion(nn.Module):
         self.known_rank_coef = getattr(args, 'discovery_known_rank_coef', 0.)
         self.feature_grad_scale = getattr(args, 'discovery_feature_grad_scale', 1.)
         self.scoring = getattr(args, 'discovery_scoring', 'hierarchical')
+        self.background_negative = getattr(args, 'discovery_background_negative', False)
         if not math.isfinite(self.known_rank_coef) or self.known_rank_coef < 0:
             raise ValueError('discovery_known_rank_coef must be finite and nonnegative')
         if not math.isfinite(self.feature_grad_scale) or not 0 <= self.feature_grad_scale <= 1:
@@ -317,6 +319,12 @@ class DiscoveryCriterion(nn.Module):
             semantic[batch, queries] = targets[batch]['labels'][matches]
         foreground, foreground_weights, proposal_weights = proposal_supervision(
             positive, pseudo, confidence)
+        # Only two-view low-saliency matches are trusted negatives. In warmup,
+        # evaluation, or without an EMA view, the legacy foreground loss applies.
+        trusted_background = background & ~foreground
+        if not self.background_negative or teacher is None:
+            trusted_background = torch.zeros_like(background)
+        novelty_weights = foreground_weights + trusted_background.to(confidence.dtype)
         pseudo_scale = (pseudo_supervision_scale(self.epoch, self.warmup, self.pseudo_ramp_epochs)
                         if self.training else 1.)
         contribution_scale = (torch.where(pseudo, confidence.new_tensor(pseudo_scale), 1.)
@@ -326,7 +334,7 @@ class DiscoveryCriterion(nn.Module):
         # classes. An unmatched query is a negative for those classes, not a
         # claim that its region contains no (possibly unknown) object. Masking
         # this loss with discovery trust removes duplicate/background suppression.
-        # Novelty uses selected foreground only; objectness and routing learn
+        # Novelty optionally includes trusted background; objectness and routing learn
         # one-to-one proposal selection, including unselected-query negatives.
         prepared = dict(outputs)
         prepared.pop('query_label_weights', None)
@@ -344,7 +352,7 @@ class DiscoveryCriterion(nn.Module):
             losses['loss_objectness'] = balanced_bce(outputs['pred_objectness'], foreground.float(),
                                                     proposal_weights, contribution_scale)
         losses['loss_unknown'] = balanced_bce(outputs['pred_novelty'], pseudo.float(),
-                                             foreground_weights, contribution_scale,
+                                             novelty_weights, contribution_scale,
                                              normalization=self.pseudo_normalization)
         if self.stability:
             matched_logits = outputs['pred_logits'][positive]
@@ -408,10 +416,11 @@ class DiscoveryCriterion(nn.Module):
         losses['discovery_pseudo_scale'] = confidence.new_tensor(pseudo_scale)
         # v5 ignores unselected slots for conditional novelty only. Classification,
         # objectness and routing all receive dense proposal supervision.
-        losses['discovery_ignored_fraction'] = (~foreground).float().mean()
+        losses['discovery_ignored_fraction'] = (novelty_weights == 0).float().mean()
         losses['discovery_known_supervised_fraction'] = confidence.new_ones(())
         losses['discovery_objectness_supervised_fraction'] = (proposal_weights > 0).float().mean()
-        losses['discovery_novelty_supervised_fraction'] = (foreground_weights > 0).float().mean()
+        losses['discovery_novelty_supervised_fraction'] = (novelty_weights > 0).float().mean()
+        losses['discovery_novelty_background_fraction'] = trusted_background.float().mean()
         losses['discovery_proposal_negative_fraction'] = (~foreground).float().mean()
         losses['discovery_background_fraction'] = background.float().mean()
         losses['discovery_positive_fraction'] = positive.float().mean()

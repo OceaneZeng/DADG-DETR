@@ -165,6 +165,10 @@ def get_args_parser():
                         help='Experimental v8 matched-GT known/unknown score ranking loss coefficient')
     parser.add_argument('--discovery-feature-grad-scale', type=float, default=1.,
                         help='Experimental v8 discovery-graph input and pseudo box-consistency gradient scale')
+    parser.add_argument('--discovery-background-negative', action='store_true',
+                        help='Experimental v9: two-view trusted background also supervises novelty=0')
+    parser.add_argument('--initialization-audit', default='',
+                        help='Shared initialization proof for paired bounded Task 1 diagnostics')
     parser.add_argument('--discovery-top-k', type=int, default=5)
     parser.add_argument('--discovery-saliency-threshold', type=float, default=.65)
     parser.add_argument('--discovery-consistency-threshold', type=float, default=.5)
@@ -333,7 +337,8 @@ def main(args):
                                        if args.discovery_scoring == 'hierarchical' else
                                        'objectness * sigmoid(known_logits)'),
                        'known_supervision': 'dense released-class focal loss; one-to-one matching',
-                       'discovery_supervision': 'dense selected-proposal objectness/router; foreground-only novelty',
+                       'discovery_supervision': ('dense selected-proposal objectness/router; foreground novelty'
+                           + (' plus two-view trusted background negatives' if args.discovery_background_negative else '')),
                        'discovery_version': args.discovery_version,
                        'pseudo_ramp_epochs': args.discovery_pseudo_ramp_epochs,
                        'objectness_loss': args.discovery_objectness_loss,
@@ -342,6 +347,7 @@ def main(args):
                        'pseudo_normalization': args.discovery_pseudo_normalization,
                        'known_rank_coef': args.discovery_known_rank_coef,
                        'feature_grad_scale': args.discovery_feature_grad_scale,
+                       'background_negative': args.discovery_background_negative,
                        'implementation': 'project_research_method', 'paper_baseline': False}
         elif getattr(args, 'control_postprocess_version', None):
             profile = {'method': 'supervised-control', 'unknown_score': 'none; no unknown predictions',
@@ -657,6 +663,10 @@ def main(args):
         model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[args.gpu])
         model_without_ddp = model.module
 
+    if args.initialization_audit:
+        from tools.owod.paired_initialization import audit_initialization
+        audit_initialization(model_without_ddp, args)
+
     if args.dataset_file == "coco_panoptic":
         # We also evaluate AP during panoptic training, on original coco DS
         coco_val = datasets.coco.build("val", args)
@@ -664,6 +674,7 @@ def main(args):
     else:
         base_ds = get_coco_api_from_dataset(dataset_val)
 
+    resumed_test_stats = None
     if args.resume:
         if args.resume.startswith('https'):
             checkpoint = torch.hub.load_state_dict_from_url(
@@ -731,6 +742,7 @@ def main(args):
                 owod_specification=getattr(args, "owod_evaluation", None),
                 print_freq=args.eval_print_freq,
             )
+            resumed_test_stats = test_stats
     
     if args.eval:
         test_stats, coco_evaluator = evaluate(model, criterion, postprocessors,
@@ -751,6 +763,9 @@ def main(args):
     if args.output_dir and utils.is_main_process():
         structured_log = experiment_log_path(output_dir, "metrics.jsonl")
         prepare_log_file(structured_log, append=bool(args.resume))
+        if args.initialization_audit and resumed_test_stats is not None:
+            from tools.owod.paired_initialization import recover_final_evaluation
+            recover_final_evaluation(structured_log, args, resumed_test_stats, n_parameters)
         completion_marker = output_dir / 'training_complete.json'
         if completion_marker.is_file():
             archive_log_file(completion_marker)

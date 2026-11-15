@@ -37,6 +37,8 @@ def validate_plan_arguments(run, saved):
                    'discovery_pseudo_normalization': 'weight-sum',
                    'discovery_known_rank_coef': 0.,
                    'discovery_feature_grad_scale': 1.,
+                   'discovery_background_negative': False,
+                   'initialization_audit': '',
                    'graph_risk_mode': 'learned', 'graph_adapter_compute': 'loop'}.get(field)
         if getattr(saved, field, default) != value:
             raise ValueError(f'Saved checkpoint differs from launch arguments: {field}')
@@ -84,7 +86,8 @@ def compare_runs(control, treatment):
     # Permit only method arguments, source/output paths to differ.
     def common(command):
         ignored = {'--output_dir', '--pretrained', '--resume', '--graph-gnn-checkpoint'}
-        boolean = {'--graph-routed-adapter', '--owod-discovery', '--discovery-no-transfer', '--discovery-no-message'}
+        boolean = {'--graph-routed-adapter', '--owod-discovery', '--discovery-no-transfer',
+                   '--discovery-no-message', '--discovery-background-negative'}
         result, i = [], 0
         while i < len(command):
             item = command[i]

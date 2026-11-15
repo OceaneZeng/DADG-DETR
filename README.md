@@ -54,6 +54,10 @@ PDF、图片、论文文稿、压缩包、权重、日志与临时输出均忽�
 
 ## 双 RTX 3090 服务器实验
 
+当前 `mowodb` 分支新增[可信背景 novelty 负监督配对实验](docs/mowodb-background-experiment.md)：
+`bash tools/owod/run_mowodb_background_pair.sh` 固定使用物理 GPU 0/1，顺序运行
+focal v8 参照与 v9 实验各八轮，自动恢复并汇总固定末轮。先等待当前作业结束再切换服务器分支。
+
 详见 [GPU 0/1 环境、数据迁移、自检与完整消融](docs/server-3090.md)。
 `python tools/owod/run_server_experiment.py` 核验计划；加 `--execute` 后依次运行
 硬路由、软路由及受限定位更新对照。

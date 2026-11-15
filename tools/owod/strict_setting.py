@@ -25,6 +25,9 @@ def configure_run(args):
     pseudo_normalization = getattr(args, 'discovery_pseudo_normalization', 'weight-sum')
     known_rank_coef = getattr(args, 'discovery_known_rank_coef', 0.)
     feature_grad_scale = getattr(args, 'discovery_feature_grad_scale', 1.)
+    background_negative = getattr(args, 'discovery_background_negative', False)
+    if background_negative and not getattr(args, 'owod_discovery', False):
+        raise ValueError('Discovery background negatives require discovery')
     if (not math.isfinite(known_rank_coef) or known_rank_coef < 0
             or not math.isfinite(feature_grad_scale) or not 0 <= feature_grad_scale <= 1):
         raise ValueError('Invalid discovery stability configuration: rank coefficient >= 0, gradient scale in [0, 1]')
@@ -45,16 +48,24 @@ def configure_run(args):
         raise ValueError('screen-no-distill requires shared-parent discovery screening Task 2')
     if getattr(args, 'owod_discovery', False):
         from models.graph_local.discovery import (DISCOVERY_VERSION, DISCOVERY_RAMP_VERSION,
-                                                  DISCOVERY_LOSS_VERSION, DISCOVERY_STABILITY_VERSION)
+                                                  DISCOVERY_LOSS_VERSION, DISCOVERY_STABILITY_VERSION,
+                                                  DISCOVERY_BACKGROUND_VERSION)
         args.discovery_pseudo_ramp_epochs = ramp_epochs
         args.discovery_objectness_loss = objectness_loss
         args.discovery_pseudo_normalization = pseudo_normalization
         args.discovery_known_rank_coef = known_rank_coef
         args.discovery_feature_grad_scale = feature_grad_scale
-        args.discovery_version = (DISCOVERY_STABILITY_VERSION if stability_experiment else
+        args.discovery_background_negative = background_negative
+        args.discovery_version = (DISCOVERY_BACKGROUND_VERSION if background_negative else
+                                  DISCOVERY_STABILITY_VERSION if stability_experiment else
                                   DISCOVERY_LOSS_VERSION if loss_experiment else
                                   DISCOVERY_RAMP_VERSION if ramp_epochs else DISCOVERY_VERSION)
         args.graph_routed_adapter = True
+    if getattr(args, 'initialization_audit', '') and not (
+            getattr(args, 'owod_discovery', False) and args.owod_stage == 0
+            and args.owod_phase == 'increment'
+            and not args.pretrained and not getattr(args, 'owod_screening', '')):
+        raise ValueError('Initialization audit requires a fresh full-data discovery Task 1')
     requested = bool(args.owod_manifest or args.owod_known_class_ids is not None or args.paper_baseline
                      or getattr(args, 'graph_routed_adapter', False))
     if not requested:
@@ -162,6 +173,8 @@ def validate_checkpoint(args, checkpoint, resume=False):
     if not getattr(args, 'owod_manifest', ''):
         return
     saved = checkpoint.get('args')
+    if bool(getattr(saved, 'initialization_audit', '')) != bool(getattr(args, 'initialization_audit', '')):
+        raise ValueError('Cannot mix paired Task 1 diagnostic checkpoints and formal chains')
     shared_parent = bool(getattr(args, 'screen_branch_checkpoint_sha256', None))
     branching = (shared_parent and not resume and args.owod_stage == 1
                  and args.owod_phase == 'increment' and getattr(saved, 'owod_stage', None) == 0
@@ -198,7 +211,8 @@ def validate_checkpoint(args, checkpoint, resume=False):
         for field, default in (('discovery_objectness_loss', 'balanced-bce'),
                                ('discovery_pseudo_normalization', 'weight-sum'),
                                ('discovery_known_rank_coef', 0.),
-                               ('discovery_feature_grad_scale', 1.)):
+                               ('discovery_feature_grad_scale', 1.),
+                               ('discovery_background_negative', False)):
             if getattr(saved, field, default) != getattr(args, field, default):
                 raise ValueError(f'Discovery checkpoint cannot change {field}')
         if (getattr(args, 'discovery_objectness_loss', 'balanced-bce') == 'focal'
@@ -256,6 +270,11 @@ def validate_checkpoint(args, checkpoint, resume=False):
     if getattr(saved, 'backbone_weights_sha256', None) != getattr(args, 'backbone_weights_sha256', None):
         raise ValueError('Backbone pretraining changed within the checkpoint chain')
     if resume:
+        if getattr(args, 'initialization_audit', ''):
+            from tools.owod.protocol import read_json
+            proof = read_json(Path(args.initialization_audit))
+            if getattr(saved, 'initialization_sha256', None) != proof['model_sha256']:
+                raise ValueError('Checkpoint differs from paired initialization proof')
         for field in ('epochs', 'lr', 'lr_backbone', 'lr_drop', 'batch_size', 'weight_decay',
                       'seed', 'sgd', 'backbone', 'num_classes', 'num_queries', 'world_size'):
             if getattr(saved, field, None) != getattr(args, field, None):
