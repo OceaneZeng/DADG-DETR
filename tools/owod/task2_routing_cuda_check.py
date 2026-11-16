@@ -1,4 +1,5 @@
 """Two-rank, two-step synthetic hard/soft check; no data, saved weights or AP."""
+import argparse
 import os
 from pathlib import Path
 import sys
@@ -8,6 +9,9 @@ sys.path[:0] = [str(ROOT), str(ROOT / 'models/ops')]
 
 
 def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--localization-comparison', action='store_true')
+    opt = parser.parse_args()
     import gc
     import torch
     import torch.distributed as dist
@@ -23,7 +27,9 @@ def main():
     torch.cuda.set_device(rank)
     dist.init_process_group('nccl', timeout=timedelta(minutes=3))
     try:
-        for routing in ('hard', 'soft'):
+        variants = (('soft', 'frozen'), ('soft', 'bbox-last')) if opt.localization_comparison else (
+            ('hard', 'frozen'), ('soft', 'frozen'))
+        for routing, localization in variants:
             torch.manual_seed(42)
             args = get_args_parser().parse_args([])
             args.skip_backbone_initialization = True
@@ -40,7 +46,10 @@ def main():
                                     risk_beta=2., risk=[[.2]], routing=routing))
             model.known_ids = criterion.known_ids = criterion.base.active_class_ids = [1, 3]
             criterion.old_ids = [1]
-            hooks = configure_trainable(model, [3], [1, 3])
+            hooks = configure_trainable(model, [3], [1, 3], localization=localization)
+            coordinates = list(model.detr.bbox_embed[0].layers[-1].parameters())
+            coordinate_before = [p.detach().clone() for p in coordinates]
+            old_rows = model.detr.class_embed[0].weight[1].detach().clone()
             model.train_discovery()
             criterion.weight_dict['loss_adapter_route'] = 1.
             criterion.train()
@@ -66,6 +75,9 @@ def main():
                 optimizer.step()
                 model.observe_training(criterion.evidence)
                 update_ema(teacher, model)
+            changed = any(not torch.equal(p, old) for p, old in zip(coordinates, coordinate_before))
+            assert changed == (localization == 'bbox-last'), 'Unexpected coordinate update policy'
+            assert torch.equal(old_rows, model.detr.class_embed[0].weight[1])
             states = [None] * 2
             generator = torch.Generator().manual_seed(42 + rank)
             dist.all_gather_object(states, capture_rank_state(generator))
@@ -77,7 +89,8 @@ def main():
             assert torch.equal(counts[0], counts[1])
             for hook in hooks:
                 hook.remove()
-            print(f'Rank {rank}: v7 {routing}, CUDA backward/NCCL/EMA/memory/rank RNG passed', flush=True)
+            print(f'Rank {rank}: v7 {routing}/{localization}, '
+                  'CUDA backward/coordinate policy/old rows/NCCL/EMA/memory/rank RNG passed', flush=True)
             del network, model, criterion, teacher, old_teacher, optimizer, outputs, losses, total
             gc.collect()
             torch.cuda.empty_cache()

@@ -1,13 +1,24 @@
 #!/usr/bin/env bash
 # Same-weight measurements, then fresh paired v7 hard/soft Task 2 runs.
 set -euo pipefail
-if (( $# )) && [[ $# != 1 || $1 != --check ]]; then
-  echo 'Accepted option: --check (CPU provenance and data only).' >&2
-  exit 2
+comparison=routing
+check_only=false
+for option in "$@"; do
+  case "$option" in
+    --check) check_only=true ;;
+    --localization) comparison=localization ;;
+    *) echo 'Accepted options: --check, --localization.' >&2; exit 2 ;;
+  esac
+done
+driver=tools/owod/run_sowodb_task2_routing.py
+cuda_check=()
+if [[ $comparison == localization ]]; then
+  driver=tools/owod/run_sowodb_task2_localization.py
+  cuda_check=(--localization-comparison)
 fi
 cd "$(dirname "${BASH_SOURCE[0]}")/../.."
 python_bin="${TREE_DETR_PYTHON:-/home/top/disks/new-hdd/conda_envs/tree-detr/bin/python}"
-output="${SOWODB_TASK2_OUTPUT:-output/sowodb-task2-v7-routing-8epochs-2gpu}"
+output="${SOWODB_TASK2_OUTPUT:-output/sowodb-task2-v7-${comparison}-8epochs-2gpu}"
 export CUDA_DEVICE_ORDER=PCI_BUS_ID
 export CUDA_VISIBLE_DEVICES="${SOWODB_GPUS:-0,1}"
 export LOCAL_SIZE=2
@@ -38,11 +49,11 @@ git rev-parse HEAD
 git branch --show-current
 git status --short
 "$python_bin" tools/owod/manage_data.py verify --benchmark s-owodb --output-root data/owod
-"$python_bin" tools/owod/run_sowodb_task2_routing.py --preflight --output "$output/results"
-if [[ ${1:-} == --check ]]; then
+"$python_bin" "$driver" --preflight --output "$output/results"
+if $check_only; then
   exit 0
 fi
-[[ -n ${TMUX:-} ]] || { echo 'Run in tmux: tmux new -s s-task2-8e "bash tools/owod/run_sowodb_task2_routing.sh"' >&2; exit 1; }
+[[ -n ${TMUX:-} ]] || { echo 'Run this launcher inside tmux.' >&2; exit 1; }
 nvidia-smi --query-gpu=index,uuid,pci.bus_id,name,memory.free --format=csv
 "$python_bin" - <<'PY'
 import torch
@@ -65,10 +76,10 @@ if ! "$python_bin" -c 'import torch; import MultiScaleDeformableAttention as ext
 fi
 # Fail on a broken NCCL/extension/backward path before any long data run.
 "$python_bin" -m torch.distributed.run --standalone --nproc_per_node=2 \
-  tools/owod/task2_routing_cuda_check.py
+  tools/owod/task2_routing_cuda_check.py "${cuda_check[@]}"
 resume=()
 if [[ -f "$output/results/diagnostic_plan.json" ]]; then
   resume=(--resume)
 fi
 "$python_bin" -m torch.distributed.run --standalone --nproc_per_node=2 \
-  tools/owod/run_sowodb_task2_routing.py --output "$output/results" "${resume[@]}"
+  "$driver" --output "$output/results" "${resume[@]}"

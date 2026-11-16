@@ -158,7 +158,17 @@ def make_optimizer(model, args):
     ], lr=args.lr, weight_decay=args.weight_decay)
 
 
-def run_policy(opt, identity, policy, *, variant=None, provenance=None):
+def validate_pair_resume(checkpoint, variant, localization, run_name=None):
+    saved = checkpoint['args']
+    if (checkpoint.get('variant') != variant
+            or getattr(saved, 'graph_routing', None) != variant
+            or getattr(saved, 'graph_localization', None) != localization
+            or (run_name is not None and checkpoint.get('run_name') != run_name)):
+        raise ValueError('Paired diagnostic routing/localization/run changed on resume')
+
+
+def run_policy(opt, identity, policy, *, variant=None, provenance=None,
+               localization='frozen', run_name=None, initialization_reference='hard'):
     import numpy as np
     import torch
     from torch.utils.data import DataLoader, RandomSampler, SequentialSampler, DistributedSampler
@@ -182,7 +192,12 @@ def run_policy(opt, identity, policy, *, variant=None, provenance=None):
 
     if variant is not None and (variant not in ('hard', 'soft') or policy != 7 or provenance is None):
         raise ValueError('Routing comparison requires an explicit verified v7 diagnostic fork')
-    directory = opt.output / (variant or f'v{policy}')
+    if localization not in ('frozen', 'bbox-last'):
+        raise ValueError('Unknown paired localization policy')
+    for name in (run_name, initialization_reference):
+        if name is not None and (not name or Path(name).name != name or name in ('.', '..')):
+            raise ValueError('Paired run names must be single directory names')
+    directory = opt.output / (run_name or variant or f'v{policy}')
     directory.mkdir(exist_ok=True)
     parent = torch.load(opt.checkpoint, map_location='cpu', weights_only=False)
     source = parent['args']
@@ -231,7 +246,7 @@ def run_policy(opt, identity, policy, *, variant=None, provenance=None):
         # Only after strict validation: Task 1 has no class bank, so both new
         # banks can be initialized identically with different routing rules.
         args.graph_routing = initialization_args.graph_routing = variant
-        args.graph_localization = initialization_args.graph_localization = 'frozen'
+        args.graph_localization = initialization_args.graph_localization = localization
         # Calibration uses deterministic transforms. Do not fork workers after
         # CUDA initialization in its class-by-class loaders on Linux.
         initialization_args.num_workers = 0
@@ -250,8 +265,8 @@ def run_policy(opt, identity, policy, *, variant=None, provenance=None):
     resuming = restored is not None
     if restored:
         validate_diagnostic_resume(restored, identity, policy)
-        if variant is not None and restored.get('variant') != variant:
-            raise ValueError('Routing diagnostic variant changed on resume')
+        if variant is not None:
+            validate_pair_resume(restored, variant, localization, run_name)
         if (restored['epoch'] == args.epochs - 1 and (directory / 'training_complete.json').is_file()
                 and (directory / 'final_metrics.json').is_file()
                 and (variant is None or all((directory / name).is_file() for name in
@@ -350,11 +365,12 @@ def run_policy(opt, identity, policy, *, variant=None, provenance=None):
                 torch.distributed.all_gather_object(digests, digest)
                 if len(set(digests)) != 1:
                     raise ValueError('Task 2 initialization differs across ranks')
-            if variant == 'soft':
-                initial = json.loads((opt.output / 'hard' / 'initialization.json').read_text())
+            if variant == 'soft' and initialization_reference is not None:
+                initial = json.loads((opt.output / initialization_reference / 'initialization.json').read_text())
                 if initial['state_sha256'] != digest:
-                    raise ValueError('hard/soft must start with identical weights and memory')
+                    raise ValueError('Paired runs must start with identical weights and memory')
             write(directory / 'initialization.json', dict(state_sha256=digest, routing=variant,
+                  localization=localization, run_name=directory.name,
                   diagnostic_only=True, parent_checkpoint_sha256=identity['checkpoint_sha256']))
         criterion.epoch = 0
         write(directory / 'initial_metrics.json', evaluate_now())
@@ -392,6 +408,8 @@ def run_policy(opt, identity, policy, *, variant=None, provenance=None):
                        discovery_ema=teacher.state_dict(), **capture_rank_state(generator))
         if variant is not None:
             payload['variant'] = variant
+            if run_name is not None:
+                payload['run_name'] = run_name
         if distributed:
             states = [None] * world
             torch.distributed.all_gather_object(states, capture_rank_state(generator))

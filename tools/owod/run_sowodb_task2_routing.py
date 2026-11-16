@@ -43,8 +43,35 @@ def paired_report(hard, soft, *, epoch=EPOCHS):
                      'not formal Task 2 or evidence of successful Task 1 unknown-to-new transfer.')
 
 
-def main():
-    parser = argparse.ArgumentParser(description=__doc__)
+def paired_variants(comparison):
+    if comparison == 'routing':
+        return (('hard', 'hard', 'frozen'), ('soft', 'soft', 'frozen'))
+    if comparison == 'localization':
+        return (('frozen', 'soft', 'frozen'), ('bbox-last', 'soft', 'bbox-last'))
+    raise ValueError('Unknown paired comparison')
+
+
+def localization_identity(*args):
+    identity = routing_identity(*args)
+    identity.update(suite='sowodb-task2-v7-localization-v1',
+                    variants=['frozen', 'bbox-last'], routing='soft',
+                    localization=['frozen', 'bbox-last'])
+    return identity
+
+
+def localization_report(frozen, bbox_last, *, epoch=EPOCHS):
+    report = paired_report(frozen, bbox_last, epoch=epoch)
+    report['frozen'] = report.pop('hard')
+    report['bbox_last'] = report.pop('soft')
+    report['bbox_last_minus_frozen'] = report.pop('soft_minus_hard')
+    report.update(comparison='localization', routing='soft')
+    return report
+
+
+def main(*, comparison='routing'):
+    variants = paired_variants(comparison)
+    parser = argparse.ArgumentParser(description=(__doc__ if comparison == 'routing' else
+        'Paired soft/frozen vs soft/bbox-last Task 2 diagnostic; fresh Task 1 parents.'))
     parser.add_argument('--manifest', type=Path, default=Path('data/owod/s-owodb/split_manifest.json'))
     parent = Path('output/tree-detr-s-v5-full/s-owodb/seed_42')
     parser.add_argument('--checkpoint', type=Path, default=parent / 'stage_0/increment/checkpoint0049.pth')
@@ -52,7 +79,8 @@ def main():
     previous = Path('output/task2-v5-v7-diagnostic-3epochs-2gpu/results')
     parser.add_argument('--reference-checkpoint', type=Path, default=previous / 'v7/checkpoint.pth')
     parser.add_argument('--reference-plan', type=Path, default=previous / 'diagnostic_plan.json')
-    parser.add_argument('--output', type=Path, default=Path('output/sowodb-task2-v7-routing-8epochs-2gpu/results'))
+    parser.add_argument('--output', type=Path, default=Path(
+        f'output/sowodb-task2-v7-{comparison}-8epochs-2gpu/results'))
     parser.add_argument('--preflight', action='store_true', help='CPU-only provenance checks; writes no experiment state')
     parser.add_argument('--resume', action='store_true')
     opt = parser.parse_args()
@@ -64,7 +92,7 @@ def main():
     reference = verify_reference(opt.reference_checkpoint, opt.reference_plan, proof)
     if opt.preflight:
         print(json.dumps(dict(parent_provenance=proof, reference=reference,
-                              variants=['hard', 'soft'], epochs=EPOCHS,
+                              variants=[name for name, _, _ in variants], comparison=comparison, epochs=EPOCHS,
                               evaluation_epochs=list(EVALUATION_EPOCHS), effective_batch_size=2), indent=2))
         return
     opt.world_size = int(os.environ.get('WORLD_SIZE', 1))
@@ -77,7 +105,8 @@ def main():
     torch.distributed.init_process_group('nccl', timeout=timedelta(minutes=30))
     # LOCAL_SIZE is consumed by the existing COCO dataset helpers.
     os.environ['LOCAL_SIZE'] = '2'
-    identity = routing_identity(opt.manifest, opt.checkpoint, opt.gnn, proof, reference,
+    identity_builder = routing_identity if comparison == 'routing' else localization_identity
+    identity = identity_builder(opt.manifest, opt.checkpoint, opt.gnn, proof, reference,
                                 opt.world_size, os.environ.get('CUDA_VISIBLE_DEVICES', ''))
     import torchvision
     import MultiScaleDeformableAttention as extension
@@ -102,9 +131,12 @@ def main():
     evaluate_reference(opt, identity)
     gc.collect()
     torch.cuda.empty_cache()
-    for variant in ('hard', 'soft'):
-        print(f'v7 Task 2 paired experiment: {variant}, {EPOCHS} increment epochs, frozen localization', flush=True)
-        run_policy(opt, identity, 7, variant=variant, provenance=proof)
+    for index, (name, routing, localization) in enumerate(variants):
+        print(f'v7 Task 2 paired experiment: {name}, {EPOCHS} increment epochs, '
+              f'{routing} routing, {localization} localization', flush=True)
+        run_policy(opt, identity, 7, variant=routing, provenance=proof,
+                   localization=localization, run_name=name if comparison == 'localization' else None,
+                   initialization_reference=variants[0][0] if index else None)
     for path, expected in [(opt.checkpoint, proof['checkpoint_sha256']), (opt.gnn, proof['gnn_sha256']),
                            (opt.reference_checkpoint, reference['checkpoint_sha256']),
                            (opt.manifest, proof['canonical_manifest_sha256'])]:
@@ -114,14 +146,15 @@ def main():
         comparisons = {}
         for epoch in EVALUATION_EPOCHS:
             metrics = [json.loads((opt.output / variant / f'metrics_epoch_{epoch}.json').read_text())
-                       for variant in ('hard', 'soft')]
-            comparisons[epoch] = paired_report(*metrics, epoch=epoch)
+                       for variant, _, _ in variants]
+            reporter = paired_report if comparison == 'routing' else localization_report
+            comparisons[epoch] = reporter(*metrics, epoch=epoch)
             dump(opt.output / f'comparison_epoch_{epoch}.json', comparisons[epoch])
         report = comparisons[EPOCHS]
         report['change_from_epoch_3_to_8'] = {
             variant: {key: value - comparisons[3][variant][key]
                       for key, value in report[variant].items() if key in comparisons[3][variant]}
-            for variant in ('hard', 'soft')}
+            for variant in (('hard', 'soft') if comparison == 'routing' else ('frozen', 'bbox_last'))}
         dump(opt.output / 'comparison.json', report)
         print(json.dumps(report, indent=2), flush=True)
     torch.distributed.barrier()

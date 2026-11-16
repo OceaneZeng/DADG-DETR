@@ -151,7 +151,8 @@ def test_short_comparison_reports_actual_ap_units_and_missing_metrics_are_not_ze
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason='Real detector CUDA check')
-def test_real_v7_soft_detector_updates_and_keeps_old_classifier_rows(tmp_path):
+@pytest.mark.parametrize('localization', ['frozen', 'bbox-last'])
+def test_real_v7_soft_detector_updates_and_keeps_old_classifier_rows(tmp_path, localization):
     from main import get_args_parser
     from models.graph_local.discovery import build
     from models.graph_local.routed_adapter import append_stage, configure_trainable
@@ -177,9 +178,11 @@ def test_real_v7_soft_detector_updates_and_keeps_old_classifier_rows(tmp_path):
     append_stage(model, args.graph_adapter_specs[0])
     model.cuda()
     criterion.cuda().eval()  # No teacher needed for the supervised backward check.
-    hooks = configure_trainable(model, [3], [1, 3])
+    args.graph_localization = localization
+    hooks = configure_trainable(model, [3], [1, 3], localization=localization)
     model.train_discovery()
-    before = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
+    # Match the long-run audit call, where the frozen parent detector remains on CUDA.
+    before = {k: v.detach().clone() for k, v in model.state_dict().items()}
     optimizer = make_optimizer(model, args)
     outputs = model([torch.rand(3, 96, 96, device='cuda')])
     targets = [dict(labels=torch.tensor([3], device='cuda'),
@@ -191,6 +194,8 @@ def test_real_v7_soft_detector_updates_and_keeps_old_classifier_rows(tmp_path):
     optimizer.step()
     audit = parameter_audit(model, before, [3], [1])
     assert audit['previous_max_abs_change'] == 0
+    assert (audit['bbox_max_abs_change'] > 0) == (localization == 'bbox-last')
+    assert audit['bbox_hidden_max_abs_change'] == 0
     assert audit['current_classifier_row_delta_norm']['3'] > 0
     assert any(value > 0 for value in audit['adapter_up_norms'].values())
     path = tmp_path / 'soft.pth'

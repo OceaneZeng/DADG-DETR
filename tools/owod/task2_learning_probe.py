@@ -108,7 +108,17 @@ def parameter_audit(model, parent_state, current_ids, previous_ids):
     key = next(k for k in state if 'class_embed' in k and k.endswith('.weight') and k in parent_state)
     delta = state[key].detach().cpu() - parent_state[key].detach().cpu()
     current = delta[current_ids].norm(dim=1)
-    return dict(classifier_key=key, previous_max_abs_change=float(delta[previous_ids].abs().max()),
+    detector = model.detr if hasattr(model, 'detr') else model
+    last_ids = {id(p) for head in detector.bbox_embed for p in head.layers[-1].parameters()}
+    parameters = dict(model.named_parameters())
+    bbox_changes = {name: float((value.detach().cpu() - parent_state[name].detach().cpu()).abs().max())
+                    for name, value in parameters.items()
+                    if 'bbox_embed.' in name and name in parent_state}
+    hidden_changes = [change for name, change in bbox_changes.items()
+                      if id(parameters[name]) not in last_ids]
+    return dict(bbox_max_abs_change=max(bbox_changes.values(), default=0.),
+                bbox_hidden_max_abs_change=max(hidden_changes, default=0.),
+                classifier_key=key, previous_max_abs_change=float(delta[previous_ids].abs().max()),
                 current_classifier_row_delta_norm=dict(zip(map(str, current_ids), current.tolist())),
                 adapter_up_norms={name: float(value.norm()) for name, value in state.items()
                                   if '.graph_adapter.' in name and name.endswith('.up.weight')},
