@@ -1,5 +1,9 @@
 # S-OWODB Task 2 新类学习诊断与路由对照
 
+2026-11-17新增显式 `--epochs 3` 快速诊断选项，独立计划/输出，只在第3轮末评估；
+无参命令仍使用本页的8轮计划。快速运行、Git同步及未知检测诊断顺序见
+[3轮快速检查](sowodb-task2-fast-check.md)。旧8轮恢复须使用原提交，不能改计划接成3轮。
+
 这是独立诊断，采用作者完整 S-OWODB 数据和 VOC2007 11 点 AP50，非正式四任务成绩。
 沿用已有完整 v5 Task 1 第50轮及其 GNN，两张3090、每卡 batch1、总 batch2、seed42。
 默认只比较 v7 hard/frozen 与 v7 soft/frozen，各8轮 increment，不做 balanced finetune。

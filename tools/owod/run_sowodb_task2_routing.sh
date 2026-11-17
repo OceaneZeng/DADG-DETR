@@ -3,13 +3,26 @@
 set -euo pipefail
 comparison=routing
 check_only=false
-for option in "$@"; do
-  case "$option" in
+epochs=8
+while (($#)); do
+  case "$1" in
     --check) check_only=true ;;
     --localization) comparison=localization ;;
-    *) echo 'Accepted options: --check, --localization.' >&2; exit 2 ;;
+    --epochs)
+      [[ $# -ge 2 ]] || { echo '--epochs requires 3 or 8.' >&2; exit 2; }
+      epochs="$2"
+      shift
+      ;;
+    --help|-h)
+      echo 'Usage: bash tools/owod/run_sowodb_task2_routing.sh [--localization] [--epochs 3|8] [--check]'
+      echo 'Default: 8 epochs. The 3-epoch screening plan uses its own output directory.'
+      exit 0
+      ;;
+    *) echo 'Accepted options: --check, --localization, --epochs 3|8.' >&2; exit 2 ;;
   esac
+  shift
 done
+[[ $epochs == 3 || $epochs == 8 ]] || { echo '--epochs must be 3 or 8.' >&2; exit 2; }
 driver=tools/owod/run_sowodb_task2_routing.py
 cuda_check=()
 if [[ $comparison == localization ]]; then
@@ -18,7 +31,7 @@ if [[ $comparison == localization ]]; then
 fi
 cd "$(dirname "${BASH_SOURCE[0]}")/../.."
 python_bin="${TREE_DETR_PYTHON:-/home/top/disks/new-hdd/conda_envs/tree-detr/bin/python}"
-output="${SOWODB_TASK2_OUTPUT:-output/sowodb-task2-v7-${comparison}-8epochs-2gpu}"
+output="${SOWODB_TASK2_OUTPUT:-output/sowodb-task2-v7-${comparison}-${epochs}epochs-2gpu}"
 export CUDA_DEVICE_ORDER=PCI_BUS_ID
 export CUDA_VISIBLE_DEVICES="${SOWODB_GPUS:-0,1}"
 export LOCAL_SIZE=2
@@ -49,7 +62,7 @@ git rev-parse HEAD
 git branch --show-current
 git status --short
 "$python_bin" tools/owod/manage_data.py verify --benchmark s-owodb --output-root data/owod
-"$python_bin" "$driver" --preflight --output "$output/results"
+"$python_bin" "$driver" --epochs "$epochs" --preflight --output "$output/results"
 if $check_only; then
   exit 0
 fi
@@ -82,4 +95,4 @@ if [[ -f "$output/results/diagnostic_plan.json" ]]; then
   resume=(--resume)
 fi
 "$python_bin" -m torch.distributed.run --standalone --nproc_per_node=2 \
-  "$driver" --output "$output/results" "${resume[@]}"
+  "$driver" --epochs "$epochs" --output "$output/results" "${resume[@]}"
