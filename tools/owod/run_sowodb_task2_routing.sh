@@ -8,17 +8,19 @@ while (($#)); do
   case "$1" in
     --check) check_only=true ;;
     --localization) comparison=localization ;;
+    --unknown) comparison=unknown ;;
     --epochs)
       [[ $# -ge 2 ]] || { echo '--epochs requires 3 or 8.' >&2; exit 2; }
       epochs="$2"
       shift
       ;;
     --help|-h)
-      echo 'Usage: bash tools/owod/run_sowodb_task2_routing.sh [--localization] [--epochs 3|8] [--check]'
-      echo 'Default: 8 epochs. The 3-epoch screening plan uses its own output directory.'
+      echo 'Usage: bash tools/owod/run_sowodb_task2_routing.sh [--localization|--unknown] [--epochs 3|8] [--check]'
+      echo 'Routing/localization default: 8 epochs; run_sowodb_task2_unknown.sh defaults to 3 per arm.'
+      echo 'Each comparison and budget uses its own output directory.'
       exit 0
       ;;
-    *) echo 'Accepted options: --check, --localization, --epochs 3|8.' >&2; exit 2 ;;
+    *) echo 'Accepted options: --check, --localization, --unknown, --epochs 3|8.' >&2; exit 2 ;;
   esac
   shift
 done
@@ -28,6 +30,10 @@ cuda_check=()
 if [[ $comparison == localization ]]; then
   driver=tools/owod/run_sowodb_task2_localization.py
   cuda_check=(--localization-comparison)
+fi
+if [[ $comparison == unknown ]]; then
+  driver=tools/owod/run_sowodb_task2_unknown.py
+  cuda_check=(--unknown-comparison)
 fi
 cd "$(dirname "${BASH_SOURCE[0]}")/../.."
 python_bin="${TREE_DETR_PYTHON:-/home/top/disks/new-hdd/conda_envs/tree-detr/bin/python}"

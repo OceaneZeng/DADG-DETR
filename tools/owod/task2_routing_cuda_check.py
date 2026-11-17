@@ -10,7 +10,9 @@ sys.path[:0] = [str(ROOT), str(ROOT / 'models/ops')]
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--localization-comparison', action='store_true')
+    comparison = parser.add_mutually_exclusive_group()
+    comparison.add_argument('--localization-comparison', action='store_true')
+    comparison.add_argument('--unknown-comparison', action='store_true')
     opt = parser.parse_args()
     import gc
     import torch
@@ -27,9 +29,10 @@ def main():
     torch.cuda.set_device(rank)
     dist.init_process_group('nccl', timeout=timedelta(minutes=3))
     try:
-        variants = (('soft', 'frozen'), ('soft', 'bbox-last')) if opt.localization_comparison else (
-            ('hard', 'frozen'), ('soft', 'frozen'))
-        for routing, localization in variants:
+        variants = (('soft', 'frozen', 'dense'), ('soft', 'frozen', 'cross-view-protected')) if opt.unknown_comparison else (
+            (('soft', 'frozen', 'dense'), ('soft', 'bbox-last', 'dense')) if opt.localization_comparison else
+            (('hard', 'frozen', 'dense'), ('soft', 'frozen', 'dense')))
+        for routing, localization, negative_policy in variants:
             torch.manual_seed(42)
             args = get_args_parser().parse_args([])
             args.skip_backbone_initialization = True
@@ -38,6 +41,7 @@ def main():
             args.enc_layers = args.dec_layers = args.graph_adapter_last_n = 1
             args.num_queries = args.owod_max_detections = 3
             args.discovery_version, args.discovery_warmup = 7, 0
+            args.discovery_negative_policy = negative_policy
             args.owod_known_class_ids, args.owod_previous_class_ids = [1], []
             model, criterion, _ = build(args)
             model.cuda(); criterion.cuda()
@@ -66,6 +70,10 @@ def main():
                     outputs['discovery_old_teacher'] = old_teacher(images)
                     outputs['discovery_teacher'] = teacher(flip_samples(images))
                 losses = criterion(outputs, targets)
+                assert criterion.negative_policy == negative_policy
+                assert 0 <= losses['discovery_protected_count'] <= args.discovery_top_k
+                if negative_policy == 'dense':
+                    assert losses['discovery_protected_count'] == 0
                 total = sum(v * criterion.weight_dict[k] for k, v in losses.items() if k in criterion.weight_dict)
                 if not torch.isfinite(total):
                     raise ValueError('Nonfinite CUDA smoke loss')
@@ -89,7 +97,7 @@ def main():
             assert torch.equal(counts[0], counts[1])
             for hook in hooks:
                 hook.remove()
-            print(f'Rank {rank}: v7 {routing}/{localization}, '
+            print(f'Rank {rank}: v7 {routing}/{localization}/{negative_policy}, '
                   'CUDA backward/coordinate policy/old rows/NCCL/EMA/memory/rank RNG passed', flush=True)
             del network, model, criterion, teacher, old_teacher, optimizer, outputs, losses, total
             gc.collect()

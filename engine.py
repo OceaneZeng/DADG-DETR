@@ -63,6 +63,7 @@ def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
                         "discovery_pseudo_count", "discovery_ignored_fraction",
                         "discovery_known_supervised_fraction", "discovery_background_fraction",
                         "discovery_positive_fraction", "discovery_proposal_negative_fraction",
+                        "discovery_protected_count", "discovery_protected_fraction",
                         "discovery_objectness_supervised_fraction", "discovery_novelty_supervised_fraction"})
     metric_logger.add_meter('lr', utils.SmoothedValue(window_size=1, fmt='{value:.6f}'))
     metric_logger.add_meter('class_error', utils.SmoothedValue(window_size=1, fmt='{value:.2f}'))

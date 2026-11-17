@@ -162,12 +162,12 @@ def balanced_bce(logits, targets, weights):
     return torch.stack(parts).mean() if parts else logits.sum() * 0
 
 
-def proposal_supervision(positive, pseudo, confidence):
+def proposal_supervision(positive, pseudo, confidence, protected=None):
     """Supervise detection slots, not exhaustive foreground regions.
 
     The GT matcher and deduplicated pseudo miner select positives; every other
-    slot is a negative objectness/router example. This trades possible missed
-    unknowns for learning to reject unselected and duplicate proposals.
+    slot is a negative objectness/router example by default. This trades
+    possible missed unknowns for rejecting unselected and duplicate proposals.
     Novelty is conditional on a selected object, so negatives do not teach it
     that background is a known semantic object.
     """
@@ -175,6 +175,10 @@ def proposal_supervision(positive, pseudo, confidence):
     foreground_weights = torch.where(positive, torch.ones_like(confidence),
                                      torch.where(pseudo, confidence, torch.zeros_like(confidence)))
     proposal_weights = torch.where(foreground, foreground_weights, torch.ones_like(confidence))
+    if protected is not None:
+        # Withhold only the miner's bounded, cross-view-supported independent
+        # candidates. They receive no positive label, novelty loss or memory.
+        proposal_weights = proposal_weights.masked_fill(protected & ~foreground, 0)
     return foreground, foreground_weights, proposal_weights
 
 
@@ -213,6 +217,9 @@ class DiscoveryCriterion(nn.Module):
         self.revision = getattr(args, 'discovery_version', 5)
         self.trusted_background_negative = bool(
             getattr(args, 'discovery_trusted_background_negative', False))
+        self.negative_policy = getattr(args, 'discovery_negative_policy', 'dense')
+        if self.negative_policy not in ('dense', 'cross-view-protected'):
+            raise ValueError('Unknown discovery negative policy')
         self.old_ids = list(getattr(args, 'owod_previous_class_ids', []) or [])
         self.evidence = None
         self.weight_dict.update(loss_objectness=1., loss_unknown=1., loss_discovery_route=1.,
@@ -239,7 +246,8 @@ class DiscoveryCriterion(nn.Module):
         indices = self.matcher(outputs, targets)
         teacher = outputs.get('discovery_teacher') if self.training and self.epoch >= self.warmup else None
         candidates = mine_candidates(outputs, targets, indices, self.known_ids, teacher,
-                                     self.top_k, self.saliency_threshold, self.consistency_threshold)
+                                     self.top_k, self.saliency_threshold, self.consistency_threshold,
+                                     protect_unselected=self.negative_policy == 'cross-view-protected')
         pseudo, background, confidence = (candidates[k] for k in ('pseudo', 'background', 'weights'))
         positive = torch.zeros_like(pseudo)
         semantic = torch.full_like(pseudo, -1, dtype=torch.long)
@@ -247,7 +255,7 @@ class DiscoveryCriterion(nn.Module):
             positive[batch, queries] = True
             semantic[batch, queries] = targets[batch]['labels'][matches]
         foreground, foreground_weights, proposal_weights = proposal_supervision(
-            positive, pseudo, confidence)
+            positive, pseudo, confidence, candidates['protected'])
         novelty_weights, trusted_background = novelty_supervision(
             foreground, pseudo, background, confidence,
             include_background_negative=self.trusted_background_negative)
@@ -258,8 +266,8 @@ class DiscoveryCriterion(nn.Module):
         # this loss with discovery trust removes duplicate/background suppression.
         # Novelty uses selected foreground only by default.  The optional
         # trusted-background branch adds a conservative subset of negatives;
-        # objectness and routing always learn one-to-one proposal selection,
-        # including unselected-query negatives.
+        # objectness/router keep dense negatives except the explicitly enabled
+        # bounded candidate protection experiment. Known classification stays dense.
         prepared = dict(outputs)
         prepared.pop('query_label_weights', None)
         prepared['aux_outputs'] = []
@@ -297,15 +305,15 @@ class DiscoveryCriterion(nn.Module):
         losses['loss_affinity'] = (F.cross_entropy(affinity[anchor] / .1, semantic[anchor])
                                    if anchor.any() else affinity.sum() * 0)
         losses['discovery_pseudo_count'] = pseudo.sum().float()
-        # v5 ignores unselected slots for conditional novelty only unless the
-        # explicitly recorded trusted-background experiment is enabled.
-        # Classification, objectness and routing receive dense proposal
-        # supervision in both modes.
+        # Keep the historical ignored_fraction meaning: conditional novelty.
+        # Objectness/router protection is recorded separately.
         losses['discovery_ignored_fraction'] = (~foreground).float().mean()
         losses['discovery_known_supervised_fraction'] = confidence.new_ones(())
         losses['discovery_objectness_supervised_fraction'] = (proposal_weights > 0).float().mean()
         losses['discovery_novelty_supervised_fraction'] = (novelty_weights > 0).float().mean()
-        losses['discovery_proposal_negative_fraction'] = (~foreground).float().mean()
+        losses['discovery_proposal_negative_fraction'] = ((~foreground) & (proposal_weights > 0)).float().mean()
+        losses['discovery_protected_count'] = candidates['protected'].sum().float()
+        losses['discovery_protected_fraction'] = candidates['protected'].float().mean()
         losses['discovery_background_fraction'] = background.float().mean()
         losses['discovery_background_negative_fraction'] = trusted_background.float().mean()
         losses['discovery_positive_fraction'] = positive.float().mean()

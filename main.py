@@ -153,6 +153,8 @@ def get_args_parser():
     parser.add_argument('--discovery-consistency-threshold', type=float, default=.5)
     parser.add_argument('--discovery-trusted-background-negative', action='store_true',
                         help='opt in to novelty=0 supervision only for conservative low-saliency background slots')
+    parser.add_argument('--discovery-negative-policy', choices=('dense', 'cross-view-protected'), default='dense',
+                        help='cross-view-protected is restricted to the paired Task 2 diagnostic launcher')
     parser.add_argument('--lora-rank', default=8, type=int)
     parser.add_argument('--lora-last-decoder-layers', default=2, type=int)
     parser.add_argument('--lora-train-detection-heads', action='store_true',
@@ -318,6 +320,7 @@ def main(args):
                            router_supervision=('balanced-three-groups' if args.discovery_version >= 6
                                                else 'proposal-weighted'),
                            old_target_completion=args.discovery_version >= 6)
+            profile['discovery_negative_policy'] = getattr(args, 'discovery_negative_policy', 'dense')
             if getattr(args, 'discovery_trusted_background_negative', False):
                 profile['discovery_supervision'] = (
                     'dense selected-proposal objectness/router; selected foreground plus trusted-background novelty negatives')

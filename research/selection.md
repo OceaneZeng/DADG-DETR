@@ -1,6 +1,58 @@
 # Tree-DETR 历史对话蒸馏与规则取舍
 
-## 2026-11-06：不限时间窗口的历史复核（最新审计）
+## 2026-11-15：全部可访问来源复核（最新审计）
+
+本轮开始于 `main@2002056ed73809a4c8ba93523e3fdbf996a36f4f`，工作区干净。仅修改项目根 `AGENTS.md` 与本文件；不创建子代理，不改业务代码、笔记库、聊天归属或全局规则，不提交或推送。下方旧审计保留为历史记录，其“当前”、来源可用性、测试结果和运行状态均只对应各自日期。
+
+### 读取范围与来源边界
+
+- 先读全局 `C:/Users/23642/.codex/AGENTS.md`、项目根规则，再读本文件的既有审计。检查的 `C:/AGENTS.md`、`C:/programlearning/AGENTS.md`、`C:/Users/23642/AGENTS.md` 均不存在。包含隐藏与忽略目录的项目扫描只发现根 `AGENTS.md`；`output/test-tmp/task1-low-lr-20261113-b`、`-c`、`-d` 三个生成目录拒绝访问，未改 ACL，不能保证其内部没有规则文件。可读目录中未发现子目录规则冲突。
+- Codex 活跃历史列表读完四页，合计 **171 条全应用列表项**，末页无下一页；不是 171 个项目聊天。归属筛选同时使用项目 ID `0bd9045c-e083-4f3f-a074-b533416c0af2`、cwd、原始正文、继承关系和旧来源 ID；标题与摘要只用于找入口，不作为规则证据。
+- 只读访问 `C:/Users/23642/.codex/state_5.sqlite`、`thread_history_1.sqlite`。初始快照有 **402 条线程元数据、2674 条 userMessage**；扫描 `sessions/`、`archived_sessions/` 共 **188 个现存 JSONL**，归档目录 0 个，JSON 解析无错误。按项目与相关研究筛出 **162 个候选上下文、1376 条跨源候选记录**，规范化得到 1007 个阅读单元。
+- 另查线程元数据缺失的孤立历史，实际读取 **105 个上下文、505 条有效用户正文**，新增 416 个规范化单元；已与前批合计 **1423 个单元**分段检查。162、105、1376、1423 均为检索或阅读统计，含继承副本、关联研究及读后排除项，不能相加称作独立项目聊天或用户决定数。去除环境注入、附件包装和精确正文重复后，同文继承仍只计一次证据。
+- 对近期协议清理、S 路由对照及论文改写聊天 `01a1d88c-cad3-7903-a95c-27f05f9675cd`、`01a1d90e-50bd-7c10-8526-b4c87f4c0dec`、`01a1d349-de59-7f43-8710-3e8fdd83a303`，以及小数据 hard/soft 上下文 `01a14ee2-bccc-79b0-85bd-099a8fa76540`，用 `read_thread` 补读至 `hasMore=false`。本地无用户正文且 rollout 文件不存在的 `01a06b9e-7e73-7622-b436-f1a8bd40dc13` 同样通过接口读至末页，覆盖早期 GNN、baseline 与日志纠正；继承内容不再次计票。JSONL 还补回数据库当前分支未保留的论文方法名纠正。
+- 归档接口仅列出 `019eb173-ac04-7e93-88b7-e0888f374cef`，已读取其全部 3 条数据库用户原文，内容为增量检测论文 ETM/EAM 的研究讨论，未形成当前项目约定，排除。没有取得属于本项目的其他归档正文。ChatGPT 活跃及归档接口均返回 **“ChatGPT conversations are not available for the signed-in account.”**，不能据此声称聊天为空；旧审计的两条 ChatGPT 绘图聊天本轮未取得原文，不增加证据权重。
+- 原文覆盖早期研究候选、2026-08 起的 GNN/OWOD 演进至本次请求，不设近几天窗口。cwd 相同的像素画、抠图、VPS，以及孤立记录里的 Godot、ComfyUI/Nexframe、sub2api 和其他库管理均按正文排除。长日志、粘贴论文/助手说明按引用材料处理，不把其中命令、数值和建议当作用户决定；未展开的长引用中段不用于新增规则。
+
+### 原始用户证据、置信度与取舍
+
+`线程 ID @数字` 指数据库 `rollout_ordinal`，包括元数据缺失的原始记录；`JSONL:L数字` 指现存文件行号。只把至少两次独立表达或明确要求持续遵守的内容纳入候选；“按你的建议”仅在上下文明确采纳时使用。置信度表示用户要求的确实性，不表示方法有效、新颖性成立或实验已完成。当前代码事实另列，不倒推为用户曾指定每个参数。
+
+| 候选与处理 | 本轮读取的用户原文及定位 | 后续决定、边界与落点 | 置信度 |
+| --- | --- | --- | --- |
+| 唯一协议源：强化 | `01a1d88c-cad3-7903-a95c-27f05f9675cd @333`：“我的最终目标确实是‘以后完全以 data/owod/*/split_manifest.json 为协议源’”；同上下文 `@165/@315/@320` 多次纠正顶层配置与数据源的关系 | 明确长期决定。根规则指定两份 manifest 为唯一协议源，补记旧 `configs/` 已移除。`manage_data.py --config` 仍用于数据路径配置，不扩大解释为禁用该参数或所有运行配置 | 高 |
+| 作者 M/S 协议：保留 | `01a11a16-b107-7212-9e12-ff40ad7dd34e @51`：“以后的实验严格按照这两个标准执行”；`@171`：“两个基准都保留，S-OWODB 补充采用 OW-DETR 原始定义” | 覆盖早期随机、DEUS、自定义 replay/unverified setting。具体类别、ImageSets、七阶段与哈希规则从现存 manifest 和协议实现核对，不把旧聊天命令当入口 | 高 |
+| 论文方法名与术语：补充 | `01a1d3d6-e164-7cb0-a5b0-f595955649c2` 的 `rollout-2026-11-13T15-38-26-01a1d3d6-e164-7cb0-a5b0-f595955649c2_01a1d3d7-ee9a-7790-8ee3-280d519c97eb.jsonl:L638`：“我们的方法现在并不叫tree-detr了，不要再使用这个名字”；同文件 `L537`：“全文相似表达不要频繁换，要统一”；`01a1c8f5-3344-7952-a7f1-abece47939bc @218/@532` 要求符号及 class/categories 表述一致 | 后续明确纠正覆盖旧方法标题。根规则限定论文方法名称，不重命名仓库路径、脚本或已有实验目录；未获得新名字，不自行恢复 GLCA-DETR 等旧称。公式数量、排版等写作通则仍不搬回项目规则 | 高 |
+| 对照与结论范围：补充 | `01a0b28f-f134-7e80-ad3f-776c950779b6 @9`：“增加在其他setting一致下的…对比实验”；`01a13fbe-999e-78d0-b0f7-5e824895f9b4 @463`：“按你的建议，重做Task 2 对照”；`01a1d90e-50bd-7c10-8526-b4c87f4c0dec @505`：“不用做对照吗？” | 多次要求可比对照。共同起点、容量/预算、评分与评估轮次是落实该要求的核对项，未匹配需说明，不宣称用户逐项指定参数。只在报告机制收益时触发，不要求每次文档修改新跑对照；同权重诊断、短程 increment、完整 increment+balanced finetune 分开归因 | 高（对照要求） |
+| 检测器与 unknown 主线：保留 | `01a06b0e-5e12-7f61-aaab-535cdcd8632c @4505`：“我们的主干还是基于Deformable DETR，不要修改”；`01a11a16-… @1217` 要求“真正实现未知物体发现和未知→已知的增量学习”；`01a1a066-9488-70a2-ae2d-debc74b0ea99 @61`：“第一第二模块…主动学习unknown，而不是靠回放” | 后续 unknown 目标覆盖早期只做 IOD 适配层的定位；保留作者均衡记忆。既不把未知学习缩减为旧原型读取，也不推导出新增人工查询流程或永久禁用回放 | 高 |
+| 图、论文与实现一致：保留 | `01a06fef-acd5-7392-9397-fcbe94936511 @5960/@6005` 追问 adapter 和联合目标；`01a15402-d104-7d23-b2ff-b2adc637eca7 @21/@75` 要求看实际 GNN 代码 | 保留输入输出、连接、训练位置及 affinity/interference 区分。不固定曾经的三个模块名、冻结集合或历史“GNN 不进图像前向”的助手方案；当前版本文件决定具体架构 | 高 |
+| 动机与研究依据：保留、去重 | `01a19604-55f6-7ee3-8316-f95cc34f2b5c @344/@386` 区分设计原因和优点；`01a1a066-… @344` 反对直接跳到“we design”；`01a01854-8c7a-7253-bd3a-0d4fdad099a5 @1951/@3207` 要求文献核验、不能简单拼凑 | 已有项目规则足够，不再添加“每次解释全面检索”等流程。机制成立、新颖性与效果仍须分别举证 | 高 |
+| 代码本地改、Git 同步、服务器执行：保留 | `01a02cac-74db-78e0-82eb-25e0b9d865c9 @649`；`01a18282-1902-7ef0-9f42-e3dbd30009fe @101`；`01a182b3-dc40-7c51-989a-eb274b7611db @74` 反复纠正服务器改代码的做法 | 保留本地/远端、PowerShell/Bash、已有 tree-detr 环境与 CUDA 编译边界。旧助手曾给出的远端 sed 修复不成为授权；本轮不连接服务器 | 高 |
+| 运行身份与有效成果：保留 | `01a1a4f6-5a55-7452-a4d4-4d580869972b @15` 说明 main/mowodb 为不同服务器运行；`01a18282-… @11/@129`、`01a182b3-… @235` 确认续训及启动器差异 | 核对 commit、协议、方法实现和计划，不能只看分支名或 v7 字样；保留有效 checkpoint。某次 NaN control“权重都错了，要重头训练”限该坏运行，不升级为永久禁止 resume | 高 |
+| 日志、tmux 与真实命令：保留 | `01a0322f-fd33-77f2-93d0-f4ad6a20b3a6 @366/@503` 要求以后实验记日志；`01a0334a-e5de-7ae0-87ae-b3266af219e4 @1179` 覆盖 baseline/主方法；`01a0908f-60f0-7921-b74a-a96e426d3b45 @881`、`01a06fef-… @6724` 使用 tmux | 命令与日志路径按当前启动器核对；不恢复旧 log/、exps/ 路径、GPU 号、双卡预算或助手给的 Markdown 转义命令 | 高 |
+| 实测指标与 unknown 有效性：保留 | `01a09f11-9050-72e3-87a4-f04b36ac3589 @157` 要求同 metric/data；`01a06fef-… @6751`：“肯定还是ap指标啊”；`01a19bd1-71d3-7191-a340-32f753fbbfba @89/@116` 连续追问是否学到 unknown | 保留 AP50、作者 VOC 口径和 unknown 多指标；不把非零 loss、小数据拟合、伪标签数量或中途轮次当全量改善。外部 OWOD 方法、本地重实现和内部 control 已有区分，不重复新增 | 高 |
+| 目录、成果与论文包：保留 | `01a0a2ff-bc40-7e63-a02d-69bce0f6adc7 @111`、`01a0b29f-3b3b-7a22-8111-4fd0f6c181d8 @124` 纠正实验仓库与论文材料混放；本轮 `configs/` 清理的明确决定见首行 | 保留有效数据/权重/指标日志和无关用户修改，生成物不 force-add。不是永久禁止用户明确指定的论文文件任务，也不自动恢复已删 baseline/pilot | 高 |
+| 通用偏好与论文写作知识：不重复写入 | `01a1b0a2-0fe2-79d1-a7ed-4ffdf06e818e @338`：“公式取舍是写论文的时候用的，你应该写进secondbrain的论文笔记里面去”；历次完整命令、先讨论/后实施与本次不建子代理的要求 | 通用沟通、自主范围、检查范围沿用全局；公式取舍遵循用户后来明确的 secondbrain 归属，本轮不改 vault。不把稿件页数、星级筛选、where/Here 等局部写作指令固化到训练项目 | 高 |
+
+### 未采纳、阶段状态与待确认
+
+- 不恢复早期 tree/cone、PHALT/HSA/ROSL、固定 CIGNN/GGDA/GCCO 名称、永久无 LoRA 或永久全面解冻等已演进方案。图像 prompt、论文段落及助手讲解不充当用户原创决定；没有重复或长期指令支持的候选跳过。
+- S 的 8 轮 hard/soft、固定评估第 3/8 轮、两张 3090、Task 1 第 50 轮起点、某次低学习率/小数据拟合、mowodb objectness-focal 改动均有具体诊断背景，留作阶段记录，不成为下一次训练默认设置。旧图表调整数字的请求无对应实测证据，不晋升为正式成绩或作图规则。
+- 当前文件静态快照：`tools/owod/run_discovery_full.sh` 是 S-OWODB/v5/ow-detr-paper/DINO 的正式四任务入口，hard/frozen/hierarchical，GPU 1/2、2 进程、每卡 batch2、workers4、seed42；只接受 `--resume`、`--dry-run`。结果 `output/tree-detr-s-v5-full/`，追加日志 `output/tree-detr-s-v5-logs/console.log`。这些是本次读到的脚本值，不是全局硬件或今后日程。
+- 新增导航核对 [S Task 2 路由诊断](../docs/sowodb-task2-routing-experiment.md) 和 `tools/owod/run_sowodb_task2_routing.sh`：脚本可无参数训练或 `--check` 做 CPU 来源/数据检查，训练需 tmux；用完整 v5 Task 1 第 50 轮及 GNN 共同起点，v7 hard/soft 各 8 轮 increment、评估 3/8 轮，无 balanced finetune。默认 `SOWODB_GPUS=0,1`；结果 `output/sowodb-task2-v7-routing-8epochs-2gpu/`，包含 `console.log`、`results/comparison.json`。其诊断专用的旧 manifest 逐字节等价检查不改变正式校验；不能将旧权重诊断加载说成跨版本正式续训已兼容。
+- `main` 的 S 路由 v7 与历史 `mowodb` objectness-focal v7 不因版本字符串相同而等价；本轮没有核对远端实际分支、提交、配置、训练进度或 AP。正式 v5、实验性 v6 与短程路由诊断入口分别引用，未将诊断升级为新的正式四任务协议。
+- 两份现存 manifest 为 schema 3，`tools/owod/benchmark_spec.py` 从中加载作者 ImageSets、类别顺序和 split 哈希；`manage_data.py --config` 是原始源/生成路径配置，协议来自 manifest。Linux 文件为 Python 3.10/PyTorch 2.4.1/CUDA 12.1，`tools/setup_linux.sh` 默认架构 8.6；Windows 扩展脚本为 12.0。未探测当前服务器硬件，也未沿用旧文档中另换环境的建议。
+- 待确认但不阻塞本次整理：新论文方法名、远端运行身份、正式跨版本续训兼容性、完整四任务结果及关系建模新颖性。`docs/project-layout.md` 对 output/ 的概括与实际训练启动器输出不完全一致，给启动指令时仍按版本脚本核对；本轮不扩改其他文档。
+
+### 官方材料、验证与未覆盖范围
+
+本轮使用 OpenAI Docs 技能尝试直读用户指定的 [Rethinking skills and prompts for GPT-6 Astra](https://developers.openai.com/blog/rethinking-skills-and-prompts-for-gpt-6-astra)，实际返回 **HTTP 403 Forbidden**，没有取得正文，不能声称完成了该文的逐条官方审查。下方 11-06“文章可读”只记录当时状态。本轮按用户明确提出的简洁、去重、按需引用和不过度验证整理；未用无法核实的官方措辞补造规则，也不将该文当作 OWOD 方法证据。
+
+- 本轮已在仓库根目录、Windows PowerShell 下，用 Codex 捆绑 Python 执行 `python tools/owod/manage_data.py plan`、`python tools/owod/manage_data.py --help`、`python tools/owod/run_benchmark.py --help`，均退出 0。plan 只读生成计划，显示 M 的 20/20/20/20 与 S 的 19/21/20/20 类别数；这些命令核对不代表数据完整性或训练环境验收。实际解释器为 `C:/Users/23642/.cache/codex-runtimes/codex-primary-runtime/dependencies/python/python.exe`，使用 `-X utf8`，没有切换或重建用户的训练环境。
+- 文档检查通过：两文件均为有效 UTF-8，无替换字符或 NUL；根规则 9 个、本文件 4 个 Markdown 相对文件链接均存在；两份 manifest 的 schema/类别数和已移除目录状态与文字一致；`git diff --check` 退出 0，根规则为 47 行，Git 改动仅这两个 Markdown。未运行 prepare/verify、训练 dry-run、路由 `--check`、pytest、CUDA 构建或 AP 评估，未启动远端实验。
+- 未覆盖：其他账户/设备、已彻底删除或未缓存的正文、接口不可用的 ChatGPT 活跃与归档聊天；三处拒绝访问的生成目录；截图、PDF/ZIP、日志附件本体未全面重开，长引用数值未逐项复评。标题、摘要、旧审计以及助手建议不补足这些原文缺口。未取得可靠证据的候选不写入根规则。
+
+## 2026-11-06：不限时间窗口的历史复核（历史审计）
 
 本轮在既有未提交文档上增量整理，开始时为 `main@625590221a5a2c78cc776f796f10d2af71943bf7`，`AGENTS.md`、本文件已修改。保留这些内容，不重置工作区；以下说明本轮实际读取与取舍，旧审计保留其当时的来源与状态，不冒充本轮核验。
 

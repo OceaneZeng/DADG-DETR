@@ -64,6 +64,8 @@ def paired_variants(comparison):
         return (('hard', 'hard', 'frozen'), ('soft', 'soft', 'frozen'))
     if comparison == 'localization':
         return (('frozen', 'soft', 'frozen'), ('bbox-last', 'soft', 'bbox-last'))
+    if comparison == 'unknown':
+        return (('baseline', 'soft', 'frozen'), ('protected', 'soft', 'frozen'))
     raise ValueError('Unknown paired comparison')
 
 
@@ -85,9 +87,35 @@ def localization_report(frozen, bbox_last, *, epoch=None, epochs=EPOCHS):
     return report
 
 
+def unknown_identity(*args, epochs=3):
+    identity = routing_identity(*args, epochs=epochs)
+    identity.update(suite=f'sowodb-task2-v7-unknown-protection-{epochs}epochs-v1',
+                    variants=['baseline', 'protected'], routing='soft', localization='frozen',
+                    negative_policies={'baseline': 'dense', 'protected': 'cross-view-protected'},
+                    protection=dict(saliency_both_views=.5, consistency='same as pseudo',
+                                    max_extra='discovery_top_k', max_pair_iou=.7,
+                                    max_released_gt_iou=.3, teacher_required=True),
+                    changed_factor='objectness/router negatives on bounded unselected candidates')
+    return identity
+
+
+def unknown_report(baseline, protected, *, epoch=None, epochs=3):
+    report = paired_report(baseline, protected, epoch=epoch, epochs=epochs)
+    report['baseline'] = report.pop('hard')
+    report['protected'] = report.pop('soft')
+    report['protected_minus_baseline'] = report.pop('soft_minus_hard')
+    report.update(comparison='unknown', routing='soft', localization='frozen',
+                  negative_policies={'baseline': 'dense', 'protected': 'cross-view-protected'},
+                  desired_direction={'owod_u_recall': 'higher', 'owod_wi': 'lower',
+                                     'owod_a_ose': 'lower', 'owod_unknown_precision': 'higher'},
+                  note='Fixed final-budget increment-only screening; compare all APs and unknown '
+                       'precision/count as well as U-Recall, WI and A-OSE. No automatic efficacy claim.')
+    return report
+
+
 def write_reports(directory, comparison, epochs):
     variants = paired_variants(comparison)
-    reporter = paired_report if comparison == 'routing' else localization_report
+    reporter = {'routing': paired_report, 'localization': localization_report, 'unknown': unknown_report}[comparison]
     comparisons = {}
     for epoch in evaluation_epochs(epochs):
         metrics = [json.loads((directory / name / f'metrics_epoch_{epoch}.json').read_text())
@@ -99,24 +127,57 @@ def write_reports(directory, comparison, epochs):
         report['change_from_epoch_3_to_8'] = {
             variant: {key: value - comparisons[3][variant][key]
                       for key, value in report[variant].items() if key in comparisons[3][variant]}
-            for variant in (('hard', 'soft') if comparison == 'routing' else ('frozen', 'bbox_last'))}
+            for variant in (('hard', 'soft') if comparison == 'routing' else
+                            ('frozen', 'bbox_last') if comparison == 'localization' else
+                            ('baseline', 'protected'))}
+    if comparison == 'unknown':
+        initial_metrics = [json.loads((directory / name / 'initial_metrics.json').read_text())
+                           for name, _, _ in variants]
+        initial = unknown_report(*initial_metrics, epochs=epochs)
+        report['initial'] = {name: initial[name] for name, _, _ in variants}
+        report['change_from_initial'] = {
+            name: {key: value - initial[name][key] for key, value in report[name].items()
+                   if key in initial[name]} for name, _, _ in variants}
+        activity_fields = ('discovery_pseudo_count', 'discovery_protected_count',
+                           'discovery_protected_fraction', 'discovery_proposal_negative_fraction')
+        report['training_activity'] = {
+            name: [dict(epoch=epoch + 1, **{key: value for key, value in json.loads(
+                (directory / name / f'epoch_{epoch}.json').read_text())['train'].items()
+                if key in activity_fields}) for epoch in range(epochs)]
+            for name, _, _ in variants}
     dump(directory / 'comparison.json', report)
     return report
 
 
+def run_paired_variants(opt, identity, proof, comparison):
+    variants = paired_variants(comparison)
+    for index, (name, routing, localization) in enumerate(variants):
+        negative_policy = identity.get('negative_policies', {}).get(name, 'dense')
+        print(f'v7 Task 2 paired experiment: {name}, {opt.epochs} increment epochs, '
+              f'{routing} routing, {localization} localization, {negative_policy} negatives', flush=True)
+        run_policy(opt, identity, 7, variant=routing, provenance=proof,
+                   localization=localization, run_name=name if comparison != 'routing' else None,
+                   negative_policy=negative_policy,
+                   initialization_reference=variants[0][0] if index else None)
+
+
 def main(*, comparison='routing'):
     variants = paired_variants(comparison)
-    parser = argparse.ArgumentParser(description=(__doc__ if comparison == 'routing' else
-        'Paired soft/frozen vs soft/bbox-last Task 2 diagnostic; fresh Task 1 parents.'))
+    parser = argparse.ArgumentParser(description={
+        'routing': __doc__,
+        'localization': 'Paired soft/frozen vs soft/bbox-last Task 2 diagnostic; fresh Task 1 parents.',
+        'unknown': 'Paired dense vs cross-view-protected unknown supervision; fresh, identical Task 1 parents.',
+    }[comparison])
     parser.add_argument('--manifest', type=Path, default=Path('data/owod/s-owodb/split_manifest.json'))
     parent = Path('output/tree-detr-s-v5-full/s-owodb/seed_42')
     parser.add_argument('--checkpoint', type=Path, default=parent / 'stage_0/increment/checkpoint0049.pth')
     parser.add_argument('--gnn', type=Path, default=parent / 'gnn/stage_0/gnn_stage0.pt')
-    previous = Path('output/task2-v5-v7-diagnostic-3epochs-2gpu/results')
-    parser.add_argument('--reference-checkpoint', type=Path, default=previous / 'v7/checkpoint.pth')
-    parser.add_argument('--reference-plan', type=Path, default=previous / 'diagnostic_plan.json')
-    parser.add_argument('--epochs', type=int, choices=(3, 8), default=EPOCHS,
-                        help='3 = quick screening; 8 = extended diagnostic (default); separate plans/outputs')
+    if comparison != 'unknown':
+        previous = Path('output/task2-v5-v7-diagnostic-3epochs-2gpu/results')
+        parser.add_argument('--reference-checkpoint', type=Path, default=previous / 'v7/checkpoint.pth')
+        parser.add_argument('--reference-plan', type=Path, default=previous / 'diagnostic_plan.json')
+    parser.add_argument('--epochs', type=int, choices=(3, 8), default=3 if comparison == 'unknown' else EPOCHS,
+                        help='3 = quick screening (unknown default); 8 = extended; separate plans/outputs')
     parser.add_argument('--output', type=Path,
                         help='Defaults to a separate comparison/epoch-budget directory')
     parser.add_argument('--preflight', action='store_true', help='CPU-only provenance checks; writes no experiment state')
@@ -124,15 +185,23 @@ def main(*, comparison='routing'):
     opt = parser.parse_args()
     if opt.output is None:
         opt.output = output_directory(comparison, opt.epochs)
-    for field in ('manifest', 'checkpoint', 'gnn', 'reference_checkpoint', 'reference_plan', 'output'):
+    fields = ['manifest', 'checkpoint', 'gnn', 'output']
+    if comparison != 'unknown':
+        fields.extend(['reference_checkpoint', 'reference_plan'])
+    for field in fields:
         setattr(opt, field, getattr(opt, field).resolve())
     import torch
     torch.set_num_threads(2)
     proof = verify_parent_inputs(opt.manifest, opt.checkpoint, opt.gnn)
-    reference = verify_reference(opt.reference_checkpoint, opt.reference_plan, proof)
+    # The new supervision pair needs only the verified formal Task 1 parent.
+    # Historical diagnostic weights are not an initialization or prerequisite.
+    reference = (verify_reference(opt.reference_checkpoint, opt.reference_plan, proof)
+                 if comparison != 'unknown' else None)
     if opt.preflight:
         print(json.dumps(dict(parent_provenance=proof, reference=reference,
                               variants=[name for name, _, _ in variants], comparison=comparison, epochs=opt.epochs,
+                              negative_policies=({'baseline': 'dense', 'protected': 'cross-view-protected'}
+                                                 if comparison == 'unknown' else None),
                               evaluation_epochs=list(evaluation_epochs(opt.epochs)), effective_batch_size=2,
                               output=str(opt.output), finetune=False), indent=2))
         return
@@ -146,7 +215,8 @@ def main(*, comparison='routing'):
     torch.distributed.init_process_group('nccl', timeout=timedelta(minutes=30))
     # LOCAL_SIZE is consumed by the existing COCO dataset helpers.
     os.environ['LOCAL_SIZE'] = '2'
-    identity_builder = routing_identity if comparison == 'routing' else localization_identity
+    identity_builder = {'routing': routing_identity, 'localization': localization_identity,
+                        'unknown': unknown_identity}[comparison]
     identity = identity_builder(opt.manifest, opt.checkpoint, opt.gnn, proof, reference,
                                 opt.world_size, os.environ.get('CUDA_VISIBLE_DEVICES', ''), epochs=opt.epochs)
     import torchvision
@@ -168,19 +238,17 @@ def main(*, comparison='routing'):
         dump(plan_path, identity)
         dump(opt.output / 'parent_provenance.json', proof)
     torch.distributed.barrier()
-    from tools.owod.task2_learning_probe import evaluate_reference
-    evaluate_reference(opt, identity)
+    if reference is not None:
+        from tools.owod.task2_learning_probe import evaluate_reference
+        evaluate_reference(opt, identity)
     gc.collect()
     torch.cuda.empty_cache()
-    for index, (name, routing, localization) in enumerate(variants):
-        print(f'v7 Task 2 paired experiment: {name}, {opt.epochs} increment epochs, '
-              f'{routing} routing, {localization} localization', flush=True)
-        run_policy(opt, identity, 7, variant=routing, provenance=proof,
-                   localization=localization, run_name=name if comparison == 'localization' else None,
-                   initialization_reference=variants[0][0] if index else None)
-    for path, expected in [(opt.checkpoint, proof['checkpoint_sha256']), (opt.gnn, proof['gnn_sha256']),
-                           (opt.reference_checkpoint, reference['checkpoint_sha256']),
-                           (opt.manifest, proof['canonical_manifest_sha256'])]:
+    run_paired_variants(opt, identity, proof, comparison)
+    inputs = [(opt.checkpoint, proof['checkpoint_sha256']), (opt.gnn, proof['gnn_sha256']),
+              (opt.manifest, proof['canonical_manifest_sha256'])]
+    if reference is not None:
+        inputs.append((opt.reference_checkpoint, reference['checkpoint_sha256']))
+    for path, expected in inputs:
         if file_sha256(path) != expected:
             raise ValueError(f'Input changed during experiment: {path}')
     if opt.rank == 0:

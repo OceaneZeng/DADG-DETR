@@ -108,13 +108,15 @@ def view_matches(outputs, teacher):
 
 @torch.no_grad()
 def mine_candidates(outputs, targets, indices, known_ids, teacher=None, top_k=5,
-                    saliency_threshold=.65, consistency_threshold=.5):
+                    saliency_threshold=.65, consistency_threshold=.5,
+                    protect_unselected=False):
     saliency = saliency_in_boxes(outputs['attention_feature'], outputs['pred_boxes'],
                                 outputs['image_sizes'], outputs['padded_size'])
     known = outputs['pred_logits'][..., known_ids].sigmoid().amax(-1)
     semantic = semantic_weights(outputs, targets, indices, known_ids)
     pseudo = torch.zeros_like(known, dtype=torch.bool)
     background = torch.zeros_like(pseudo)
+    protected = torch.zeros_like(pseudo)
     weights = torch.zeros_like(known)
     maps, consistency, teacher_boxes = (None, torch.zeros_like(known), None)
     teacher_saliency = None
@@ -155,11 +157,37 @@ def mine_candidates(outputs, targets, indices, known_ids, teacher=None, top_k=5,
             chosen = torch.stack(chosen)
             pseudo[batch, chosen] = True
             weights[batch, chosen] = quality[chosen]
+        if protect_unselected and teacher is not None:
+            # A weaker saliency gate can justify withholding a negative, not
+            # inventing a positive. Require the SAME cross-view consistency,
+            # two saliency observations and released-GT exclusion as above.
+            # At most top_k extra, spatially distinct slots are protected;
+            # duplicate queries and all other unmatched slots remain negative.
+            uncertain = eligible & ~pseudo[batch] & (maps[batch] >= 0)
+            uncertain &= saliency[batch] >= .5
+            uncertain &= teacher_saliency[batch, maps[batch].clamp_min(0)] >= .5
+            uncertain &= consistency[batch] >= consistency_threshold
+            remaining = torch.where(uncertain)[0]
+            remaining = remaining[torch.argsort(quality[remaining], descending=True)]
+            representatives = list(torch.where(pseudo[batch])[0].unbind())
+            extra = []
+            for query in remaining:
+                if len(extra) >= top_k:
+                    break
+                if representatives:
+                    overlap = box_iou(box_cxcywh_to_xyxy(box[query:query + 1]),
+                                     box_cxcywh_to_xyxy(box[torch.stack(representatives)]))[0]
+                    if overlap.max() > .7:
+                        continue
+                representatives.append(query)
+                extra.append(query)
+            if extra:
+                protected[batch, torch.stack(extra)] = True
         # Lack of a semantic label is insufficient evidence of background.
         background[batch] = eligible & (saliency[batch] < .15)
         if teacher is not None:
             background[batch] &= maps[batch] >= 0
             background[batch] &= teacher_saliency[batch, maps[batch].clamp_min(0)] < .15
-    return {'pseudo': pseudo, 'background': background, 'weights': weights,
+    return {'pseudo': pseudo, 'background': background, 'protected': protected, 'weights': weights,
             'matches': maps, 'teacher_boxes': teacher_boxes, 'consistency': consistency,
             'saliency': saliency, 'semantic_weights': semantic}

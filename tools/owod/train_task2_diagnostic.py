@@ -158,17 +158,20 @@ def make_optimizer(model, args):
     ], lr=args.lr, weight_decay=args.weight_decay)
 
 
-def validate_pair_resume(checkpoint, variant, localization, run_name=None):
+def validate_pair_resume(checkpoint, variant, localization, run_name=None, *, negative_policy='dense'):
     saved = checkpoint['args']
     if (checkpoint.get('variant') != variant
             or getattr(saved, 'graph_routing', None) != variant
             or getattr(saved, 'graph_localization', None) != localization
             or (run_name is not None and checkpoint.get('run_name') != run_name)):
         raise ValueError('Paired diagnostic routing/localization/run changed on resume')
+    if getattr(saved, 'discovery_negative_policy', 'dense') != negative_policy:
+        raise ValueError('Paired diagnostic negative policy changed on resume')
 
 
 def run_policy(opt, identity, policy, *, variant=None, provenance=None,
-               localization='frozen', run_name=None, initialization_reference='hard'):
+               localization='frozen', run_name=None, initialization_reference='hard',
+               negative_policy='dense'):
     import numpy as np
     import torch
     from torch.utils.data import DataLoader, RandomSampler, SequentialSampler, DistributedSampler
@@ -194,6 +197,12 @@ def run_policy(opt, identity, policy, *, variant=None, provenance=None,
         raise ValueError('Routing comparison requires an explicit verified v7 diagnostic fork')
     if localization not in ('frozen', 'bbox-last'):
         raise ValueError('Unknown paired localization policy')
+    if negative_policy not in ('dense', 'cross-view-protected'):
+        raise ValueError('Unknown discovery negative policy')
+    planned_negative = identity.get('negative_policies', {}).get(run_name or variant, 'dense')
+    if negative_policy != planned_negative or (negative_policy != 'dense' and (
+            policy != 7 or variant != 'soft' or provenance is None or localization != 'frozen')):
+        raise ValueError('Negative policy requires its explicitly paired, verified soft/frozen v7 plan')
     for name in (run_name, initialization_reference):
         if name is not None and (not name or Path(name).name != name or name in ('.', '..')):
             raise ValueError('Paired run names must be single directory names')
@@ -266,7 +275,7 @@ def run_policy(opt, identity, policy, *, variant=None, provenance=None,
     if restored:
         validate_diagnostic_resume(restored, identity, policy)
         if variant is not None:
-            validate_pair_resume(restored, variant, localization, run_name)
+            validate_pair_resume(restored, variant, localization, run_name, negative_policy=negative_policy)
         if (restored['epoch'] == args.epochs - 1 and (directory / 'training_complete.json').is_file()
                 and (directory / 'final_metrics.json').is_file()
                 and (variant is None or all((directory / name).is_file() for name in
@@ -296,6 +305,9 @@ def run_policy(opt, identity, policy, *, variant=None, provenance=None,
         criterion.old_ids = list(args.owod_previous_class_ids)
     args.discovery_version = policy
     args.discovery_policy = f'v{policy}'
+    # The parent was strictly validated with its original supervision above.
+    # This diagnostic-only change is persisted for exact model reconstruction.
+    args.discovery_negative_policy = criterion.negative_policy = negative_policy
     args.diagnostic_only = True
     args.paper_comparable_protocol = False
     criterion.revision = policy
@@ -371,6 +383,7 @@ def run_policy(opt, identity, policy, *, variant=None, provenance=None,
                     raise ValueError('Paired runs must start with identical weights and memory')
             write(directory / 'initialization.json', dict(state_sha256=digest, routing=variant,
                   localization=localization, run_name=directory.name,
+                  discovery_negative_policy=negative_policy,
                   diagnostic_only=True, parent_checkpoint_sha256=identity['checkpoint_sha256']))
         criterion.epoch = 0
         write(directory / 'initial_metrics.json', evaluate_now())

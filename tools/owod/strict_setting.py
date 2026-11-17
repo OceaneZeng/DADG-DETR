@@ -7,6 +7,8 @@ from tools.owod.protocol import (file_sha256, resolve_image_root, stage_files,
 
 
 def configure_run(args):
+    if getattr(args, 'discovery_negative_policy', 'dense') != 'dense':
+        raise ValueError('Experimental discovery negative policy requires the paired Task 2 diagnostic launcher')
     if getattr(args, 'screen_no_distill', False) and not (
             getattr(args, 'owod_screening', '') and getattr(args, 'screen_branch_checkpoint', '')
             and args.owod_stage == 1 and getattr(args, 'owod_discovery', False)):
@@ -162,9 +164,10 @@ def validate_checkpoint(args, checkpoint, resume=False):
                       'discovery_no_transfer', 'discovery_no_keep', 'discovery_capacity', 'discovery_min_support',
                       'discovery_transfer_threshold', 'discovery_warmup', 'discovery_top_k',
                       'discovery_saliency_threshold', 'discovery_consistency_threshold',
-                      'discovery_trusted_background_negative',
+                      'discovery_trusted_background_negative', 'discovery_negative_policy',
                       'distill_class_coef', 'distill_bbox_coef', 'distill_score_threshold', 'distill_max_queries'):
-            default = False if field == 'discovery_trusted_background_negative' else None
+            default = (False if field == 'discovery_trusted_background_negative' else
+                       'dense' if field == 'discovery_negative_policy' else None)
             if getattr(saved, field, default) != getattr(args, field, default):
                 raise ValueError(f'Discovery checkpoint cannot change {field}')
     if bool(getattr(saved, 'graph_routed_adapter', False)) != bool(getattr(args, 'graph_routed_adapter', False)):
