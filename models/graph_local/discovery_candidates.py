@@ -140,6 +140,8 @@ def mine_candidates(outputs, targets, indices, known_ids, teacher=None, top_k=5,
             confident &= teacher_saliency[batch, maps[batch].clamp_min(0)] >= saliency_threshold
         ranked = torch.where(confident)[0]
         quality = saliency[batch] * consistency[batch] * semantic[batch]
+        if 'geometry_quality' in outputs:
+            quality = quality * outputs['geometry_quality'][batch].detach()
         ranked = ranked[torch.argsort(quality[ranked], descending=True)]
         chosen = []
         for query in ranked:

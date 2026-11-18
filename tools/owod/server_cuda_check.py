@@ -27,6 +27,9 @@ def main():
     try:
         args = get_args_parser().parse_args([])
         args.no_pretrained_backbone = True
+        if '--instances' in sys.argv[1:]:
+            args.instance_mode = 'matched'
+            args.owod_stage = 1
         args.hidden_dim, args.dim_feedforward = 64, 128
         args.enc_layers, args.dec_layers, args.num_queries = 1, 2, 8
         args.graph_adapter_last_n = 1
@@ -49,6 +52,11 @@ def main():
         samples = nested_tensor_from_tensor_list([torch.rand(3, 128, 128, device='cuda')])
         targets = [dict(labels=torch.tensor([3], device='cuda'),
                         boxes=torch.tensor([[.5, .5, .3, .3]], device='cuda'))]
+        if getattr(args, 'instance_mode', 'legacy') == 'matched':
+            targets[0].update(image_id=torch.tensor([rank], device='cuda'),
+                              source_objects=torch.tensor([0], device='cuda'))
+            # Rank one intentionally has no target. Both ranks must reduce the alignment weight.
+            criterion.instance_targets = {(0, 0, 3): ([1.] * 64, .8)}
         for _ in range(2):
             optimizer.zero_grad(set_to_none=True)
             outputs = ddp(samples)

@@ -58,6 +58,9 @@ def build_plan(args):
         raise FileNotFoundError(args.backbone_weights)
     image_root = resolve_image_root(args.manifest, manifest)
     method = getattr(args, 'method', 'control')
+    instance_mode = getattr(args, 'instance_mode', 'legacy')
+    if instance_mode != 'legacy' and method != 'discovery':
+        raise ValueError('Instance transfer requires --method discovery')
     control_lr_scale = getattr(args, 'control_lr_scale', 1.)
     if not math.isfinite(control_lr_scale) or not 0 < control_lr_scale <= 1:
         raise ValueError('control-lr-scale must be finite and in (0, 1]')
@@ -201,6 +204,8 @@ def build_plan(args):
                            if c in set(record['active_classes']) - set(record['classes'])]
                     command += ['--old-class-distillation', '--distill-old-class-ids', *map(str, old)]
             if method.startswith('discovery'):
+                if instance_mode != 'legacy':
+                    command += ['--instance-mode', instance_mode]
                 if no_distill:
                     command += ['--screen-no-distill']
                 command += ['--owod-discovery', '--discovery-scoring', getattr(args, 'discovery_scoring', 'hierarchical')]
@@ -302,6 +307,7 @@ def get_args_parser():
     parser.add_argument('--graph-route-loss-coef', type=float, default=1.0)
     parser.add_argument('--graph-routing', choices=('hard', 'soft'), default='hard')
     parser.add_argument('--graph-localization', choices=('frozen', 'bbox-last'), default='frozen')
+    parser.add_argument('--instance-mode', choices=('legacy','matched','off','shuffled'),default='legacy')
     parser.add_argument('--discovery-scoring', choices=('hierarchical', 'focal'), default='hierarchical')
     parser.add_argument('--discovery-pseudo-ramp-epochs', type=int, default=0,
                         help='Experimental v6 pseudo loss ramp after warmup; default 0 keeps v5')

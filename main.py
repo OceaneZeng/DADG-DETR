@@ -100,6 +100,10 @@ def get_args_parser():
 
     parser.add_argument('--owod-manifest', default='',
                         help='S-OWODB/M-OWODB split manifest used for this run')
+    parser.add_argument('--instance-mode', choices=('legacy','matched','shuffled','off'), default='legacy')
+    parser.add_argument('--instance-cache', default='', help='Shared frozen-parent retrieval cache')
+    parser.add_argument('--screen-author-eval', action='store_true',
+                        help='Evaluate a diagnostic training subset on the full author test set')
     parser.add_argument('--owod-screening', default='',
                         help='Verified training-only diagnostic selection; not an official benchmark run')
     parser.add_argument('--screen-branch-checkpoint', default='',
@@ -495,12 +499,30 @@ def main(args):
                 from tools.owod.graph_adaptation import collect_promotion_features
                 means, route_means = collect_promotion_features(model_without_ddp, criterion, args)
                 model_without_ddp.promote(means, spec, route_means)
+                if args.instance_mode != 'legacy':
+                    from models.graph_local.instance_transfer import stage_evidence
+                    parent = teacher_model
+                    if parent is None:
+                        from tools.owod.gnn_calibration import load_detector
+                        parent, _ = load_detector(args, Path(args.pretrained), device)
+                    spec['instances'] = stage_evidence(parent, criterion, args, graph_source, spec)
+                    del parent
             args.graph_adapter_specs.append(spec)
         classifier_hook_handles = configure_trainable(
             model_without_ddp, args.owod_current_class_ids, args.owod_known_class_ids,
             finetune=args.owod_phase == 'finetune', localization=args.graph_localization)
         criterion.weight_dict['loss_adapter_route'] = args.graph_route_loss_coef
-        print('Graph-routed adapter layout:', json.dumps(args.graph_adapter_specs, sort_keys=True))
+        if args.instance_mode != 'legacy':
+            from models.graph_local.instance_transfer import configure_targets
+            layout = args.graph_adapter_specs[-1]
+            evidence = layout['instances']
+            swapped = configure_targets(criterion, evidence, args.instance_mode)
+            layout['alignment_summary'] = dict(accepted=evidence['accepted'],
+                classes=evidence['accepted_classes'], localized=evidence['localized'],
+                applied=len(criterion.instance_targets), shuffled_across_slots=swapped)
+            print('Instance alignment:', layout['alignment_summary'], flush=True)
+        else:
+            print('Graph-routed adapter layout:', json.dumps(args.graph_adapter_specs, sort_keys=True))
 
     if args.owod_discovery:
         model_without_ddp.train_discovery()
@@ -763,7 +785,7 @@ def main(args):
     if args.output_dir and utils.is_main_process():
         structured_log = experiment_log_path(output_dir, "metrics.jsonl")
         prepare_log_file(structured_log, append=bool(args.resume))
-        if args.initialization_audit and resumed_test_stats is not None:
+        if (args.initialization_audit or args.screen_author_eval) and resumed_test_stats is not None:
             from tools.owod.paired_initialization import recover_final_evaluation
             recover_final_evaluation(structured_log, args, resumed_test_stats, n_parameters)
         completion_marker = output_dir / 'training_complete.json'

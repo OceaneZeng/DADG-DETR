@@ -175,6 +175,9 @@ class DeformableTransformer(nn.Module):
             query_embed = query_embed.unsqueeze(0).expand(bs, -1, -1)
             tgt = tgt.unsqueeze(0).expand(bs, -1, -1)
             reference_points = self.reference_points(query_embed).sigmoid()
+            if hasattr(self, "instance_proposals"):
+                query_embed, tgt, reference_points, proposal_state = self.instance_proposals(
+                    memory, masks, query_embed, tgt, reference_points)
             init_reference_out = reference_points
 
         # decoder
@@ -197,6 +200,8 @@ class DeformableTransformer(nn.Module):
                     location_hs, location_references)
         if self.two_stage:
             return hs, init_reference_out, inter_references_out, enc_outputs_class, enc_outputs_coord_unact
+        if hasattr(self, "instance_proposals"):
+            return hs, init_reference_out, inter_references_out, proposal_state, None
         return hs, init_reference_out, inter_references_out, None, None
 
 

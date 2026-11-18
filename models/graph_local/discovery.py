@@ -92,13 +92,25 @@ class DiscoveryDetector(nn.Module):
         self.feature_grad_scale = getattr(args, 'discovery_feature_grad_scale', 1.)
         if not math.isfinite(self.feature_grad_scale) or not 0 <= self.feature_grad_scale <= 1:
             raise ValueError('discovery_feature_grad_scale must be finite and in [0, 1]')
+        self.instance_mode = getattr(args, 'instance_mode', 'legacy')
+        if self.instance_mode != 'legacy':
+            from .instance_proposals import InstanceProposals
+            from .instance_transfer import SETTINGS
+            if detector.two_stage:
+                raise ValueError('Mixed instance proposals require one-stage decoder queries')
+            # Isolate initialization so common detector and discovery parameters start identically.
+            with torch.random.fork_rng(devices=[]):
+                detector.transformer.instance_proposals = InstanceProposals(args.hidden_dim)
+                self.instance_projection = nn.Linear(args.hidden_dim, SETTINGS['projection_dim'])
+                self.instance_classes = nn.Linear(SETTINGS['projection_dim'], args.num_classes)
+            self.transfer_enabled = False
         detector.return_baseline_features = True
         self.memory = PrototypeMemory(args.hidden_dim, args.discovery_capacity)
         self.affinity_graph = AffinityGraph(
             args.hidden_dim, use_messages=not getattr(args, 'discovery_no_message', False))
         for layer in target_decoder_layers(self, args.graph_adapter_last_n):
             layer.discovery_adapter = DiscoveryFFN(args.hidden_dim, args.graph_adapter_rank,
-                                                   args.discovery_capacity)
+                                                   args.discovery_capacity if self.instance_mode == 'legacy' else 0)
 
     def forward(self, samples, *, teacher_purpose=None):
         from util.misc import NestedTensor, nested_tensor_from_tensor_list
@@ -114,6 +126,10 @@ class DiscoveryDetector(nn.Module):
             return {key: outputs[key] for key in ('pred_logits', 'pred_boxes')}
         features = outputs.pop('decoder_features')[-1]
         outputs['query_features'] = features
+        if self.instance_mode != 'legacy':
+            z = F.normalize(self.instance_projection(features), dim=-1)
+            outputs['instance_features'] = z
+            outputs['instance_logits'] = self.instance_classes(z)
         outputs.update(self.affinity_graph(scale_gradient(features, self.feature_grad_scale), self.memory))
         routes, route_inputs = self._discovery_routes()
         if teacher_purpose is None:
@@ -123,8 +139,11 @@ class DiscoveryDetector(nn.Module):
         outputs['image_sizes'] = [(int((~mask).any(1).sum()), int((~mask).any(0).sum())) for mask in masks]
         if teacher_purpose == 'discovery':
             # Keep the graph embedding: cross-view consistency consumes it.
-            return {key: outputs[key] for key in ('pred_boxes', 'query_features',
-                    'attention_feature', 'padded_size', 'image_sizes', 'discovery_embedding')}
+            keys = ['pred_boxes', 'query_features', 'attention_feature', 'padded_size',
+                    'image_sizes', 'discovery_embedding']
+            if self.instance_mode != 'legacy':
+                keys.append('instance_features')
+            return {key: outputs[key] for key in keys}
         return outputs
 
     def _discovery_routes(self):
@@ -160,14 +179,14 @@ class DiscoveryDetector(nn.Module):
                 raise ValueError('Prototype update received unreleased semantic labels')
             slots = self.memory.observe(features, labels, weights)
             for module in self.modules():
-                if isinstance(module, DiscoveryFFN):
+                if isinstance(module, DiscoveryFFN) and self.instance_mode == 'legacy':
                     module.snapshot(slots)
         if distributed:
             # All model buffers (including anonymous snapshots) remain identical.
             for buffer in self.memory.buffers():
                 torch.distributed.broadcast(buffer, 0)
             for module in self.modules():
-                if isinstance(module, DiscoveryFFN):
+                if isinstance(module, DiscoveryFFN) and self.instance_mode == 'legacy':
                     torch.distributed.broadcast(module.snapshot_down, 0)
                     torch.distributed.broadcast(module.snapshot_up, 0)
 
@@ -184,6 +203,8 @@ class DiscoveryDetector(nn.Module):
                     row = spec['class_ids'].index(class_id)
                     branch.router.weight[row].copy_(4 * centroid / centroid.square().sum().clamp_min(1e-6))
                     branch.router.bias[row] = -2.
+            if self.instance_mode != 'legacy':
+                continue  # The class router is initialized above; v10 learns from instance targets.
             similarity = self.affinity_graph.similarities(
                 feature[None], self.memory.centers[self.memory.known_slots:])[0]
             selected = torch.where(valid & (similarity >= self.transfer_threshold))[0]
@@ -293,6 +314,13 @@ class DiscoveryCriterion(nn.Module):
         self.top_k = args.discovery_top_k
         self.saliency_threshold = args.discovery_saliency_threshold
         self.consistency_threshold = args.discovery_consistency_threshold
+        self.instance_mode = getattr(args, 'instance_mode', 'legacy')
+        self.instance_targets = {}
+        self.train_instance_projection = getattr(args, 'owod_stage', 0) == 0
+        if self.instance_mode != 'legacy':
+            from .instance_transfer import SETTINGS
+            self.weight_dict.update(loss_geometry=1., loss_instance_class=.2,
+                                    loss_instance_view=.2, loss_instance_align=SETTINGS['alignment_weight'])
         self.epoch = 0
         self.evidence = None
         self.weight_dict.update(loss_objectness=1., loss_unknown=1., loss_discovery_route=1.,
@@ -302,10 +330,14 @@ class DiscoveryCriterion(nn.Module):
 
     def forward(self, outputs, targets):
         # Unknown GT in full evaluation annotations is never visible to losses.
-        targets = [{**target, 'labels': target['labels'][torch.isin(target['labels'],
-                    target['labels'].new_tensor(self.known_ids))],
-                    'boxes': target['boxes'][torch.isin(target['labels'],
-                    target['labels'].new_tensor(self.known_ids))]} for target in targets]
+        released = []
+        for target in targets:
+            keep = torch.isin(target['labels'], target['labels'].new_tensor(self.known_ids))
+            filtered = {**target, 'labels': target['labels'][keep], 'boxes': target['boxes'][keep]}
+            if 'source_objects' in target:
+                filtered['source_objects'] = target['source_objects'][keep]
+            released.append(filtered)
+        targets = released
         indices = self.matcher(outputs, targets)
         teacher = outputs.get('discovery_teacher') if self.training and self.epoch >= self.warmup else None
         with scope('candidates'):
@@ -404,6 +436,32 @@ class DiscoveryCriterion(nn.Module):
                         - teacher_boxes).abs().sum(-1)
             consistency = ((feature_cost + box_cost) * confidence).sum() / confidence.sum().clamp_min(1)
         losses['loss_discovery_consistency'] = consistency * pseudo_scale if self.pseudo_ramp_epochs else consistency
+        if self.instance_mode != 'legacy':
+            from .instance_proposals import geometry_loss
+            from .instance_transfer import alignment_loss
+            z = outputs['instance_features']
+            scores = outputs['instance_logits'][positive][:, self.known_ids]
+            labels = semantic[positive]
+            columns = (labels[:, None] == labels.new_tensor(self.known_ids)).long().argmax(-1)
+            losses['loss_instance_class'] = (F.cross_entropy(scores, columns) if len(labels) and self.train_instance_projection
+                                             else scores.sum()*0)
+            losses['loss_geometry'] = geometry_loss(outputs['geometry'], targets)
+            if len(labels):
+                from .instance_transfer import paired_iou
+                gt_boxes = torch.cat([t['boxes'][g] for t, (_,g) in zip(targets, indices)])
+                # Keep the matcher's order for both operands, independently of query indexing order.
+                refined = torch.cat([outputs['pred_boxes'][i,q] for i,(q,_) in enumerate(indices)])
+                quality = torch.cat([outputs['geometry_quality'][i,q] for i,(q,_) in enumerate(indices)])
+                losses['loss_geometry'] += F.binary_cross_entropy(
+                    quality.clamp(1e-6,1-1e-6), paired_iou(refined.detach(),gt_boxes).clamp(0,1))
+            losses['loss_instance_view'] = z.sum()*0
+            if teacher is not None:
+                teacher_z = teacher['instance_features'][batch_ids, maps.clamp_min(0)].detach()
+                cost = 1 - F.cosine_similarity(z, teacher_z, dim=-1)
+                losses['loss_instance_view'] = (cost*confidence).sum()/confidence.sum().clamp_min(1.)
+            losses['loss_instance_align'], losses['discovery_alignment_count'] = (
+                alignment_loss(z, targets, indices, self.instance_targets)
+                if self.training and self.instance_targets else (z.sum()*0, z.new_zeros(())))
         affinity = outputs['affinities']
         anchor = positive & (affinity.amax(-1) > -100)
         # The correct known prototype must exist; invalid anchors cannot be targets.

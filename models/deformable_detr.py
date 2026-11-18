@@ -189,6 +189,10 @@ class DeformableDETR(nn.Module):
         outputs_coord = torch.stack(outputs_coords)
 
         out = {'pred_logits': outputs_class[-1], 'pred_boxes': outputs_coord[-1]}
+        if hasattr(self.transformer, 'instance_proposals'):
+            out['geometry'] = enc_outputs_class
+            out['geometry_quality'] = self.transformer.instance_proposals.refined_quality(
+                enc_outputs_class, out['pred_boxes']).sigmoid()
         from .graph_local.routed_adapter import routing_outputs
         routes = routing_outputs(self)
         if routes:

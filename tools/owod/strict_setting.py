@@ -7,6 +7,11 @@ from tools.owod.protocol import (file_sha256, resolve_image_root, stage_files,
 
 
 def configure_run(args):
+    instance_mode = getattr(args, 'instance_mode', 'legacy')
+    if instance_mode != 'legacy' and not getattr(args, 'owod_discovery', False):
+        raise ValueError('Instance transfer requires discovery')
+    if getattr(args, 'screen_author_eval', False) and not getattr(args, 'owod_screening', ''):
+        raise ValueError('screen-author-eval requires a verified diagnostic training subset')
     risk_mode = getattr(args, 'graph_risk_mode', 'learned')
     compute = getattr(args, 'graph_adapter_compute', 'loop')
     if risk_mode not in ('learned', 'disabled') or compute not in ('loop', 'batched'):
@@ -60,6 +65,10 @@ def configure_run(args):
                                   DISCOVERY_STABILITY_VERSION if stability_experiment else
                                   DISCOVERY_LOSS_VERSION if loss_experiment else
                                   DISCOVERY_RAMP_VERSION if ramp_epochs else DISCOVERY_VERSION)
+        if instance_mode != 'legacy':
+            from models.graph_local.instance_transfer import SETTINGS
+            args.discovery_version = 10
+            args.instance_settings = dict(SETTINGS)
         args.graph_routed_adapter = True
     if getattr(args, 'initialization_audit', '') and not (
             getattr(args, 'owod_discovery', False) and args.owod_stage == 0
@@ -138,6 +147,9 @@ def configure_run(args):
         args.paper_comparable_protocol = False
         args.owod_evaluation = {**manifest['evaluation'], 'known_only_screening': True,
                                'image_source_ids': screen['heldout_source_ids']}
+        if getattr(args, 'screen_author_eval', False):
+            args.val_ann = str(files['full_val'])
+            args.owod_evaluation = manifest['evaluation']
     if getattr(args, 'owod_discovery', False):
         if (args.discovery_capacity < 1 or args.discovery_top_k < 1 or args.discovery_warmup < 0
                 or not math.isfinite(args.discovery_min_support) or args.discovery_min_support <= 0
@@ -175,6 +187,13 @@ def validate_checkpoint(args, checkpoint, resume=False):
     saved = checkpoint.get('args')
     if bool(getattr(saved, 'initialization_audit', '')) != bool(getattr(args, 'initialization_audit', '')):
         raise ValueError('Cannot mix paired Task 1 diagnostic checkpoints and formal chains')
+    if getattr(saved, 'screen_author_eval', False) != getattr(args, 'screen_author_eval', False):
+        raise ValueError('Screen evaluation source changed')
+    before, after = getattr(saved, 'instance_mode', 'legacy'), getattr(args, 'instance_mode', 'legacy')
+    fork = (not resume and getattr(saved, 'owod_stage', None) == 0 and args.owod_stage == 1
+            and args.owod_phase == 'increment' and before != 'legacy' and after != 'legacy')
+    if (before != after and not fork) or getattr(saved, 'instance_settings', {}) != getattr(args,'instance_settings', {}):
+        raise ValueError('Instance model, matching settings or training arm changed')
     shared_parent = bool(getattr(args, 'screen_branch_checkpoint_sha256', None))
     branching = (shared_parent and not resume and args.owod_stage == 1
                  and args.owod_phase == 'increment' and getattr(saved, 'owod_stage', None) == 0

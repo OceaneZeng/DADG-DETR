@@ -29,11 +29,11 @@ import datasets.transforms as T
 
 class CocoDetection(TvCocoDetection):
     def __init__(self, img_folder, ann_file, transforms, return_masks, cache_mode=False,
-                 local_rank=0, local_size=1, proposal_file=None):
+                 local_rank=0, local_size=1, proposal_file=None, source_objects=False):
         super(CocoDetection, self).__init__(img_folder, ann_file,
                                             cache_mode=cache_mode, local_rank=local_rank, local_size=local_size)
         self._transforms = transforms
-        self.prepare = ConvertCocoPolysToMask(return_masks)
+        self.prepare = ConvertCocoPolysToMask(return_masks, source_objects)
         self.proposal_enabled = bool(proposal_file)
         self.proposal_file = str(proposal_file) if proposal_file else ''
         self._proposal_connection = None
@@ -100,8 +100,9 @@ def convert_coco_poly_to_mask(segmentations, height, width):
 
 
 class ConvertCocoPolysToMask(object):
-    def __init__(self, return_masks=False):
+    def __init__(self, return_masks=False, source_objects=False):
         self.return_masks = return_masks
+        self.source_objects = source_objects
 
     def __call__(self, image, target):
         w, h = image.size
@@ -146,6 +147,10 @@ class ConvertCocoPolysToMask(object):
         target = {}
         target["boxes"] = boxes
         target["labels"] = classes
+        if self.source_objects:
+            # VOC source IDs end in the object index, COCO uses integer annotation IDs.
+            ids = [int(str(obj["owod_source_annotation_id"]).rsplit(":", 1)[-1]) for obj in anno]
+            target["source_objects"] = torch.tensor(ids, dtype=torch.long)[keep]
         if self.return_masks:
             target["masks"] = masks
         target["image_id"] = image_id
@@ -244,5 +249,6 @@ def build(image_set, args):
                                 getattr(args, 'no_random_crop', False)),
                             return_masks=args.masks,
                             cache_mode=args.cache_mode, local_rank=get_local_rank(), local_size=get_local_size(),
-                            proposal_file=proposal_file)
+                            proposal_file=proposal_file,
+                            source_objects=getattr(args, "instance_mode", "legacy") != "legacy")
     return dataset

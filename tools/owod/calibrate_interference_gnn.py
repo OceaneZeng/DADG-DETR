@@ -25,7 +25,7 @@ from tools.owod.gnn_calibration import (build_calibration_dataset, class_loss,
                                         compute_gradient_sketches, atomic_torch_save,
                                         empirical_harm_row, load_detector,
                                         run_source_probe, set_seed)
-from tools.owod.protocol import stage_files, file_sha256
+from tools.owod.protocol import stage_files, file_sha256, resolve_image_root
 from main import load_local_checkpoint
 from util.experiment_log import start_file_logging, stop_file_logging
 import util.misc as utils
@@ -249,7 +249,7 @@ def run(args: argparse.Namespace) -> int:
         "protocol_validation": checked_manifest.get("validation_mode", "official"),
         "paper_comparable": bool(checked_manifest.get("paper_comparable", False)),
     }, indent=2))
-    dataset = build_calibration_dataset(Path(checked_manifest['image_root']), annotation,
+    dataset = build_calibration_dataset(resolve_image_root(args.manifest, checked_manifest), annotation,
                                         lightweight=args.lightweight)
     model, criterion = load_detector(args, args.checkpoint, device)
     criterion.active_class_ids = class_ids

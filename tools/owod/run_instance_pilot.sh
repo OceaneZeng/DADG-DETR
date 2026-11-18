@@ -1,0 +1,21 @@
+#!/usr/bin/env bash
+set -euo pipefail
+cd "$(dirname "${BASH_SOURCE[0]}")/../.."
+python_bin="${TREE_DETR_PYTHON:-/home/top/disks/new-hdd/conda_envs/tree-detr/bin/python}"
+if [[ ! -x "$python_bin" ]]; then
+  echo "Set TREE_DETR_PYTHON to the Python executable in the tree-detr environment." >&2
+  exit 1
+fi
+env_dir="$(cd "$(dirname "$python_bin")/.." && pwd)"
+export PATH="$env_dir/bin:$PATH"
+export LD_LIBRARY_PATH="$env_dir/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+export CUDA_DEVICE_ORDER=PCI_BUS_ID
+export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1}"
+export OMP_NUM_THREADS=2
+export PYTHONUNBUFFERED=1
+export PYTHONPATH="$PWD/models/ops:$PWD${PYTHONPATH:+:$PYTHONPATH}"
+if [[ ${1:-} == --plan ]]; then
+  exec "$python_bin" tools/owod/run_instance_pilot.py "$@"
+fi
+mkdir -p output/m-instance-pilot
+"$python_bin" -u tools/owod/run_instance_pilot.py "$@" 2>&1 | tee -a output/m-instance-pilot/console.log

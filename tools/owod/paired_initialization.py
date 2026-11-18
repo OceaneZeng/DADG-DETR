@@ -90,7 +90,8 @@ def audit_initialization(model, args):
 
 def recover_final_evaluation(log, args, stats, n_parameters):
     """Recover checkpoint-before-evaluation interruption at the fixed pause."""
-    if not args.pause_after_epochs or args.start_epoch != args.pause_after_epochs:
+    endpoint = args.epochs if getattr(args,'screen_author_eval',False) else args.pause_after_epochs
+    if not endpoint or args.start_epoch != endpoint:
         return
     text = Path(log).read_text(encoding='utf-8') if Path(log).is_file() else ''
     rows = [json.loads(line) for line in text.splitlines() if line.strip()]

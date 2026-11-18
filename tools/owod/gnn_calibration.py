@@ -22,6 +22,12 @@ from models.graph_local.losses import weighted_detection_loss
 import util.misc as utils
 
 
+def controller_loss(losses, weights):
+    # Keep the empirical harm probe on the pre-existing detection/discovery objective.
+    extra = {'loss_geometry', 'loss_instance_view', 'loss_instance_class', 'loss_instance_align'}
+    return weighted_detection_loss(losses, {name: weight for name, weight in weights.items() if name not in extra})
+
+
 def flatten_gradients(gradients: Iterable[torch.Tensor | None],
                       parameters: Sequence[torch.Tensor]) -> torch.Tensor:
     chunks = []
@@ -47,7 +53,7 @@ def set_seed(seed: int) -> None:
 
 
 def build_calibration_dataset(coco_path: Path, annotation: Path,
-                              lightweight: bool = False) -> CocoDetection:
+                              lightweight: bool = False, source_objects: bool = False) -> CocoDetection:
     """Read train images with deterministic transforms for comparable losses."""
     return CocoDetection(
         coco_path,
@@ -56,7 +62,7 @@ def build_calibration_dataset(coco_path: Path, annotation: Path,
         return_masks=False,
         cache_mode=False,
         local_rank=0,
-        local_size=1,
+        local_size=1, source_objects=source_objects,
     )
 
 
@@ -165,7 +171,7 @@ def compute_class_gradient_sketch(
         batch_count = sum(int(target["labels"].numel()) for target in filtered)
         if batch_count == 0:
             continue
-        scalar = weighted_detection_loss(
+        scalar = controller_loss(
             criterion(model(samples), filtered), criterion.weight_dict)
         gradients = torch.autograd.grad(scalar, weights, allow_unused=True)
         vector = flatten_gradients(gradients, weights).detach().cpu()
@@ -239,7 +245,7 @@ def class_loss(model: torch.nn.Module, criterion: torch.nn.Module,
             count = sum(int(target["labels"].numel()) for target in filtered)
             if count == 0:
                 continue
-            value = weighted_detection_loss(
+            value = controller_loss(
                 criterion(model(samples), filtered), criterion.weight_dict)
             total += float(value.item()) * count
             matched += count
@@ -271,7 +277,7 @@ def run_source_probe(base_model: torch.nn.Module, criterion: torch.nn.Module,
                 samples = samples.to(device)
                 targets = move_targets(targets, device)
                 filtered = [target_for_class(target, source_class) for target in targets]
-                objective = weighted_detection_loss(
+                objective = controller_loss(
                     criterion(probe(samples), filtered), criterion.weight_dict)
                 optimizer.zero_grad(set_to_none=True)
                 objective.backward()
