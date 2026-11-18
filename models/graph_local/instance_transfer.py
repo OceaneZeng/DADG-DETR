@@ -30,12 +30,20 @@ SETTINGS = dict(
 )
 
 
+def bank_settings(expanded=False):
+    settings = dict(SETTINGS)
+    if expanded:
+        settings.update(bank_images=4096, slots=32, per_slot=8)
+    return settings
+
+
 def paired_iou(boxes, truth):
     return box_iou(box_cxcywh_to_xyxy(boxes), box_cxcywh_to_xyxy(truth))[0].diagonal()
 
 
 class Representatives:
-    def __init__(self):
+    def __init__(self, settings=None):
+        self.settings = SETTINGS if settings is None else settings
         self.slots = []
 
     def add(self, feature, image, confidence, quality):
@@ -46,15 +54,15 @@ class Representatives:
             )
             similarities = centers @ feature
             index = int(similarities.argmax())
-            if similarities[index] >= SETTINGS["slot_cosine"] or len(self.slots) == SETTINGS["slots"]:
+            if similarities[index] >= self.settings["slot_cosine"] or len(self.slots) == self.settings["slots"]:
                 slot = self.slots[index]
-                if similarities[index] < SETTINGS["slot_cosine"]:
+                if similarities[index] < self.settings["slot_cosine"]:
                     return
                 same = next((j for j, e in enumerate(slot) if e[0] == image), None)
                 if same is not None:
                     if confidence > slot[same][2]:
                         slot[same] = entry
-                elif len(slot) < SETTINGS["per_slot"]:
+                elif len(slot) < self.settings["per_slot"]:
                     slot.append(entry)
                 else:
                     weakest = min(range(len(slot)), key=lambda j: slot[j][2])
@@ -67,22 +75,22 @@ class Representatives:
         candidates = []
         for index, slot in enumerate(self.slots):
             entries = [e for e in slot if e[0] != image]
-            if len(entries) < SETTINGS["independent_images"]:
+            if len(entries) < self.settings["independent_images"]:
                 continue
             vectors = torch.stack([e[1] for e in entries])
             center = F.normalize(vectors.mean(0), dim=0)
             scores = vectors @ feature
-            selected = scores >= SETTINGS["min_similarity"]
-            if selected.sum() < SETTINGS["independent_images"]:
+            selected = scores >= self.settings["min_similarity"]
+            if selected.sum() < self.settings["independent_images"]:
                 continue
             weights = (scores[selected] / 0.1).softmax(0)
             target = F.normalize(weights @ vectors[selected], dim=0)
             sources = [entry[0] for entry, keep in zip(entries, selected.tolist()) if keep]
             candidates.append((float(center @ feature), index, target, sources, weights.tolist()))
         candidates.sort(key=lambda item: -item[0])
-        if not candidates or candidates[0][0] < SETTINGS["min_similarity"]:
+        if not candidates or candidates[0][0] < self.settings["min_similarity"]:
             return None
-        if len(candidates) > 1 and candidates[0][0] - candidates[1][0] < SETTINGS["margin"]:
+        if len(candidates) > 1 and candidates[0][0] - candidates[1][0] < self.settings["margin"]:
             return None
         return candidates[0]
 
@@ -116,14 +124,17 @@ def calibration(parent, criterion, args, payload):
     previous = args.owod_stage - 1
     ema = make_ema(parent)
     ema.load_state_dict(payload["discovery_ema"], strict=True)
-    bank = Representatives()
+    settings = args.instance_settings
+    bank = Representatives(settings)
+    scanned_images = 0
     count = 0
     for images, targets in sample_loader(
-        args, previous, "increment_train" if previous == 0 else "train", SETTINGS["bank_images"]
+        args, previous, "increment_train" if previous == 0 else "train", settings["bank_images"]
     ):
         images = images.to(device)
         targets = move_targets(targets, device)
         out = parent(images)
+        scanned_images += len(targets)
         match = criterion.matcher(out, targets)
         other = ema.forward_teacher(flip_samples(images))
         mined = mine_candidates(
@@ -151,7 +162,7 @@ def calibration(parent, criterion, args, payload):
     groups = defaultdict(list)
     localized = 0
     for images, targets in sample_loader(
-        args, args.owod_stage, "increment_train", SETTINGS["query_images"]
+        args, args.owod_stage, "increment_train", settings["query_images"]
     ):
         targets = move_targets(targets, device)
         out = parent(images.to(device))
@@ -165,7 +176,7 @@ def calibration(parent, criterion, args, payload):
             gt = torch.as_tensor(gt, device=device)
             ious = overlap[q, gt]
             image = int(target["image_id"].item())
-            for idx in torch.where(ious >= SETTINGS["localization_iou"])[0].tolist():
+            for idx in torch.where(ious >= settings["localization_iou"])[0].tolist():
                 localized += 1
                 g = gt[idx]
                 result = bank.query(out["instance_features"][row, q[idx]].cpu(), image)
@@ -190,18 +201,19 @@ def calibration(parent, criterion, args, payload):
         support = defaultdict(list)
         for entry in entries:
             support[entry["image"]].append(entry["weight"])
-        if len(support) >= SETTINGS["independent_images"]:
+        if len(support) >= settings["independent_images"]:
             strength = sum(max(scores) for scores in support.values()) / len(support)
             claims[slot].append((strength, label, entries))
     for competing in claims.values():
         competing.sort(key=lambda item: -item[0])
-        if len(competing) == 1 or competing[0][0] - competing[1][0] >= SETTINGS["margin"]:
+        if len(competing) == 1 or competing[0][0] - competing[1][0] >= settings["margin"]:
             records.extend(competing[0][2])
     representatives = [
         [dict(image=i, feature=f.tolist(), weight=w, quality=q) for i, f, w, q in slot]
         for slot in bank.slots
     ]
     return dict(
+        bank_images_scanned=scanned_images,
         representatives=representatives,
         candidates=count,
         localized=localized,
@@ -219,7 +231,7 @@ def stage_evidence(parent, criterion, args, payload, spec):
         parent=spec["source_checkpoint_sha256"],
         manifest=args.owod_manifest_sha256,
         screen=getattr(args, "owod_screening_sha256", None),
-        settings=SETTINGS,
+        settings=args.instance_settings,
         seed=args.seed,
         stage=args.owod_stage,
         train=spec["training_annotation_sha256"],

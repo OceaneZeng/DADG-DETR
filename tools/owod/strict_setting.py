@@ -66,9 +66,9 @@ def configure_run(args):
                                   DISCOVERY_LOSS_VERSION if loss_experiment else
                                   DISCOVERY_RAMP_VERSION if ramp_epochs else DISCOVERY_VERSION)
         if instance_mode != 'legacy':
-            from models.graph_local.instance_transfer import SETTINGS
+            from models.graph_local.instance_transfer import bank_settings
             args.discovery_version = 10
-            args.instance_settings = dict(SETTINGS)
+            args.instance_settings = bank_settings(getattr(args, "expanded_instance_bank", False))
         args.graph_routed_adapter = True
     if getattr(args, 'initialization_audit', '') and not (
             getattr(args, 'owod_discovery', False) and args.owod_stage == 0

@@ -16,9 +16,9 @@ from tools.owod.screening_data import prepare_screen, write_json
 
 MANIFEST = ROOT / "data/owod/m-owodb/split_manifest.json"
 WEIGHTS = ROOT / "pretrained/dino_resnet50.pth"
-OUTPUT = ROOT / "output/m-instance-pilot"
+OUTPUT = ROOT / "output/m-instance-expanded"
 SCREEN = OUTPUT / "data/screening.json"
-EPOCHS = {"task1": 4, "increment": 3, "finetune": 1}
+EPOCHS = {"task1": 8, "increment": 3, "finetune": 1}
 METRICS = (
     "previous_ap50",
     "current_ap50",
@@ -30,7 +30,9 @@ METRICS = (
     "a_ose",
     "h_score",
 )
-TRAIN_IMAGES = 1536
+TASK1_IMAGES = 6144
+TASK2_IMAGES = 1536
+ARMS = ("matched", "off", "shuffled")
 
 
 def command(arm, phase, parent=None, gnn=None):
@@ -49,6 +51,7 @@ def command(arm, phase, parent=None, gnn=None):
         str(ROOT / "main.py"),
         "--instance-mode",
         arm,
+        "--expanded-instance-bank",
         "--instance-cache",
         str(OUTPUT / "retrieval"),
         "--owod-discovery",
@@ -194,7 +197,8 @@ def pilot():
 
     if torch.cuda.device_count() != 2 or any("3090" not in torch.cuda.get_device_name(i) for i in range(2)):
         raise RuntimeError("Select two RTX 3090 devices with CUDA_VISIBLE_DEVICES")
-    from models.graph_local.instance_transfer import SETTINGS
+    from models.graph_local.instance_transfer import bank_settings
+    from tools.owod.instance_coverage import task1_coverage
 
     commit = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=ROOT, text=True).strip()
     run(
@@ -220,19 +224,20 @@ def pilot():
             "--instances",
         ]
     )
-    screen = prepare_screen(MANIFEST, SCREEN.parent, TRAIN_IMAGES, 128, 42)
+    screen = prepare_screen(MANIFEST, SCREEN.parent, TASK1_IMAGES, 128, 42, task2_images=TASK2_IMAGES)
     identity = dict(
         commit=commit,
         manifest=file_sha256(MANIFEST),
         screen=file_sha256(screen),
         weights=file_sha256(WEIGHTS),
         epochs=EPOCHS,
-        instance_settings=SETTINGS,
+        instance_settings=bank_settings(expanded=True),
+        task2_arms=list(ARMS),
         devices=os.environ["CUDA_VISIBLE_DEVICES"],
         gpus=[torch.cuda.get_device_name(i) for i in range(2)],
         torch_version=str(torch.__version__),
         batch_per_device=2,
-        train_images=TRAIN_IMAGES,
+        increment_images=[TASK1_IMAGES, TASK2_IMAGES],
         seed=42,
         evaluation="official full M test, VOC integral AP50; fixed endpoints",
         finetune="entire author balanced memory",
@@ -252,63 +257,49 @@ def pilot():
         deltas=deltas,
         units="fractions; counts for unknown_predictions and a_ose",
     )
-    for parent_arm in ("legacy", "matched"):
-        t1, result = train(parent_arm, "task1")
-        rows[parent_arm] = {"task1": result}
-        from tools.owod.instance_coverage import task1_coverage
-
-        audit = OUTPUT / parent_arm / "task1" / "candidate_coverage.json"
-        if not audit.is_file():
-            write_json(audit, task1_coverage(t1, MANIFEST, SCREEN))
-        rows[parent_arm]["task1_coverage"] = read_json(audit)
+    parent, result = train("matched", "task1")
+    parent_dir = parent.parent
+    audit = parent_dir / "candidate_coverage.json"
+    if not audit.is_file():
+        write_json(audit, task1_coverage(parent, MANIFEST, SCREEN))
+    report["task1"] = dict(metrics=result, coverage=read_json(audit), checkpoint=str(parent))
+    report["common_parent_sha256"] = file_sha256(parent)
+    write_json(OUTPUT / "comparison.json", report)
+    gnn = calibrate("matched", parent)
+    report["common_gnn_sha256"] = file_sha256(gnn)
+    for arm in ARMS:
+        inc, increment = train(arm, "increment", parent, gnn)
+        layout = read_json(inc.parent / "graph_adapter_config.json")["specs"][-1]
+        evidence = layout["instances"]
+        if (layout["source_checkpoint_sha256"] != report["common_parent_sha256"]
+                or layout["gnn_sha256"] != report["common_gnn_sha256"]):
+            raise ValueError(f"{arm} did not use the planned Task 1 parent and GNN")
+        if arm == "matched":
+            report["evidence_sha256"] = evidence["cache_sha256"]
+            representatives = [entry for slot in evidence["representatives"] for entry in slot]
+            report["bank"] = dict(images_scanned=evidence["bank_images_scanned"],
+                                  occupied_slots=len(evidence["representatives"]),
+                                  representatives=len(representatives),
+                                  source_images=len({entry["image"] for entry in representatives}))
+        elif evidence["cache_sha256"] != report["evidence_sha256"]:
+            raise ValueError(f"{arm} did not use the shared frozen-parent evidence")
+        rows[arm] = dict(increment=increment, retrieval=layout["alignment_summary"])
         write_json(OUTPUT / "comparison.json", report)
-        gnn = calibrate(parent_arm, t1)
-        arms = ("legacy",) if parent_arm == "legacy" else ("matched", "off", "shuffled")
-        for arm in arms:
-            if arm != parent_arm:
-                if not report["retrieval"]["accepted"]:
-                    report["transfer_conclusion"] = "No accepted instances; transfer effect unmeasured"
-                    break
-                rows[arm] = {}
-            inc, rows[arm]["increment"] = train(arm, "increment", t1, gnn)
-            if arm != "legacy":
-                layout = read_json(OUTPUT / arm / "increment/graph_adapter_config.json")["specs"][-1]
-                summary = layout["alignment_summary"]
-                if arm == "matched":
-                    report["retrieval"] = summary
-                    report["common_parent_sha256"] = layout["source_checkpoint_sha256"]
-                    report["evidence_sha256"] = layout["instances"]["cache_sha256"]
-                elif (
-                    layout["source_checkpoint_sha256"] != report["common_parent_sha256"]
-                    or layout["instances"]["cache_sha256"] != report["evidence_sha256"]
-                ):
-                    raise ValueError("Paired arms used different parent or evidence")
-                if arm == "shuffled":
-                    report["shuffled_across_slots"] = summary["shuffled_across_slots"]
-            _, rows[arm]["finetune"] = train(arm, "finetune", inc, gnn)
-            if arm != "legacy":
-                ref, method = ("legacy", "matched") if arm == "matched" else (arm, "matched")
-                deltas[f"{method}_minus_{ref}"] = {
-                    phase: compare(rows, phase, method, ref) for phase in ("increment", "finetune")
-                }
-            write_json(OUTPUT / "comparison.json", report)
-    deltas["matched_minus_legacy"]["task1"] = compare(rows, "task1", "matched", "legacy")
-    if "shuffled" in rows:
-        active = rows["matched"]["increment"]["mean_alignment_count_per_rank_batch"]
-        if not active or not report["shuffled_across_slots"]:
-            report["transfer_conclusion"] = (
-                "Inconclusive: insufficient training exposure or distinct shuffled targets"
-            )
-        else:
-            improved = all(
-                deltas["matched_minus_" + ref]["finetune"]["current_ap50"] > 0
-                for ref in ("off", "shuffled")
-            )
-            report["transfer_conclusion"] = (
-                "Higher final Current AP50 than both controls in this pilot"
-                if improved
-                else "No consistent final Current AP50 advantage over both controls"
-            )
+        _, rows[arm]["finetune"] = train(arm, "finetune", inc, gnn)
+        if arm != "matched":
+            deltas[f"matched_minus_{arm}"] = {
+                phase: compare(rows, phase, "matched", arm) for phase in ("increment", "finetune")
+            }
+        write_json(OUTPUT / "comparison.json", report)
+
+    active = rows["matched"]["increment"]["mean_alignment_count_per_rank_batch"]
+    if not active or not rows["shuffled"]["retrieval"]["shuffled_across_slots"]:
+        report["transfer_conclusion"] = "Inconclusive: insufficient training exposure or distinct shuffled targets"
+    else:
+        improved = all(deltas["matched_minus_" + ref]["finetune"]["current_ap50"] > 0
+                       for ref in ("off", "shuffled"))
+        report["transfer_conclusion"] = ("Higher final Current AP50 than both controls in this pilot"
+            if improved else "No consistent final Current AP50 advantage over both controls")
     report["status"] = "complete"
     write_json(OUTPUT / "comparison.json", report)
     print(json.dumps(report, indent=2), flush=True)
@@ -318,10 +309,12 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--plan", action="store_true", help="show the schedule without training")
     if parser.parse_args().plan:
-        print(f"M-OWODB, 2 x RTX3090, {TRAIN_IMAGES} increment images per task; {EPOCHS}")
-        print(
-            "Task1 legacy/matched; Task2 legacy and shared-parent matched/off/shuffled; full author evaluation."
-        )
+        from models.graph_local.instance_transfer import bank_settings
+        bank = bank_settings(expanded=True)
+        print(f"M-OWODB, 2 x RTX 3090, batch 2 per GPU. One Task 1 parent: {TASK1_IMAGES} images x {EPOCHS['task1']} epochs.")
+        print(f"Bank: {bank['bank_images']} images, {bank['slots']} slots x {bank['per_slot']} representatives.")
+        print(f"Task 2: {', '.join(ARMS)}; each {TASK2_IMAGES} images x {EPOCHS['increment']} epochs + full author memory x {EPOCHS['finetune']}.")
+        print(f"Full M author evaluation at phase endpoints. Output: {OUTPUT}")
     else:
         import fcntl
 

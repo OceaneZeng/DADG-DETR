@@ -40,7 +40,8 @@ def validate_plan_arguments(run, saved):
                    'discovery_background_negative': False,
                    'initialization_audit': '',
                    'graph_risk_mode': 'learned', 'graph_adapter_compute': 'loop',
-                   'instance_mode': 'legacy', 'instance_cache': '', 'screen_author_eval': False}.get(field)
+                   'instance_mode': 'legacy', 'instance_cache': '', 'screen_author_eval': False,
+                   'expanded_instance_bank': False}.get(field)
         if getattr(saved, field, default) != value:
             raise ValueError(f'Saved checkpoint differs from launch arguments: {field}')
     world_size = int(command[command.index('--nproc_per_node') + 1]) if '--nproc_per_node' in command else 1

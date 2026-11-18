@@ -70,7 +70,7 @@ def merge_training(payloads):
             'annotations': [dict(ann, id=i + 1) for i, ann in enumerate(annotations.values())]}
 
 
-def prepare_screen(manifest_path, output, train_images=2000, val_images=400, seed=42):
+def prepare_screen(manifest_path, output, train_images=2000, val_images=400, seed=42, *, task2_images=None):
     manifest_path, output = Path(manifest_path).resolve(), Path(output).resolve()
     manifest, first = stage_files(manifest_path, 0)
     _, second = stage_files(manifest_path, 1)
@@ -81,15 +81,19 @@ def prepare_screen(manifest_path, output, train_images=2000, val_images=400, see
     # phase. Excluding released memory here keeps Task 2 finetuning intact.
     heldout = select_images(combined, val_images, manifest['stages'][1]['active_classes'], seed,
                             source_ids(memory))
-    selected = [select_images(data, train_images, manifest['stages'][stage]['classes'], seed, heldout)
+    budgets = (train_images, train_images if task2_images is None else task2_images)
+    selected = [select_images(data, budgets[stage], manifest['stages'][stage]['classes'], seed, heldout)
                 for stage, data in enumerate(inputs)]
     spec_path = output / 'screening.json'
     settings = dict(kind='training_only_screen', version=1, paper_comparable=False,
                     parent_manifest_sha256=file_sha256(manifest_path), protocol=manifest['protocol'],
                     seed=seed, train_images=train_images, val_images=val_images)
+    if task2_images is not None:
+        settings["task2_train_images"] = task2_images
     if spec_path.exists():
         saved = read_json(spec_path)
-        if any(saved.get(key) != value for key, value in settings.items()):
+        if (saved.get('task2_train_images') != task2_images or
+                any(saved.get(key) != value for key, value in settings.items())):
             raise ValueError('Screen settings changed; use a new screening output directory')
         for stage in range(2):
             screening_files(manifest_path, spec_path, stage)

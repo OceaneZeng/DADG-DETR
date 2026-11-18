@@ -49,16 +49,26 @@
 
 新版改变 Task 1 的候选、实例表示和 checkpoint 内容，正式实验从各协议相同的基础预训练起点另建任务链。已有权重、日志和作者均衡记忆可继续用于原方案对照。本文未给新增配额、阈值或损失权重指定实测最优值，也没有生成新版 AP。
 
-## M 分支实现与双 3090 小实验
+## M-OWODB 双 RTX 3090 迁移对照
 
-在服务器的 mowodb 仓库根目录运行以下命令。启动器默认选可见设备 0、1，使用服务器既有的 tree-detr 环境和已编译的 CUDA 扩展。数据为已准备的 schema-3 M-OWODB，预训练权重为 pretrained/dino_resnet50.pth。相同提交和输入下重新运行同一命令会接续已有阶段。
+本实验比较同一个 discovery v10 父模型在三种历史实例监督下的 Task 2 表现。使用 M 作者清单、DINO ResNet-50、seed 42、每卡 batch 2、focal 评分、soft 类别路由和旧类蒸馏。训练子集属于诊断配置。七个阶段末均使用完整 M 作者测试清单和 VOC 积分 AP50 评估。
+
+| 阶段 | 图像与预算 | 运行次数 |
+| --- | --- | --- |
+| Task 1 increment | 作者增量训练清单中固定选 6,144 张，训练 8 轮 | 一次，使用第 8 轮末权重 |
+| 历史实例库与 GNN | 用父模型及其 EMA 在上述训练图中固定扫描 4,096 张。最多 32 槽，每槽保留 8 个不同图像的实例代表 | 一次，三组共用 |
+| Task 2 increment | 固定 1,536 张增量训练图，训练 3 轮 | matched、off、shuffled 各一次 |
+| Task 2 balanced finetune | 完整作者均衡记忆清单 1,743 张，训练 1 轮 | 每组接自己的增量末轮权重 |
+
+matched 使用检索到的历史实例，off 关闭对齐损失，shuffled 在相同的已接受实例之间置换对齐目标并保留权重。三组均运行，程序核验父权重、GNN 与检索缓存 SHA256。匹配门槛沿用原方案，若有效匹配为零或未交换不同槽的目标，报告会将迁移收益标作证据不足。
+
+服务器仓库根目录执行下列命令。启动器使用现有 tree-detr 环境，默认 GPU 0、1。相同提交、输入和配置下重跑启动命令可续接中断阶段。
 
 ```bash
-tmux new -d -s m-instance 'bash tools/owod/run_instance_pilot.sh'
-tail -f output/m-instance-pilot/console.log
+tmux new -d -s m-transfer 'bash tools/owod/run_instance_pilot.sh'
+tail -f output/m-instance-expanded/console.log
 ```
 
-- 两组均使用同一 DINO 预训练、seed 42、100 个 query、每图最多 5 个 pseudo、focal 评分、soft 类别路由、冻结定位策略及旧类蒸馏。增强、学习率和训练数据配对。旧组使用 M 分支 v8 发现路径，新组增加定位和实例参数。每组 Task 1 增量 4 轮，Task 2 增量 3 轮、作者均衡记忆微调 1 轮；每个 increment 从对应作者训练清单固定取 1,536 张图。每阶段末在完整作者测试清单上计算 VOC 积分 AP50 和未知指标。此预算用于单种子诊断。
-- v10 用 25 个 encoder 候选初始化 decoder，候选不足时回用 learned query。定位质量参与候选排序。实例投影为 64 维。切换任务时用冻结的父模型及其 EMA，从前一阶段合法训练清单固定取最多 512 张图重建匿名库，最多 16 槽、每槽 4 个不同图像代表。库及检索结果按父 checkpoint 哈希缓存。对新任务最多 1,536 张训练图做类别无关 IoU 匹配，只检索 IoU 达到 0.5 的标注实例。组内至少两张来源图像；竞争槽或类别间得分需有足够间隔。对齐通过冻结投影反向传播至学生 query。预算及阈值见 [SETTINGS](../models/graph_local/instance_transfer.py)。
-- 新版 Task 1 父权重和 GNN 仅训练一次。Task 2 的 matched、off、shuffled 三组共享父权重、检索缓存、路由初始化和训练预算。若没有接受的匹配，运行 legacy 和 matched 后结束并记录原因。若打乱组无法交换不同槽，迁移归因记为证据不足。
-- 日志及产物位于 output/m-instance-pilot。每组每阶段分别保存 train.log、metrics.jsonl 和 checkpoint.pth。Task 1 的 candidate_coverage.json 记录在训练留出图像上的候选覆盖，Task 2 标签仅用于事后计数。comparison.json 比较固定轮次的 Previous / Current / Known AP50、U-Recall、precision、unknown 数、WI、A-OSE 和 H-Score。先看 matched 对 legacy 的整体差异，再看其对 off 和 shuffled 的末轮 Current AP50 差异及旧类、unknown 代价。
+每阶段的 train.log、metrics.jsonl 和 checkpoint.pth 位于对应组别目录。comparison.json 记录实例库实际扫描图数、保留的代表和不同来源图数、接受的类别，以及各组在 increment、balanced finetune 固定末轮的指标和差值。candidate_coverage.json 单独统计 Task 1 的候选覆盖。先看 matched 的末轮 Current AP50 是否同时高于 off 和 shuffled，再看 Previous/Known AP50、U-Recall、precision、预测数、WI 和 A-OSE 的变化。一次短程单种子结果用于决定是否扩大训练。
+
+按全局 batch 4 计，Task 1 约 12,288 步，三个 Task 2 合计约 4,764 步，另含七次完整评估、一次 GNN 校准及历史库提取。双 3090 空闲时先预留 5–9 小时。历史 M 全量 Task 1 的训练与评估耗时见[双卡记录](owod-control-lr-quarter-epoch8-analysis-20261111.md)；v10 的实际吞吐和磁盘读取速度要以本次日志为准。

@@ -101,6 +101,8 @@ def get_args_parser():
     parser.add_argument('--owod-manifest', default='',
                         help='S-OWODB/M-OWODB split manifest used for this run')
     parser.add_argument('--instance-mode', choices=('legacy','matched','shuffled','off'), default='legacy')
+    parser.add_argument('--expanded-instance-bank', action='store_true',
+                        help='Scan 4096 parent images and retain up to 32 slots of 8 representatives')
     parser.add_argument('--instance-cache', default='', help='Shared frozen-parent retrieval cache')
     parser.add_argument('--screen-author-eval', action='store_true',
                         help='Evaluate a diagnostic training subset on the full author test set')

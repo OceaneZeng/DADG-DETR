@@ -17,5 +17,5 @@ export PYTHONPATH="$PWD/models/ops:$PWD${PYTHONPATH:+:$PYTHONPATH}"
 if [[ ${1:-} == --plan ]]; then
   exec "$python_bin" tools/owod/run_instance_pilot.py "$@"
 fi
-mkdir -p output/m-instance-pilot
-"$python_bin" -u tools/owod/run_instance_pilot.py "$@" 2>&1 | tee -a output/m-instance-pilot/console.log
+mkdir -p output/m-instance-expanded
+"$python_bin" -u tools/owod/run_instance_pilot.py "$@" 2>&1 | tee -a output/m-instance-expanded/console.log
