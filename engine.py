@@ -267,7 +267,7 @@ def evaluate(model, criterion, postprocessors, data_loader, base_ds, device, out
                 for category in owod_known_class_ids:
                     visible |= target['labels'] == category
                 loss_targets.append({key: value[visible] if key in
-                                     {'labels', 'boxes', 'area', 'iscrowd', 'masks', 'keypoints'}
+                                     {'labels', 'boxes', 'area', 'iscrowd', 'masks', 'keypoints', 'source_objects'}
                                      else value for key, value in target.items()})
         loss_dict = criterion(outputs, loss_targets)
         weight_dict = criterion.weight_dict

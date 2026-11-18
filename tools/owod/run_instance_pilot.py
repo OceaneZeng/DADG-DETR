@@ -33,6 +33,8 @@ METRICS = (
 TASK1_IMAGES = 6144
 TASK2_IMAGES = 1536
 ARMS = ("matched", "off", "shuffled")
+PRE_EVAL_FIX = "41f42c12d9a64911291ca04e56df102bc5759ce6"
+FIXED_EVAL_BLOB = "675d49ed86e58a63a5522d04fdfb5fc94e22616e"
 
 
 def command(arm, phase, parent=None, gnn=None):
@@ -192,6 +194,47 @@ def compare(rows, phase, arm, ref):
     return {key: left[key] - right[key] for key in METRICS if key in left and key in right}
 
 
+def verify_or_create_plan(path, identity):
+    if not path.exists():
+        write_json(path, identity)
+        return
+    original = read_json(path)
+    if original == identity:
+        return
+    if original != dict(identity, commit=PRE_EVAL_FIX):
+        raise ValueError(f"Different run identity at {path}")
+
+    # Only the direct repair of the failed evaluation can finish this old plan.
+    def git(*args):
+        return subprocess.check_output(["git", *args], cwd=ROOT, text=True).strip()
+
+    commit = identity["commit"]
+    if (git("rev-parse", commit + "^") != PRE_EVAL_FIX
+            or git("rev-parse", commit + ":engine.py") != FIXED_EVAL_BLOB
+            or set(git("diff", "--name-only", PRE_EVAL_FIX, commit).splitlines())
+            != {"engine.py", "tools/owod/run_instance_pilot.py"}
+            or git("diff", "--name-only", commit)):
+        raise ValueError("The checkout differs from the approved evaluation repair")
+
+    import torch
+    folder = path.parent / "matched/task1"
+    checkpoint = folder / "checkpoint.pth"
+    metadata = torch.load(checkpoint, map_location="meta", weights_only=False)
+    if metadata["epoch"] != EPOCHS["task1"] - 1:
+        raise ValueError("Expected the completed Task 1 training checkpoint for evaluation recovery")
+    receipt = path.with_name("evaluation_recovery.json")
+    recovery = dict(training_commit=PRE_EVAL_FIX, evaluation_commit=commit,
+                    epoch=metadata["epoch"], checkpoint_sha256=file_sha256(checkpoint))
+    if receipt.exists():
+        if read_json(receipt) != recovery:
+            raise ValueError("Task 1 evaluation recovery provenance changed")
+    else:
+        if (folder / "training_complete.json").exists():
+            raise ValueError("Expected a Task 1 evaluation interruption")
+        write_json(receipt, recovery)
+    print(f"Verified Task 1 endpoint for evaluation recovery: {checkpoint}", flush=True)
+
+
 def pilot():
     import torch
 
@@ -244,11 +287,7 @@ def pilot():
         paper_comparable=False,
     )
     path = OUTPUT / "plan.json"
-    if path.exists() and read_json(path) != identity:
-        raise ValueError(
-            f"Different run identity at {path}; preserve this run and use a fresh output directory"
-        )
-    write_json(path, identity)
+    verify_or_create_plan(path, identity)
     rows = {}
     deltas = {}
     report = dict(
