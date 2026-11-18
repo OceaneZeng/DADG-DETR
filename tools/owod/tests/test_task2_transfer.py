@@ -139,6 +139,25 @@ def test_read_only_matching_audit_of_legacy_cache(tmp_path):
     assert audit(tmp_path, parent)['matching']['class_counts']['empty_memory'] == 1
 
 
+def test_raw_and_projected_matching_use_same_eligible_slots():
+    from tools.analysis.audit_transfer_match import compare_matching_spaces
+    graph = torch.nn.Module()
+    graph.project = torch.nn.Linear(2, 1, bias=False)
+    with torch.no_grad():
+        graph.project.weight.fill_(1.)
+    result = compare_matching_spaces(graph, torch.tensor([[0., 1.], [1., 0.], [0., 1.]]),
+                                     torch.tensor([3., .2, 4.]), {5: [1., 0.], 7: [0., 1.]},
+                                     [7, 5, 8], 3., .8)
+    assert result['class_ids'] == [7, 5] and result['supported_slots'] == [0, 2]
+    raw, projected = result['spaces']['raw'], result['spaces']['projected']
+    assert raw['cosine_by_class_and_slot'] == [[1., 1.], [0., 0.]]
+    assert raw['classes_at_threshold'] == 1 and projected['classes_at_threshold'] == 2
+    assert projected['tied_top1_classes'] == 2 and projected['best_slot_counts'] == {0: 2}
+    single = compare_matching_spaces(graph, torch.eye(2), torch.tensor([0., 4.]),
+                                     {5: [1., 0.]}, [5], 3., .8)['spaces']['raw']
+    assert single['median_top1_top2_gap'] is None and single['median_class_pair_cosine'] is None
+
+
 def test_balanced_parent_lineage(tmp_path):
     from tools.owod.train_task2_diagnostic import validate_diagnostic_resume
     plan = dict(epochs=50, world_size=2)
