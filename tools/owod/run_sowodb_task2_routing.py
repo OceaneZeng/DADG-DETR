@@ -25,7 +25,11 @@ def evaluation_epochs(epochs):
 
 def output_directory(comparison, epochs):
     paired_variants(comparison)
-    evaluation_epochs(epochs)
+    if comparison == 'transfer':
+        from tools.owod.task2_transfer import schedule
+        schedule(epochs)
+    else:
+        evaluation_epochs(epochs)
     return Path(f'output/sowodb-task2-v7-{comparison}-{epochs}epochs-2gpu/results')
 
 
@@ -60,6 +64,8 @@ def paired_report(hard, soft, *, epoch=None, epochs=EPOCHS):
 
 
 def paired_variants(comparison):
+    if comparison == 'transfer':
+        return (('inherit', 'soft', 'frozen'), ('scratch', 'soft', 'frozen'))
     if comparison == 'routing':
         return (('hard', 'hard', 'frozen'), ('soft', 'soft', 'frozen'))
     if comparison == 'localization':
@@ -161,23 +167,36 @@ def run_paired_variants(opt, identity, proof, comparison):
                    initialization_reference=variants[0][0] if index else None)
 
 
+def transfer_identity(manifest, checkpoint, gnn, proof, reference, world_size, gpu_selection, *, epochs):
+    from tools.owod.task2_transfer import schedule
+    phases = schedule(epochs)
+    identity = diagnostic_identity(manifest, checkpoint, gnn, world_size, epochs=epochs)
+    identity.update(suite='sowodb-task2-transfer-v1', policies=[7], comparison='transfer',
+                    phase='increment', milestones=phases, evaluation_epochs=phases['increment'],
+                    variants=['inherit', 'scratch'], routing='soft', localization='frozen',
+                    negative_policy='dense', parent_provenance=proof, cuda_visible_devices=gpu_selection)
+    return identity
+
+
 def main(*, comparison='routing'):
     variants = paired_variants(comparison)
     parser = argparse.ArgumentParser(description={
         'routing': __doc__,
         'localization': 'Paired soft/frozen vs soft/bbox-last Task 2 diagnostic; fresh Task 1 parents.',
         'unknown': 'Paired dense vs cross-view-protected unknown supervision; fresh, identical Task 1 parents.',
+        'transfer': 'Matched discovery snapshot vs ordinary class adapter initialization in Task 2.',
     }[comparison])
     parser.add_argument('--manifest', type=Path, default=Path('data/owod/s-owodb/split_manifest.json'))
     parent = Path('output/tree-detr-s-v5-full/s-owodb/seed_42')
     parser.add_argument('--checkpoint', type=Path, default=parent / 'stage_0/increment/checkpoint0049.pth')
     parser.add_argument('--gnn', type=Path, default=parent / 'gnn/stage_0/gnn_stage0.pt')
-    if comparison != 'unknown':
+    needs_reference = comparison in ('routing', 'localization')
+    if needs_reference:
         previous = Path('output/task2-v5-v7-diagnostic-3epochs-2gpu/results')
         parser.add_argument('--reference-checkpoint', type=Path, default=previous / 'v7/checkpoint.pth')
         parser.add_argument('--reference-plan', type=Path, default=previous / 'diagnostic_plan.json')
-    parser.add_argument('--epochs', type=int, choices=(3, 8), default=3 if comparison == 'unknown' else EPOCHS,
-                        help='3 = quick screening (unknown default); 8 = extended; separate plans/outputs')
+    parser.add_argument('--epochs', type=int, choices=(3, 50) if comparison == 'transfer' else (3, 8),
+                        default=3 if not needs_reference else EPOCHS)
     parser.add_argument('--output', type=Path,
                         help='Defaults to a separate comparison/epoch-budget directory')
     parser.add_argument('--preflight', action='store_true', help='CPU-only provenance checks; writes no experiment state')
@@ -186,7 +205,7 @@ def main(*, comparison='routing'):
     if opt.output is None:
         opt.output = output_directory(comparison, opt.epochs)
     fields = ['manifest', 'checkpoint', 'gnn', 'output']
-    if comparison != 'unknown':
+    if needs_reference:
         fields.extend(['reference_checkpoint', 'reference_plan'])
     for field in fields:
         setattr(opt, field, getattr(opt, field).resolve())
@@ -196,14 +215,19 @@ def main(*, comparison='routing'):
     # The new supervision pair needs only the verified formal Task 1 parent.
     # Historical diagnostic weights are not an initialization or prerequisite.
     reference = (verify_reference(opt.reference_checkpoint, opt.reference_plan, proof)
-                 if comparison != 'unknown' else None)
+                 if needs_reference else None)
+    if comparison == 'transfer':
+        from tools.owod.task2_transfer import schedule
+        phases = schedule(opt.epochs)
+    else:
+        phases = {'increment': list(evaluation_epochs(opt.epochs))}
     if opt.preflight:
         print(json.dumps(dict(parent_provenance=proof, reference=reference,
                               variants=[name for name, _, _ in variants], comparison=comparison, epochs=opt.epochs,
                               negative_policies=({'baseline': 'dense', 'protected': 'cross-view-protected'}
                                                  if comparison == 'unknown' else None),
-                              evaluation_epochs=list(evaluation_epochs(opt.epochs)), effective_batch_size=2,
-                              output=str(opt.output), finetune=False), indent=2))
+                              evaluation_epochs=phases['increment'], effective_batch_size=2,
+                              phases=phases, output=str(opt.output), finetune='finetune' in phases), indent=2))
         return
     opt.world_size = int(os.environ.get('WORLD_SIZE', 1))
     opt.rank = int(os.environ.get('RANK', 0))
@@ -216,7 +240,7 @@ def main(*, comparison='routing'):
     # LOCAL_SIZE is consumed by the existing COCO dataset helpers.
     os.environ['LOCAL_SIZE'] = '2'
     identity_builder = {'routing': routing_identity, 'localization': localization_identity,
-                        'unknown': unknown_identity}[comparison]
+                        'unknown': unknown_identity, 'transfer': transfer_identity}[comparison]
     identity = identity_builder(opt.manifest, opt.checkpoint, opt.gnn, proof, reference,
                                 opt.world_size, os.environ.get('CUDA_VISIBLE_DEVICES', ''), epochs=opt.epochs)
     import torchvision
@@ -244,6 +268,17 @@ def main(*, comparison='routing'):
     gc.collect()
     torch.cuda.empty_cache()
     run_paired_variants(opt, identity, proof, comparison)
+    if comparison == 'transfer' and 'finetune' in phases:
+        from tools.owod.task2_transfer import increment_parent, report as transfer_report
+        if opt.rank == 0:
+            transfer_report(opt.output, {'increment': phases['increment']})
+        for arm, routing, localization in variants:
+            checkpoint, digest, specs = increment_parent(opt.output / arm, identity, arm)
+            ft_identity = dict(identity, phase='finetune', finetune=True, arm=arm, increment_sha256=digest,
+                               epochs=phases['finetune'][-1], evaluation_epochs=phases['finetune'],
+                               increment_adapter_specs=specs)
+            run_policy(opt, ft_identity, 7, variant=routing, provenance=proof, localization=localization,
+                       run_name=arm, increment_checkpoint=checkpoint, initialization_reference=None)
     inputs = [(opt.checkpoint, proof['checkpoint_sha256']), (opt.gnn, proof['gnn_sha256']),
               (opt.manifest, proof['canonical_manifest_sha256'])]
     if reference is not None:
@@ -252,7 +287,11 @@ def main(*, comparison='routing'):
         if file_sha256(path) != expected:
             raise ValueError(f'Input changed during experiment: {path}')
     if opt.rank == 0:
-        report = write_reports(opt.output, comparison, opt.epochs)
+        if comparison == 'transfer':
+            from tools.owod.task2_transfer import report as transfer_report
+            report = transfer_report(opt.output, phases)
+        else:
+            report = write_reports(opt.output, comparison, opt.epochs)
         print(json.dumps(report, indent=2), flush=True)
     torch.distributed.barrier()
     torch.distributed.destroy_process_group()

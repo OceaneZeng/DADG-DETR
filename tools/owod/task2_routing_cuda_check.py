@@ -13,6 +13,7 @@ def main():
     comparison = parser.add_mutually_exclusive_group()
     comparison.add_argument('--localization-comparison', action='store_true')
     comparison.add_argument('--unknown-comparison', action='store_true')
+    comparison.add_argument('--transfer-comparison', action='store_true')
     opt = parser.parse_args()
     import gc
     import torch
@@ -32,7 +33,10 @@ def main():
         variants = (('soft', 'frozen', 'dense'), ('soft', 'frozen', 'cross-view-protected')) if opt.unknown_comparison else (
             (('soft', 'frozen', 'dense'), ('soft', 'bbox-last', 'dense')) if opt.localization_comparison else
             (('hard', 'frozen', 'dense'), ('soft', 'frozen', 'dense')))
-        for routing, localization, negative_policy in variants:
+        if opt.transfer_comparison:
+            variants = (('soft', 'frozen', 'dense'),) * 2
+        transfer_reference = None
+        for index, (routing, localization, negative_policy) in enumerate(variants):
             torch.manual_seed(42)
             args = get_args_parser().parse_args([])
             args.skip_backbone_initialization = True
@@ -46,8 +50,23 @@ def main():
             model, criterion, _ = build(args)
             model.cuda(); criterion.cuda()
             old_teacher = make_ema(model)
-            append_stage(model, dict(stage=1, class_ids=[3], old_ids=[1], rank=2, last_n=1,
-                                    risk_beta=2., risk=[[.2]], routing=routing))
+            layout = dict(stage=1, class_ids=[3], old_ids=[1], rank=2, last_n=1,
+                          risk_beta=2., risk=[[.2]], routing=routing)
+            append_stage(model, layout)
+            if opt.transfer_comparison:
+                from models.graph_local.discovery import DiscoveryFFN
+                from tools.owod.task2_transfer import promote_arm, check_transfer
+                feature = torch.ones(args.hidden_dim, device='cuda')
+                model.memory.observe(feature[None], torch.tensor([-1], device='cuda'),
+                                     torch.tensor([args.discovery_min_support], device='cuda'))
+                source = next(m for m in model.modules() if isinstance(m, DiscoveryFFN))
+                with torch.no_grad():
+                    source.adapter.up.weight.fill_(.1)
+                source.snapshot([0])
+                audit = promote_arm(model, layout, {3: feature}, {3: [feature]},
+                                    'scratch' if index else 'inherit')
+                check_transfer(audit, transfer_reference)
+                transfer_reference = audit
             model.known_ids = criterion.known_ids = criterion.base.active_class_ids = [1, 3]
             criterion.old_ids = [1]
             hooks = configure_trainable(model, [3], [1, 3], localization=localization)

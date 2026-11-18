@@ -9,24 +9,34 @@ while (($#)); do
     --check) check_only=true ;;
     --localization) comparison=localization ;;
     --unknown) comparison=unknown ;;
+    --transfer) comparison=transfer ;;
     --epochs)
-      [[ $# -ge 2 ]] || { echo '--epochs requires 3 or 8.' >&2; exit 2; }
+      [[ $# -ge 2 ]] || { echo '--epochs requires a budget.' >&2; exit 2; }
       epochs="$2"
       shift
       ;;
     --help|-h)
-      echo 'Usage: bash tools/owod/run_sowodb_task2_routing.sh [--localization|--unknown] [--epochs 3|8] [--check]'
+      echo 'Usage: bash tools/owod/run_sowodb_task2_routing.sh [--localization|--unknown|--transfer] [--epochs N] [--check]'
+      echo 'Transfer wrapper: run_sowodb_task2_transfer.sh (3 each) or --full (50 + 20 each).'
       echo 'Routing/localization default: 8 epochs; run_sowodb_task2_unknown.sh defaults to 3 per arm.'
       echo 'Each comparison and budget uses its own output directory.'
       exit 0
       ;;
-    *) echo 'Accepted options: --check, --localization, --unknown, --epochs 3|8.' >&2; exit 2 ;;
+    *) echo "Unknown option: $1" >&2; exit 2 ;;
   esac
   shift
 done
-[[ $epochs == 3 || $epochs == 8 ]] || { echo '--epochs must be 3 or 8.' >&2; exit 2; }
+if [[ $comparison == transfer ]]; then
+  [[ $epochs == 3 || $epochs == 50 ]] || { echo 'Transfer requires 3 or 50 increment epochs.' >&2; exit 2; }
+else
+  [[ $epochs == 3 || $epochs == 8 ]] || { echo '--epochs must be 3 or 8.' >&2; exit 2; }
+fi
 driver=tools/owod/run_sowodb_task2_routing.py
 cuda_check=()
+if [[ $comparison == transfer ]]; then
+  driver=tools/owod/run_sowodb_task2_transfer.py
+  cuda_check=(--transfer-comparison)
+fi
 if [[ $comparison == localization ]]; then
   driver=tools/owod/run_sowodb_task2_localization.py
   cuda_check=(--localization-comparison)

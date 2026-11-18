@@ -3,10 +3,12 @@ import hashlib
 from pathlib import Path
 
 
-def state_sha256(model):
+def state_sha256(model, *, exclude=()):
     import torch
     digest = hashlib.sha256()
     for key, value in sorted(model.state_dict().items()):
+        if key in exclude:
+            continue
         digest.update(str((key, str(value.dtype), tuple(value.shape))).encode())
         digest.update(value.detach().cpu().contiguous().reshape(-1).view(torch.uint8).numpy().tobytes())
     return digest.hexdigest()

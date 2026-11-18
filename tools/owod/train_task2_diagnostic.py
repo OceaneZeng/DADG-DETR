@@ -171,7 +171,7 @@ def validate_pair_resume(checkpoint, variant, localization, run_name=None, *, ne
 
 def run_policy(opt, identity, policy, *, variant=None, provenance=None,
                localization='frozen', run_name=None, initialization_reference='hard',
-               negative_policy='dense'):
+               negative_policy='dense', increment_checkpoint=None):
     import numpy as np
     import torch
     from torch.utils.data import DataLoader, RandomSampler, SequentialSampler, DistributedSampler
@@ -188,6 +188,15 @@ def run_policy(opt, identity, policy, *, variant=None, provenance=None,
     rank, world, gpu = opt.rank, opt.world_size, opt.gpu
     distributed = world > 1
     diagnostic_evaluation_epochs(identity)
+    transfer = identity.get('comparison') == 'transfer'
+    finetune = increment_checkpoint is not None
+    if transfer and (run_name not in ('inherit', 'scratch') or variant != 'soft'
+                     or localization != 'frozen' or negative_policy != 'dense'
+                     or (identity['phase'] == 'finetune') != finetune):
+        raise ValueError('Unexpected transfer arm or phase')
+    if finetune and (not transfer or file_sha256(increment_checkpoint) != identity['increment_sha256']
+                     or run_name != identity['arm']):
+        raise ValueError('Finetuning requires the pinned corresponding increment checkpoint')
 
     def write(path, value):
         if rank == 0:
@@ -206,8 +215,9 @@ def run_policy(opt, identity, policy, *, variant=None, provenance=None,
     for name in (run_name, initialization_reference):
         if name is not None and (not name or Path(name).name != name or name in ('.', '..')):
             raise ValueError('Paired run names must be single directory names')
-    directory = opt.output / (run_name or variant or f'v{policy}')
-    directory.mkdir(exist_ok=True)
+    root = opt.output / 'finetune' if finetune else opt.output
+    directory = root / (run_name or variant or f'v{policy}')
+    directory.mkdir(parents=True, exist_ok=True)
     parent = torch.load(opt.checkpoint, map_location='cpu', weights_only=False)
     source = parent['args']
     if (parent.get('diagnostic_only') or source.owod_stage != 0
@@ -259,6 +269,14 @@ def run_policy(opt, identity, policy, *, variant=None, provenance=None,
         # Calibration uses deterministic transforms. Do not fork workers after
         # CUDA initialization in its class-by-class loaders on Linux.
         initialization_args.num_workers = 0
+    if finetune:
+        args.owod_phase = 'finetune'
+        args.pretrained = str(increment_checkpoint)
+        args.train_ann = str(files['train'])
+        args.lr, args.lr_backbone = 2e-5, 2e-6
+        args.lr_drop = args.epochs
+    if transfer:
+        args.discovery_no_transfer = run_name == 'scratch'
     if args.discovery_warmup >= args.epochs:
         raise ValueError('Diagnostic budget would contain no unknown-learning updates')
     if args.seed != 42 or args.lightweight or args.no_augmentation:
@@ -276,6 +294,9 @@ def run_policy(opt, identity, policy, *, variant=None, provenance=None,
         validate_diagnostic_resume(restored, identity, policy)
         if variant is not None:
             validate_pair_resume(restored, variant, localization, run_name, negative_policy=negative_policy)
+        if transfer and (restored['args'].discovery_no_transfer != args.discovery_no_transfer
+                         or restored['args'].owod_phase != args.owod_phase):
+            raise ValueError('Transfer setting or phase changed on resume')
         if (restored['epoch'] == args.epochs - 1 and (directory / 'training_complete.json').is_file()
                 and (directory / 'final_metrics.json').is_file()
                 and (variant is None or all((directory / name).is_file() for name in
@@ -288,16 +309,37 @@ def run_policy(opt, identity, policy, *, variant=None, provenance=None,
         model, criterion = load_detector(args, path, device)
         args = restored['args']
         args.rank, args.gpu = rank, gpu
+    elif finetune:
+        model, criterion = load_detector(args, increment_checkpoint, device)
+        # Reuse the learned bank and frozen routing metadata, without promoting twice.
+        args.graph_adapter_specs = identity['increment_adapter_specs']
     else:
         model, criterion = load_detector(source, opt.checkpoint, device)
-        layout, means, routes = prepare_task2(model, criterion, initialization_args, opt.checkpoint)
-        if distributed:
+        if transfer:
+            from tools.owod.task2_transfer import shared_calibration
+            layout, means, routes = shared_calibration(model, criterion, initialization_args, opt, identity)
+        else:
+            layout, means, routes = prepare_task2(model, criterion, initialization_args, opt.checkpoint)
+        if distributed and not transfer:
             # Every rank enters calibration, whose criterion uses collectives.
             packet = [(layout, means, routes)]
             torch.distributed.broadcast_object_list(packet, src=0)
             layout, means, routes = packet[0]
-        model.promote({c: torch.tensor(v, device=device) for c, v in means.items()}, layout,
-                      {c: [torch.tensor(v, device=device) for v in values] for c, values in routes.items()})
+        means = {c: torch.tensor(v, device=device) for c, v in means.items()}
+        routes = {c: [torch.tensor(v, device=device) for v in values] for c, values in routes.items()}
+        if transfer:
+            from tools.owod.task2_transfer import promote_arm, check_transfer
+            audit = promote_arm(model, layout, means, routes, run_name)
+            write(directory / 'transfer.json', audit)
+            if rank == 0:
+                print(f'{run_name}: {len(audit["matched_classes"])} matched classes, '
+                      f'{len(audit["nonzero_classes"])}/{len(layout["class_ids"])} new classes '
+                      'with nonzero initial adapter mappings', flush=True)
+            reference = (json.loads((root / initialization_reference / 'transfer.json').read_text())
+                         if initialization_reference is not None else None)
+            check_transfer(audit, reference)
+        else:
+            model.promote(means, layout, routes)
         args.graph_adapter_specs = [layout]
         if policy == 7:
             model.memory.enable_bounded(args.discovery_min_support)
@@ -312,10 +354,10 @@ def run_policy(opt, identity, policy, *, variant=None, provenance=None,
     args.paper_comparable_protocol = False
     criterion.revision = policy
     hooks = configure_trainable(model, args.owod_current_class_ids, args.owod_known_class_ids,
-                                localization=args.graph_localization)
+                                finetune=finetune, localization=args.graph_localization)
     model.train_discovery()
     criterion.weight_dict['loss_adapter_route'] = args.graph_route_loss_coef
-    frozen, _ = load_detector(source, opt.checkpoint, device)
+    frozen, _ = load_detector(source, increment_checkpoint or opt.checkpoint, device)
     frozen.eval().requires_grad_(False)
     optimizer = make_optimizer(model, args)
     network = (torch.nn.parallel.DistributedDataParallel(model, device_ids=[gpu])
@@ -377,14 +419,15 @@ def run_policy(opt, identity, policy, *, variant=None, provenance=None,
                 torch.distributed.all_gather_object(digests, digest)
                 if len(set(digests)) != 1:
                     raise ValueError('Task 2 initialization differs across ranks')
-            if variant == 'soft' and initialization_reference is not None:
+            if not transfer and variant == 'soft' and initialization_reference is not None:
                 initial = json.loads((opt.output / initialization_reference / 'initialization.json').read_text())
                 if initial['state_sha256'] != digest:
                     raise ValueError('Paired runs must start with identical weights and memory')
             write(directory / 'initialization.json', dict(state_sha256=digest, routing=variant,
                   localization=localization, run_name=directory.name,
                   discovery_negative_policy=negative_policy,
-                  diagnostic_only=True, parent_checkpoint_sha256=identity['checkpoint_sha256']))
+                  diagnostic_only=True, parent_checkpoint_sha256=identity.get(
+                      'increment_sha256', identity['checkpoint_sha256'])))
         criterion.epoch = 0
         write(directory / 'initial_metrics.json', evaluate_now())
         if variant is not None:
