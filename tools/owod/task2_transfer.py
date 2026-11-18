@@ -78,8 +78,9 @@ def promote_arm(model, layout, means, routes, arm):
                 nonzero_classes=[cid for cid, values in norms.items() if any(values)])
 
 
-def check_transfer(audit, reference=None):
-    if audit['arm'] == 'inherit' and not audit['nonzero_classes']:
+def check_transfer(audit, reference=None, *, allow_unmatched=False):
+    if (audit['arm'] == 'inherit' and not audit['nonzero_classes']
+            and (audit['matched_classes'] or not allow_unmatched)):
         raise ValueError('No nonzero discovery mapping was inherited; see transfer.json. No training contrast.')
     if audit['arm'] == 'scratch' and audit['nonzero_classes']:
         raise ValueError('Scratch must start with zero effective class adapter mappings')
@@ -92,6 +93,44 @@ def check_transfer(audit, reference=None):
                     for row in report['promotion']]
         if matches(audit) != matches(reference):
             raise ValueError('Anonymous matching differs between arms')
+
+
+def match_diagnostics(graph, counts, centers, means, class_ids, min_support, threshold, promotion):
+    """Measure the two promotion gates using the calibrated, released-class features."""
+    import torch
+    from collections import Counter
+    with torch.no_grad():
+        if (not torch.isfinite(counts).all() or not torch.isfinite(centers).all()
+                or (counts < 0).any()):
+            raise ValueError('Invalid anonymous prototype state')
+        valid = counts >= min_support
+        supported = valid.nonzero().flatten()
+        actual = {r['class_id']: r['anonymous_slots'] for r in promotion}
+        rows = []
+        for cid in class_ids:
+            row = dict(class_id=cid, selected_slots=actual.get(cid, []))
+            if cid not in means:
+                reason = 'missing_class_centroid'
+            elif not len(supported):
+                reason = 'no_supported_slot' if counts.any() else 'empty_memory'
+            else:
+                feature = torch.as_tensor(means[cid], device=centers.device, dtype=centers.dtype)
+                similarities = graph.similarities(feature[None], centers)[0]
+                if not torch.isfinite(similarities).all():
+                    raise ValueError(f'Nonfinite affinity for class {cid}')
+                weak_matches = (counts > 0) & ~valid & (similarities >= threshold)
+                row['similar_but_under_supported_slots'] = weak_matches.nonzero().flatten().tolist()
+                best = int(supported[similarities[supported].argmax()])
+                row.update(best_supported_slot=best, best_supported_similarity=float(similarities[best]),
+                           margin_to_threshold=float(similarities[best]) - threshold)
+                reason = 'matched' if row['selected_slots'] else 'below_similarity_threshold'
+                # The original GPU decision is authoritative near the threshold.
+                if not row['selected_slots'] and row['margin_to_threshold'] >= 0:
+                    reason = 'recomputed_score_disagrees_with_record'
+            rows.append(dict(**row, reason=reason))
+        return dict(min_support=min_support, similarity_threshold=threshold, slot_support=counts.tolist(),
+                    supported_slots=supported.tolist(), class_counts=dict(Counter(r['reason'] for r in rows)),
+                    classes=rows)
 
 
 def increment_parent(directory, plan, arm):

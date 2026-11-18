@@ -337,7 +337,22 @@ def run_policy(opt, identity, policy, *, variant=None, provenance=None,
                       'with nonzero initial adapter mappings', flush=True)
             reference = (json.loads((root / initialization_reference / 'transfer.json').read_text())
                          if initialization_reference is not None else None)
-            check_transfer(audit, reference)
+            check_transfer(audit, reference, allow_unmatched=True)
+            if run_name == 'inherit':
+                no_match = not audit['matched_classes']
+                if distributed:
+                    decisions = [None] * world
+                    torch.distributed.all_gather_object(decisions, no_match)
+                    if len(set(decisions)) != 1:
+                        raise ValueError('Ranks disagree on whether the transfer contrast exists')
+                if no_match:
+                    from tools.owod.task2_transfer import match_diagnostics
+                    memory = model.memory
+                    details = match_diagnostics(model.affinity_graph, memory.counts[memory.known_slots:],
+                                                memory.centers[memory.known_slots:], means, layout['class_ids'],
+                                                model.min_support, model.transfer_threshold, layout['promotion'])
+                    return dict(status='no_matched_classes', diagnostic_only=True, trained_epochs=0,
+                                matching=details)
         else:
             model.promote(means, layout, routes)
         args.graph_adapter_specs = [layout]

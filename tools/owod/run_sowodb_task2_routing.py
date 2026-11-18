@@ -161,10 +161,12 @@ def run_paired_variants(opt, identity, proof, comparison):
         negative_policy = identity.get('negative_policies', {}).get(name, 'dense')
         print(f'v7 Task 2 paired experiment: {name}, {opt.epochs} increment epochs, '
               f'{routing} routing, {localization} localization, {negative_policy} negatives', flush=True)
-        run_policy(opt, identity, 7, variant=routing, provenance=proof,
+        outcome = run_policy(opt, identity, 7, variant=routing, provenance=proof,
                    localization=localization, run_name=name if comparison != 'routing' else None,
                    negative_policy=negative_policy,
                    initialization_reference=variants[0][0] if index else None)
+        if comparison == 'transfer' and outcome is not None:
+            return outcome
 
 
 def transfer_identity(manifest, checkpoint, gnn, proof, reference, world_size, gpu_selection, *, epochs):
@@ -267,8 +269,8 @@ def main(*, comparison='routing'):
         evaluate_reference(opt, identity)
     gc.collect()
     torch.cuda.empty_cache()
-    run_paired_variants(opt, identity, proof, comparison)
-    if comparison == 'transfer' and 'finetune' in phases:
+    outcome = run_paired_variants(opt, identity, proof, comparison)
+    if comparison == 'transfer' and outcome is None and 'finetune' in phases:
         from tools.owod.task2_transfer import increment_parent, report as transfer_report
         if opt.rank == 0:
             transfer_report(opt.output, {'increment': phases['increment']})
@@ -287,7 +289,10 @@ def main(*, comparison='routing'):
         if file_sha256(path) != expected:
             raise ValueError(f'Input changed during experiment: {path}')
     if opt.rank == 0:
-        if comparison == 'transfer':
+        if outcome is not None:
+            report = outcome
+            dump(opt.output / 'comparison.json', report)
+        elif comparison == 'transfer':
             from tools.owod.task2_transfer import report as transfer_report
             report = transfer_report(opt.output, phases)
         else:

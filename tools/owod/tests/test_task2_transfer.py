@@ -85,6 +85,60 @@ def test_full_schedule_and_final_report(tmp_path):
     assert frozenset(result['phases']['increment']) == {0, 1, 3, 8, 50}
 
 
+def test_no_match_ends_both_budgets_before_scratch(monkeypatch):
+    from tools.owod import run_sowodb_task2_routing as driver
+    outcome = dict(status='no_matched_classes', trained_epochs=0)
+    ran = []
+    def no_match(*args, run_name, **kwargs):
+        ran.append(run_name)
+        transfer.check_transfer(dict(arm=run_name, matched_classes=[], nonzero_classes=[]), allow_unmatched=True)
+        return outcome
+    monkeypatch.setattr(driver, 'run_policy', no_match)
+    for budget in (3, 50):
+        assert driver.run_paired_variants(SimpleNamespace(epochs=budget), {}, {}, 'transfer') == outcome
+    assert ran == ['inherit', 'inherit']
+
+
+def test_read_only_matching_audit_of_legacy_cache(tmp_path):
+    from models.graph_local.discovery_memory import AffinityGraph
+    from tools.analysis.audit_transfer_match import audit
+    from tools.owod.protocol import file_sha256
+    parent = tmp_path / 'task1.pth'
+    torch.save({'args': SimpleNamespace(hidden_dim=4, discovery_capacity=2, discovery_min_support=3.,
+                                        discovery_transfer_threshold=.99)}, parent)
+    plan = dict(comparison='transfer', phase='increment', checkpoint_sha256=file_sha256(parent))
+    (tmp_path / 'diagnostic_plan.json').write_text(json.dumps(plan))
+    graph = AffinityGraph(4)
+    # Use repeatable projections with distinguishable orthogonal inputs.
+    with torch.no_grad():
+        graph.project[0].weight.copy_(torch.eye(4).repeat(16, 1))
+        graph.project[0].bias.zero_()
+    state = {'affinity_graph.' + k: v for k, v in graph.state_dict().items()}
+    first, second = torch.eye(4)[:2]
+    state.update({'memory.counts': torch.tensor([4., 1., 3.]),
+                  'memory.centers': torch.stack((first, first, second))})
+    path = tmp_path / 'common_initialization.pth'
+    def save():
+        torch.save(dict(diagnostic_only=True, diagnostic_identity=plan, layout={'class_ids': [3, 4]},
+                        means={3: first.tolist()}, model=state), path)
+    save()
+    (tmp_path / 'inherit').mkdir()
+    (tmp_path / 'inherit/transfer.json').write_text(json.dumps(dict(arm='inherit', matched_classes=[],
+        nonzero_classes=[], effective_mapping_norms={'3': [0], '4': [0]},
+        promotion=[dict(class_id=3, anonymous_slots=[])])))
+    initial_hash = file_sha256(path)
+    match = audit(tmp_path, parent)['matching']
+    assert match['class_counts'] == {'below_similarity_threshold': 1, 'missing_class_centroid': 1}
+    assert match['classes'][0]['similar_but_under_supported_slots'] == [0]
+    assert file_sha256(path) == initial_hash
+    state['memory.counts'][-1] = 1.
+    save()
+    assert audit(tmp_path, parent)['matching']['class_counts']['no_supported_slot'] == 1
+    state['memory.counts'][-2:] = 0.
+    save()
+    assert audit(tmp_path, parent)['matching']['class_counts']['empty_memory'] == 1
+
+
 def test_balanced_parent_lineage(tmp_path):
     from tools.owod.train_task2_diagnostic import validate_diagnostic_resume
     plan = dict(epochs=50, world_size=2)
