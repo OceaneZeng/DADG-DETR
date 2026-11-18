@@ -7,6 +7,10 @@ from tools.owod.protocol import (file_sha256, resolve_image_root, stage_files,
 
 
 def configure_run(args):
+    offset = getattr(args, 'discovery_pseudo_epoch_offset', 0)
+    if offset < 0 or (offset and not (getattr(args, 'owod_discovery', False)
+            and getattr(args, 'owod_screening', '') and args.owod_phase == 'finetune')):
+        raise ValueError('A pseudo epoch offset requires screening discovery finetuning')
     instance_mode = getattr(args, 'instance_mode', 'legacy')
     if instance_mode != 'legacy' and not getattr(args, 'owod_discovery', False):
         raise ValueError('Instance transfer requires discovery')
@@ -185,6 +189,13 @@ def validate_checkpoint(args, checkpoint, resume=False):
     if not getattr(args, 'owod_manifest', ''):
         return
     saved = checkpoint.get('args')
+    offset = getattr(args, 'discovery_pseudo_epoch_offset', 0)
+    saved_offset = getattr(saved, 'discovery_pseudo_epoch_offset', 0)
+    if resume:
+        if offset != saved_offset:
+            raise ValueError('Pseudo-supervision schedule differs from the checkpoint')
+    elif offset and offset != checkpoint.get('epoch', -1) + 1:
+        raise ValueError('Pseudo-supervision must continue from the increment endpoint')
     if bool(getattr(saved, 'initialization_audit', '')) != bool(getattr(args, 'initialization_audit', '')):
         raise ValueError('Cannot mix paired Task 1 diagnostic checkpoints and formal chains')
     if getattr(saved, 'screen_author_eval', False) != getattr(args, 'screen_author_eval', False):

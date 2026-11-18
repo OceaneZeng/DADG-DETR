@@ -88,7 +88,7 @@ def audit_initialization(model, args):
     print('Paired initialization SHA256:', args.initialization_sha256)
 
 
-def recover_final_evaluation(log, args, stats, n_parameters):
+def recover_final_evaluation(log, args, stats, n_parameters, training_stats=None):
     """Recover checkpoint-before-evaluation interruption at the fixed pause."""
     endpoint = args.epochs if getattr(args,'screen_author_eval',False) else args.pause_after_epochs
     if not endpoint or args.start_epoch != endpoint:
@@ -104,4 +104,5 @@ def recover_final_evaluation(log, args, stats, n_parameters):
     with Path(log).open('a', encoding='utf-8') as handle:
         handle.write(json.dumps(dict(epoch=epoch, n_parameters=n_parameters,
             evaluation_recovered_after_resume=True,
+            **{f'train_{key}': value for key, value in (training_stats or {}).items()},
             **{f'test_{key}': value for key, value in stats.items()})) + '\n')

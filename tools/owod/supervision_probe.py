@@ -3,6 +3,32 @@ import torch
 from util.box_ops import box_cxcywh_to_xyxy, box_iou
 
 
+def current_endpoint_hits(outputs, batch, target, result, known, current):
+    """Per current GT: class ID, box coverage, correct argmax, actual final output coverage."""
+    labels = target['labels']
+    keep = torch.isin(labels, labels.new_tensor(current))
+    labels = labels[keep]
+    gt = box_cxcywh_to_xyxy(target['boxes'][keep])
+    raw = box_cxcywh_to_xyxy(outputs['pred_boxes'][batch])
+    covers = box_iou(raw, gt)[0] > .5
+    classes = labels.new_tensor(known)
+    argmax = classes[outputs['pred_logits'][batch][:, classes].argmax(dim=1)]
+    height, width = target['orig_size'].unbind()
+    final = result['boxes'] / torch.stack((width, height, width, height))
+    final_hits = (box_iou(final, gt)[0] > .5) & (result['labels'][:, None] == labels)
+    return torch.stack((labels, covers.any(0), (covers & (argmax[:, None] == labels)).any(0),
+                        final_hits.any(0)), dim=1)
+
+
+def summarize_endpoint(image_hits, current):
+    hits = torch.cat(image_hits)
+    def counts(rows):
+        box, correct, final = rows[:, 1:].sum(0).tolist()
+        return dict(gt=len(rows), any_box=box, correct_argmax=correct, final_output=final)
+    return dict(images=len(image_hits), overall=counts(hits),
+                per_class={str(c): counts(hits[hits[:, 0] == c]) for c in current})
+
+
 @torch.no_grad()
 def probe_batch(outputs, targets, matcher, known):
     """One row per visible GT. Detection coverage is not one-to-one AP matching."""

@@ -33,6 +33,7 @@ def validate_plan_arguments(run, saved):
                      'profile_runtime_steps', 'profile_runtime_warmup'):
             continue  # resume advances this counter without changing the recipe
         default = {'discovery_pseudo_ramp_epochs': 0,
+                   'discovery_pseudo_epoch_offset': 0,
                    'discovery_objectness_loss': 'balanced-bce',
                    'discovery_pseudo_normalization': 'weight-sum',
                    'discovery_known_rank_coef': 0.,

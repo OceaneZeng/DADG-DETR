@@ -322,6 +322,7 @@ class DiscoveryCriterion(nn.Module):
             self.weight_dict.update(loss_geometry=1., loss_instance_class=.2,
                                     loss_instance_view=.2, loss_instance_align=SETTINGS['alignment_weight'])
         self.epoch = 0
+        self.pseudo_epoch_offset = getattr(args, 'discovery_pseudo_epoch_offset', 0)
         self.evidence = None
         self.weight_dict.update(loss_objectness=1., loss_unknown=1., loss_discovery_route=1.,
                                 loss_discovery_consistency=1., loss_affinity=.1)

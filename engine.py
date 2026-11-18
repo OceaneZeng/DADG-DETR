@@ -62,6 +62,9 @@ def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
                     runtime_profile=None):
     model.train()
     criterion.train()
+    discovery_epoch = epoch + getattr(criterion, 'pseudo_epoch_offset', 0)
+    if discovery_teacher is not None:
+        criterion.epoch = discovery_epoch
     metric_logger = utils.MetricLogger(
         delimiter="  ",
         visible_meters={"lr", "class_error", "grad_norm", "loss", "loss_ce",
@@ -104,7 +107,7 @@ def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
             outputs = model(samples)
         # The criterion discards teacher predictions during warmup. Keep the
         # teacher's EMA/prototype updates below, but skip this unused forward.
-        if discovery_teacher is not None and epoch >= getattr(criterion, 'warmup', 0):
+        if discovery_teacher is not None and discovery_epoch >= getattr(criterion, 'warmup', 0):
             from models.graph_local.discovery_candidates import flip_samples
             with scope('ema_teacher_forward'):
                 outputs['discovery_teacher'] = teacher_prediction(discovery_teacher, flip_samples(samples), 'discovery')

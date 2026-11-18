@@ -1,6 +1,6 @@
 """Frozen stage-boundary instance retrieval for discovery v10."""
 
-from collections import defaultdict
+from collections import Counter, defaultdict
 from pathlib import Path
 import random
 
@@ -161,6 +161,7 @@ def calibration(parent, criterion, args, payload):
     del ema
     groups = defaultdict(list)
     localized = 0
+    query_gt, localized_gt = Counter(), Counter()
     for images, targets in sample_loader(
         args, args.owod_stage, "increment_train", settings["query_images"]
     ):
@@ -168,6 +169,7 @@ def calibration(parent, criterion, args, payload):
         out = parent(images.to(device))
         for row, target in enumerate(targets):
             # Future classifier rows in the frozen parent have no released semantics.
+            query_gt.update(target["labels"].tolist())
             overlap = box_iou(
                 box_cxcywh_to_xyxy(out["pred_boxes"][row]), box_cxcywh_to_xyxy(target["boxes"])
             )[0]
@@ -179,6 +181,7 @@ def calibration(parent, criterion, args, payload):
             for idx in torch.where(ious >= settings["localization_iou"])[0].tolist():
                 localized += 1
                 g = gt[idx]
+                localized_gt[int(target["labels"][g])] += 1
                 result = bank.query(out["instance_features"][row, q[idx]].cpu(), image)
                 if result:
                     similarity, slot, feature, sources, mix = result
@@ -218,6 +221,8 @@ def calibration(parent, criterion, args, payload):
         candidates=count,
         localized=localized,
         accepted=len(records),
+        query_gt_by_class=dict(query_gt), localized_by_class=dict(localized_gt),
+        accepted_by_class=dict(Counter(r["label"] for r in records)),
         accepted_classes=sorted({r["label"] for r in records}),
         records=records,
     )

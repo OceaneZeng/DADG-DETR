@@ -161,6 +161,8 @@ def get_args_parser():
     parser.add_argument('--discovery-min-support', type=float, default=3.)
     parser.add_argument('--discovery-transfer-threshold', type=float, default=.8)
     parser.add_argument('--discovery-warmup', type=int, default=1)
+    parser.add_argument('--discovery-pseudo-epoch-offset', type=int, default=0,
+                        help='Continue the increment pseudo-supervision schedule during finetuning')
     parser.add_argument('--discovery-pseudo-ramp-epochs', type=int, default=0,
                         help='Experimental v6: ramp pseudo loss contributions after warmup; 0 preserves v5')
     parser.add_argument('--discovery-objectness-loss', choices=('balanced-bce', 'focal'), default='balanced-bce',
@@ -347,6 +349,7 @@ def main(args):
                            + (' plus two-view trusted background negatives' if args.discovery_background_negative else '')),
                        'discovery_version': args.discovery_version,
                        'pseudo_ramp_epochs': args.discovery_pseudo_ramp_epochs,
+                       'pseudo_epoch_offset': args.discovery_pseudo_epoch_offset,
                        'objectness_loss': args.discovery_objectness_loss,
                        'objectness_focal_alpha': args.focal_alpha if args.discovery_objectness_loss == 'focal' else None,
                        'objectness_focal_gamma': 2 if args.discovery_objectness_loss == 'focal' else None,
@@ -789,7 +792,8 @@ def main(args):
         prepare_log_file(structured_log, append=bool(args.resume))
         if (args.initialization_audit or args.screen_author_eval) and resumed_test_stats is not None:
             from tools.owod.paired_initialization import recover_final_evaluation
-            recover_final_evaluation(structured_log, args, resumed_test_stats, n_parameters)
+            recover_final_evaluation(structured_log, args, resumed_test_stats, n_parameters,
+                                     checkpoint.get('pseudo_training_stats', {}))
         completion_marker = output_dir / 'training_complete.json'
         if completion_marker.is_file():
             archive_log_file(completion_marker)
@@ -858,6 +862,9 @@ def main(args):
                     'lr_scheduler': lr_scheduler.state_dict(),
                     'epoch': epoch,
                     'args': args,
+                    **({'pseudo_training_stats': {key: train_stats[key] for key in
+                        ('discovery_pseudo_scale', 'discovery_pseudo_per_image')}}
+                       if args.discovery_pseudo_epoch_offset else {}),
                     **({'discovery_ema': discovery_teacher.state_dict()} if discovery_teacher is not None else {}),
                 }, checkpoint_path)
             if utils.is_main_process():
