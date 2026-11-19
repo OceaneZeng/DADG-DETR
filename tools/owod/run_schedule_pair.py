@@ -29,7 +29,7 @@ def endpoint(folder, phase):
     return values
 
 
-def coverage(checkpoint, loader, *, include_top300=False, include_classification=False):
+def coverage(checkpoint, loader, *, include_top300=False, include_classification=False, include_ranks=False):
     import torch
     from tools.owod.gnn_calibration import load_detector, move_targets
     from tools.owod.supervision_probe import current_endpoint_hits, summarize_endpoint
@@ -51,13 +51,17 @@ def coverage(checkpoint, loader, *, include_top300=False, include_classification
             targets = move_targets(targets, device)
             outputs = detector(samples.to(device))
             sizes = torch.stack([t['orig_size'] for t in targets])
-            results = process(outputs, sizes)
+            results = process(outputs, sizes, include_top_indices=include_ranks)
+            score_table = None
+            if include_ranks:
+                scores, categories, _ = process.candidate_scores(outputs)
+                score_table = scores, categories, [item['top_indices'] for item in results]
             expanded = top300(outputs, sizes) if top300 is not None else [None] * len(targets)
             for i, (target, result, larger_result) in enumerate(zip(targets, results, expanded)):
                 hits.append(current_endpoint_hits(
                     outputs, i, target, result, known, current, larger_result,
-                    include_classification=include_classification).cpu())
-    return summarize_endpoint(hits, current, include_classification=include_classification)
+                    include_classification=include_classification, score_table=score_table).cpu())
+    return summarize_endpoint(hits, current, include_classification=include_classification, include_ranks=include_ranks)
 
 
 def main():

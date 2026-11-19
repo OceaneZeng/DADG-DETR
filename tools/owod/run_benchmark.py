@@ -306,7 +306,7 @@ def get_args_parser():
     parser.add_argument('--graph-adapter-compute', choices=('loop', 'batched'), default='loop')
     parser.add_argument('--graph-route-loss-coef', type=float, default=1.0)
     parser.add_argument('--graph-routing', choices=('hard', 'soft'), default='hard')
-    parser.add_argument('--graph-localization', choices=('frozen', 'bbox-last'), default='frozen')
+    parser.add_argument('--graph-localization', choices=('frozen', 'bbox-last', 'cross-attn-last'), default='frozen')
     parser.add_argument('--instance-mode', choices=('legacy','matched','off','shuffled'),default='legacy')
     parser.add_argument('--discovery-scoring', choices=('hierarchical', 'focal'), default='hierarchical')
     parser.add_argument('--discovery-pseudo-ramp-epochs', type=int, default=0,

@@ -4,7 +4,7 @@ from util.box_ops import box_cxcywh_to_xyxy, box_iou
 
 
 def current_endpoint_hits(outputs, batch, target, result, known, current, top300=None, *,
-                          include_classification=False):
+                          include_classification=False, score_table=None):
     """Per current GT: box, correct argmax, and coverage at each output budget."""
     labels = target['labels']
     keep = torch.isin(labels, labels.new_tensor(current))
@@ -28,11 +28,18 @@ def current_endpoint_hits(outputs, batch, target, result, known, current, top300
     if include_classification:
         best_class = argmax[overlaps.argmax(0)]
         hits.append(torch.where(covers.any(0), best_class, -1))
+    if score_table is not None:
+        ranks = torch.zeros_like(labels)
+        rows = current_candidate_rank_rows(labels, overlaps, batch, [score_table])
+        ranks[covers.any(0)] = rows[:, 1].to(ranks.device)
+        hits.append(ranks)
     return torch.stack(hits, dim=1)
 
 
-def summarize_endpoint(image_hits, current, *, include_classification=False):
+def summarize_endpoint(image_hits, current, *, include_classification=False, include_ranks=False):
     hits = torch.cat(image_hits)
+    if include_ranks:
+        ranks, hits = hits[:, -1], hits[:, :-1]
     coverage = hits[:, :-1] if include_classification else hits
     names = ['any_box', 'correct_argmax', 'final_output']
     if coverage.shape[1] == 5:
@@ -42,6 +49,11 @@ def summarize_endpoint(image_hits, current, *, include_classification=False):
         return dict(gt=len(rows), **dict(zip(names, rows[:, 1:].sum(0).tolist())))
     report = dict(images=len(image_hits), overall=counts(coverage),
                   per_class={str(c): counts(coverage[coverage[:, 0] == c]) for c in current})
+    if include_ranks:
+        covered_ranks = ranks[ranks > 0]
+        report['rank_at_iou50'] = dict(
+            gt_with_box=len(covered_ranks),
+            median_best_true_class_rank=float(covered_ranks.float().quantile(.5)) if len(covered_ranks) else None)
     if include_classification:
         covered = hits[hits[:, -1] >= 0]
         labels, predicted = covered[:, 0], covered[:, -1]

@@ -230,7 +230,7 @@ def _coco_ap50_for_categories(coco_eval, category_ids) -> float:
 def evaluate(model, criterion, postprocessors, data_loader, base_ds, device, output_dir,
              owod_known_class_ids=None, owod_unknown_threshold=0.5,
              owod_previous_class_ids=None, owod_current_class_ids=None,
-             print_freq=100, owod_specification=None):
+             print_freq=100, owod_specification=None, include_current_stats=False):
     if owod_known_class_ids is not None and owod_specification is None:
         raise ValueError('OWOD evaluation requires the locked author benchmark specification')
     model.eval()
@@ -364,7 +364,7 @@ def evaluate(model, criterion, postprocessors, data_loader, base_ds, device, out
             by_image.setdefault(int(target['image_id'].item()), prediction)
         benchmark_stats = evaluate_author_benchmark(
             by_image, base_ds, owod_known_class_ids, owod_previous_class_ids or [],
-            owod_current_class_ids or [], owod_specification)
+            owod_current_class_ids or [], owod_specification, include_current_stats=include_current_stats)
         stats.update({'owod_' + key: value for key, value in benchmark_stats.items()})
         print('Author OWOD protocol metrics:', benchmark_stats)
     return stats, coco_evaluator

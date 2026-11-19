@@ -30,17 +30,8 @@ def treatment_command(folder, arm, phase, parent, previous, gnn):
     return cmd
 
 
-def main(argv=None):
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--classifier-lr', action='store_true',
-                        help='Double the classifier LR only in Task 2 increment')
-    args = parser.parse_args(argv)
-
+def verified_pilot_inputs():
     import torch
-    from torch.utils.data import DataLoader
-    from tools.owod.gnn_calibration import build_calibration_dataset
-    from tools.owod.validate_discovery import validate_plan_arguments
-    from util.misc import collate_fn
 
     source = pilot.OUTPUT
     old = read_json(source / 'plan.json')
@@ -60,6 +51,35 @@ def main(argv=None):
                            (gnn, comparison['common_gnn_sha256']), (cache, comparison['evidence_sha256'])):
         if file_sha256(path) != expected:
             raise ValueError(f'Original input changed: {path}')
+    return comparison, files, parent, gnn
+
+
+def endpoint_args(path, phase, command, comparison):
+    import torch
+    from tools.owod.validate_discovery import validate_plan_arguments
+    saved = torch.load(path, map_location='meta', weights_only=False)
+    if saved['epoch'] != pilot.EPOCHS[phase] - 1:
+        raise ValueError(f'Unexpected endpoint: {path}')
+    validate_plan_arguments({'command': command}, saved['args'])
+    spec = saved['args'].graph_adapter_specs[-1]
+    if (spec['source_checkpoint_sha256'] != comparison['common_parent_sha256']
+            or spec['gnn_sha256'] != comparison['common_gnn_sha256']
+            or spec['instances']['cache_sha256'] != comparison['evidence_sha256']):
+        raise ValueError(f'Checkpoint did not use the shared pilot inputs: {path}')
+    return saved['args']
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--classifier-lr', action='store_true',
+                        help='Double the classifier LR only in Task 2 increment')
+    args = parser.parse_args(argv)
+    from torch.utils.data import DataLoader
+    from tools.owod.gnn_calibration import build_calibration_dataset
+    from util.misc import collate_fn
+
+    source = pilot.OUTPUT
+    comparison, files, parent, gnn = verified_pilot_inputs()
 
     output, arm = (CLASSIFIER_OUTPUT, 'classifier-lr2x') if args.classifier_lr else (OUTPUT, 'bbox-last')
     frozen = {phase: source / 'off' / phase / 'checkpoint.pth' for phase in PHASES}
@@ -70,20 +90,9 @@ def main(argv=None):
     }
     rows = {'frozen': {}, arm: {}}
 
-    def read_endpoint(path, phase, command):
-        saved = torch.load(path, map_location='meta', weights_only=False)
-        if saved['epoch'] != pilot.EPOCHS[phase] - 1:
-            raise ValueError(f'Unexpected endpoint: {path}')
-        validate_plan_arguments({'command': command}, saved['args'])
-        spec = saved['args'].graph_adapter_specs[-1]
-        if (spec['source_checkpoint_sha256'] != parent_hash
-                or spec['gnn_sha256'] != comparison['common_gnn_sha256']
-                or spec['instances']['cache_sha256'] != comparison['evidence_sha256']):
-            raise ValueError(f'Checkpoint did not use the shared pilot inputs: {path}')
-        return endpoint(path.parent, phase), saved['args']
-
     for phase, previous in zip(PHASES, (parent, frozen['increment'])):
-        control, saved_args = read_endpoint(frozen[phase], phase, pilot.command('off', phase, previous, gnn))
+        saved_args = endpoint_args(frozen[phase], phase, pilot.command('off', phase, previous, gnn), comparison)
+        control = endpoint(frozen[phase].parent, phase)
         if any(control[key] != value for key, value in comparison['rows']['off'][phase].items()):
             raise ValueError(f'Frozen metrics differ from the completed pilot: {phase}')
         rows['frozen'][phase] = control
@@ -106,7 +115,8 @@ def main(argv=None):
         if not (path.parent / 'training_complete.json').is_file():
             resume = ['--resume', str(path)] if path.exists() else []
             pilot.run(cmd + resume)
-        rows[arm][phase], _ = read_endpoint(path, phase, cmd)
+        endpoint_args(path, phase, cmd, comparison)
+        rows[arm][phase] = endpoint(path.parent, phase)
 
     dataset = build_calibration_dataset(Path(saved_args.owod_image_root), files['full_val'])
     loader = DataLoader(dataset, batch_size=2, num_workers=2, collate_fn=collate_fn)

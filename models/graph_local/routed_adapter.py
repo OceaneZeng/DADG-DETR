@@ -139,7 +139,7 @@ def append_stage(model, spec):
 def configure_trainable(model, current_ids, known_ids, finetune=False, localization='frozen'):
     """Increment: current bank/rows only. Balanced FT: all banks/known rows."""
     handles, _ = freeze_for_class_ids(model, known_ids if finetune else current_ids)
-    if localization not in ('frozen', 'bbox-last'):
+    if localization not in ('frozen', 'bbox-last', 'cross-attn-last'):
         raise ValueError('Unknown localization adaptation policy')
     if localization == 'bbox-last':
         detector = model.detr if hasattr(model, 'detr') else model
@@ -147,6 +147,8 @@ def configure_trainable(model, current_ids, known_ids, finetune=False, localizat
         # the whole detector/head. Shared heads are naturally deduplicated.
         for head in detector.bbox_embed:
             head.layers[-1].requires_grad_(True)
+    elif localization == 'cross-attn-last':
+        target_decoder_layers(model, 1)[0].cross_attn.requires_grad_(True)
     current = set(current_ids)
     for module in model.modules():
         if isinstance(module, RiskRoutedStage):
