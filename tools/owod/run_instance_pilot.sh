@@ -26,6 +26,12 @@ if [[ ${1:-} == --localization-pair ]]; then
   flock -n "$dir/run.lock" "$python_bin" -u tools/owod/run_localization_pair.py 2>&1 | tee -a "$dir/console.log"
   exit
 fi
+if [[ ${1:-} == --classifier-pair ]]; then
+  dir=output/m-instance-classifier-pair
+  mkdir -p "$dir"
+  flock -n "$dir/run.lock" "$python_bin" -u tools/owod/run_localization_pair.py --classifier-lr 2>&1 | tee -a "$dir/console.log"
+  exit
+fi
 if [[ ${1:-} == --ranking-probe ]]; then
   dir=output/m-instance-ranking-probe
   mkdir -p "$dir"

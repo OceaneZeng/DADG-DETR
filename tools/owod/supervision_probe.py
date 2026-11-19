@@ -3,14 +3,16 @@ import torch
 from util.box_ops import box_cxcywh_to_xyxy, box_iou
 
 
-def current_endpoint_hits(outputs, batch, target, result, known, current, top300=None):
+def current_endpoint_hits(outputs, batch, target, result, known, current, top300=None, *,
+                          include_classification=False):
     """Per current GT: box, correct argmax, and coverage at each output budget."""
     labels = target['labels']
     keep = torch.isin(labels, labels.new_tensor(current))
     labels = labels[keep]
     gt = box_cxcywh_to_xyxy(target['boxes'][keep])
     raw = box_cxcywh_to_xyxy(outputs['pred_boxes'][batch])
-    covers = box_iou(raw, gt)[0] > .5
+    overlaps = box_iou(raw, gt)[0]
+    covers = overlaps > .5
     classes = labels.new_tensor(known)
     argmax = classes[outputs['pred_logits'][batch][:, classes].argmax(dim=1)]
     height, width = target['orig_size'].unbind()
@@ -23,19 +25,40 @@ def current_endpoint_hits(outputs, batch, target, result, known, current, top300
     hits = [labels, covers.any(0), (covers & (argmax[:, None] == labels)).any(0), output_hits(result)]
     if top300 is not None:
         hits.append(output_hits(top300))
+    if include_classification:
+        best_class = argmax[overlaps.argmax(0)]
+        hits.append(torch.where(covers.any(0), best_class, -1))
     return torch.stack(hits, dim=1)
 
 
-def summarize_endpoint(image_hits, current):
+def summarize_endpoint(image_hits, current, *, include_classification=False):
     hits = torch.cat(image_hits)
+    coverage = hits[:, :-1] if include_classification else hits
     names = ['any_box', 'correct_argmax', 'final_output']
-    if hits.shape[1] == 5:
+    if coverage.shape[1] == 5:
         names.append('top300_output')
 
     def counts(rows):
         return dict(gt=len(rows), **dict(zip(names, rows[:, 1:].sum(0).tolist())))
-    return dict(images=len(image_hits), overall=counts(hits),
-                per_class={str(c): counts(hits[hits[:, 0] == c]) for c in current})
+    report = dict(images=len(image_hits), overall=counts(coverage),
+                  per_class={str(c): counts(coverage[coverage[:, 0] == c]) for c in current})
+    if include_classification:
+        covered = hits[hits[:, -1] >= 0]
+        labels, predicted = covered[:, 0], covered[:, -1]
+        correct = predicted == labels
+        predicted_current = torch.isin(predicted, predicted.new_tensor(current))
+        per_class = {}
+        for c in current:
+            ids, totals = predicted[labels == c].unique(return_counts=True)
+            per_class[str(c)] = dict(zip(map(str, ids.tolist()), totals.tolist()))
+        report['classification_at_best_iou'] = {
+            'overall': dict(best_iou_correct=int(correct.sum()), predicted_previous=int((~predicted_current).sum()),
+                            predicted_other_current=int((predicted_current & ~correct).sum())),
+            'predicted_class_counts_by_gt': per_class,
+            'definition': ('Among current GT with IoU > 0.5, use the query with the largest IoU '
+                           'and its top known-class logit. The table maps GT class IDs to predicted class counts.'),
+        }
+    return report
 
 
 def current_candidate_rank_rows(labels, overlap, index, score_tables):

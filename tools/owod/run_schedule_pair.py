@@ -29,7 +29,7 @@ def endpoint(folder, phase):
     return values
 
 
-def coverage(checkpoint, loader, *, include_top300=False):
+def coverage(checkpoint, loader, *, include_top300=False, include_classification=False):
     import torch
     from tools.owod.gnn_calibration import load_detector, move_targets
     from tools.owod.supervision_probe import current_endpoint_hits, summarize_endpoint
@@ -54,8 +54,10 @@ def coverage(checkpoint, loader, *, include_top300=False):
             results = process(outputs, sizes)
             expanded = top300(outputs, sizes) if top300 is not None else [None] * len(targets)
             for i, (target, result, larger_result) in enumerate(zip(targets, results, expanded)):
-                hits.append(current_endpoint_hits(outputs, i, target, result, known, current, larger_result).cpu())
-    return summarize_endpoint(hits, current)
+                hits.append(current_endpoint_hits(
+                    outputs, i, target, result, known, current, larger_result,
+                    include_classification=include_classification).cpu())
+    return summarize_endpoint(hits, current, include_classification=include_classification)
 
 
 def main():

@@ -194,6 +194,8 @@ def validate_checkpoint(args, checkpoint, resume=False):
     if resume:
         if offset != saved_offset:
             raise ValueError('Pseudo-supervision schedule differs from the checkpoint')
+        if getattr(saved, 'class_embed_lr_mult', 1.) != getattr(args, 'class_embed_lr_mult', 1.):
+            raise ValueError('Classifier LR multiplier differs from the checkpoint')
     elif offset and offset != checkpoint.get('epoch', -1) + 1:
         raise ValueError('Pseudo-supervision must continue from the increment endpoint')
     if bool(getattr(saved, 'initialization_audit', '')) != bool(getattr(args, 'initialization_audit', '')):

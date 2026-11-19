@@ -1,4 +1,5 @@
-"""Compare frozen and trainable box projection in the expanded M-OWODB Task 2 pilot."""
+"""Run paired localization or classifier diagnostics for the expanded M-OWODB Task 2 pilot."""
+import argparse
 import json
 import os
 from pathlib import Path
@@ -13,20 +14,28 @@ from tools.owod.run_schedule_pair import coverage, endpoint
 from tools.owod.screening_data import screening_files, write_json
 
 OUTPUT = ROOT / 'output/m-instance-localization-pair'
+CLASSIFIER_OUTPUT = ROOT / 'output/m-instance-classifier-pair'
 PHASES = ('increment', 'finetune')
 
 
-def localization_command(phase, parent, previous, gnn):
-    folder = OUTPUT / 'bbox-last' / phase
+def treatment_command(folder, arm, phase, parent, previous, gnn):
     cmd = pilot.command('off', phase, previous, gnn)
     cmd[cmd.index('--output_dir') + 1] = str(folder)
-    cmd[cmd.index('--graph-localization') + 1] = 'bbox-last'
-    # Pin the completed Task 1 checkpoint at the permitted diagnostic fork.
-    cmd += ['--screen-branch-checkpoint', str(parent)]
+    if arm == 'bbox-last':
+        cmd[cmd.index('--graph-localization') + 1] = 'bbox-last'
+        # Pin the completed Task 1 checkpoint at the permitted diagnostic fork.
+        cmd += ['--screen-branch-checkpoint', str(parent)]
+    elif phase == 'increment':
+        cmd += ['--class_embed_lr_mult', '2']
     return cmd
 
 
-def main():
+def main(argv=None):
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--classifier-lr', action='store_true',
+                        help='Double the classifier LR only in Task 2 increment')
+    args = parser.parse_args(argv)
+
     import torch
     from torch.utils.data import DataLoader
     from tools.owod.gnn_calibration import build_calibration_dataset
@@ -52,13 +61,14 @@ def main():
         if file_sha256(path) != expected:
             raise ValueError(f'Original input changed: {path}')
 
+    output, arm = (CLASSIFIER_OUTPUT, 'classifier-lr2x') if args.classifier_lr else (OUTPUT, 'bbox-last')
     frozen = {phase: source / 'off' / phase / 'checkpoint.pth' for phase in PHASES}
-    trainable = {phase: OUTPUT / 'bbox-last' / phase / 'checkpoint.pth' for phase in PHASES}
+    trainable = {phase: output / arm / phase / 'checkpoint.pth' for phase in PHASES}
     commands = {
-        'increment': localization_command('increment', parent, parent, gnn),
-        'finetune': localization_command('finetune', parent, trainable['increment'], gnn),
+        phase: treatment_command(trainable[phase].parent, arm, phase, parent, previous, gnn)
+        for phase, previous in zip(PHASES, (parent, trainable['increment']))
     }
-    rows = {'frozen': {}, 'bbox-last': {}}
+    rows = {'frozen': {}, arm: {}}
 
     def read_endpoint(path, phase, command):
         saved = torch.load(path, map_location='meta', weights_only=False)
@@ -78,17 +88,17 @@ def main():
             raise ValueError(f'Frozen metrics differ from the completed pilot: {phase}')
         rows['frozen'][phase] = control
 
-    plan = OUTPUT / 'plan.json'
+    plan = output / 'plan.json'
     identity = dict(commands=commands, source_plan=file_sha256(source / 'plan.json'),
                     source_results=file_sha256(source / 'comparison.json'),
                     frozen_checkpoints={phase: file_sha256(path) for phase, path in frozen.items()},
                     commit=subprocess.check_output(['git', 'rev-parse', 'HEAD'], cwd=ROOT, text=True).strip())
     if plan.exists():
         if read_json(plan) != identity:
-            raise ValueError(f'Changed localization comparison inputs: {plan}')
+            raise ValueError(f'Changed paired comparison inputs: {plan}')
     else:
         if any(path.parent.exists() for path in trainable.values()):
-            raise ValueError('Missing plan for existing localization run')
+            raise ValueError('Missing plan for existing paired run')
         write_json(plan, identity)
 
     for phase, path in trainable.items():
@@ -96,25 +106,37 @@ def main():
         if not (path.parent / 'training_complete.json').is_file():
             resume = ['--resume', str(path)] if path.exists() else []
             pilot.run(cmd + resume)
-        rows['bbox-last'][phase], _ = read_endpoint(path, phase, cmd)
+        rows[arm][phase], _ = read_endpoint(path, phase, cmd)
 
     dataset = build_calibration_dataset(Path(saved_args.owod_image_root), files['full_val'])
     loader = DataLoader(dataset, batch_size=2, num_workers=2, collate_fn=collate_fn)
     observed = {
-        arm: {phase: coverage(path, loader, include_top300=True) for phase, path in checkpoints.items()}
-        for arm, checkpoints in [('frozen', frozen), ('bbox-last', trainable)]
+        name: {phase: coverage(path, loader, include_top300=True, include_classification=args.classifier_lr)
+               for phase, path in checkpoints.items()}
+        for name, checkpoints in [('frozen', frozen), (arm, trainable)]
     }
     deltas = {
-        phase: {key: rows['bbox-last'][phase][key] - rows['frozen'][phase][key]
+        phase: {key: rows[arm][phase][key] - rows['frozen'][phase][key]
                 for key in (*pilot.METRICS, 'unknown_tp')}
         for phase in PHASES
     }
-    report = dict(rows=rows, bbox_last_minus_frozen=deltas, coverage=observed,
+    delta_name = f'{arm.replace("-", "_")}_minus_frozen'
+    report = dict(rows=rows, coverage=observed,
                   coverage_images=len(dataset), author_max_detections=50,
                   coverage_output_budgets=[50, 300], status='complete')
-    path = OUTPUT / 'comparison.json'
+    report[delta_name] = deltas
+    summary = {delta_name: deltas}
+    if args.classifier_lr:
+        summary['classifier_lr_multiplier'] = {'increment': 2, 'finetune': 1}
+        summary['coverage_overall'] = {
+            name: {phase: {**view['overall'], **view['classification_at_best_iou']['overall']}
+                   for phase, view in phases.items()}
+            for name, phases in observed.items()
+        }
+        report['summary'] = summary
+    path = output / 'comparison.json'
     write_json(path, report)
-    print(json.dumps(deltas, indent=2), flush=True)
+    print(json.dumps(summary if args.classifier_lr else deltas, indent=2), flush=True)
     print('Comparison saved:', path, flush=True)
 
 
