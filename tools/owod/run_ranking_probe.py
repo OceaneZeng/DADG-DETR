@@ -1,4 +1,5 @@
-"""Compare focal Top-50 and Top-300 on the completed frozen M-OWODB Task 2 checkpoint."""
+"""Compare output budgets or score factors on the frozen M-OWODB Task 2 checkpoint."""
+import argparse
 import json
 from pathlib import Path
 import sys
@@ -12,6 +13,7 @@ from tools.owod.run_schedule_pair import endpoint
 from tools.owod.screening_data import write_json
 
 OUTPUT = ROOT / 'output/m-instance-ranking-probe'
+OBJECTNESS_OUTPUT = ROOT / 'output/m-instance-objectness-probe'
 
 
 def current_counts(view):
@@ -21,7 +23,12 @@ def current_counts(view):
             'precision': counts['tp'] / max(1, counts['tp'] + counts['fp'])}
 
 
-def main():
+def main(argv=None):
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--objectness', action='store_true',
+                        help='At fixed Top-50, omit the objectness factor from known-class scores in the treatment')
+    args = parser.parse_args(argv)
+
     import torch
     from torch.utils.data import BatchSampler, DataLoader
     from datasets import build_dataset
@@ -55,12 +62,18 @@ def main():
     if file_sha256(Path(saved.backbone_weights)) != saved.backbone_weights_sha256:
         raise ValueError('Checkpoint backbone input changed')
 
+    diagnostic = 'class_only_top50' if args.objectness else 'top300'
+    diagnostic_scoring, diagnostic_budget = ('focal_class_only', 50) if args.objectness else (saved.discovery_scoring, 300)
+    variants = {'top50': (known, saved.discovery_scoring, 50),
+                diagnostic: (known, diagnostic_scoring, diagnostic_budget)}
     identity = dict(checkpoint=str(checkpoint), checkpoint_sha256=file_sha256(checkpoint),
                     manifest_sha256=manifest_hash, test_annotation=str(files['full_val']),
                     test_annotation_sha256=manifest['stages'][1]['sha256']['full_val'],
-                    scoring=saved.discovery_scoring, budgets=[50, 300],
+                    scoring=saved.discovery_scoring, budgets=[50, diagnostic_budget],
                     original_eval_world_size=saved.world_size, batch_size=saved.batch_size)
-    report_path = OUTPUT / 'comparison.json'
+    if args.objectness:
+        identity['diagnostic_scoring'] = diagnostic_scoring
+    report_path = (OBJECTNESS_OUTPUT if args.objectness else OUTPUT) / 'comparison.json'
     if report_path.is_file():
         result = read_json(report_path)
         if result['inputs'] != identity:
@@ -83,21 +96,24 @@ def main():
                         num_workers=saved.num_workers, **loader_worker_options(saved.num_workers))
     device = torch.device('cuda:0')
     model, _ = load_detector(saved, checkpoint, device)
-    variants = {f'top{limit}': (known, saved.discovery_scoring, limit) for limit in identity['budgets']}
     print(f'Evaluating {len(dataset)} unique M-OWODB test images with a shared forward pass', flush=True)
     views = evaluate_views(model, loader, dataset.coco, variants, manifest['evaluation'],
-                           previous, current, device, include_current_stats=True, print_freq=250)
-    top50, top300 = (views[name]['metrics'] for name in ('top50', 'top300'))
+                           previous, current, device, include_current_stats=True,
+                           compare_current_ranks=args.objectness, print_freq=250)
+    reference_metrics, diagnostic_metrics = (views[name]['metrics'] for name in variants)
+    delta_name = 'class_only_minus_top50' if args.objectness else 'top300_minus_top50'
     summary = {
-        'top50': top50,
-        'top300': top300,
-        'top300_minus_top50': {key: top300[key] - top50[key] for key in top50},
-        'top50_minus_saved': {key: top50[key] - original_metrics[key] for key in top50},
+        'top50': reference_metrics,
+        diagnostic: diagnostic_metrics,
+        delta_name: {key: diagnostic_metrics[key] - reference_metrics[key] for key in reference_metrics},
+        'top50_minus_saved': {key: reference_metrics[key] - original_metrics[key] for key in reference_metrics},
         'current_counts': {name: current_counts(views[name]) for name in variants},
     }
+    if args.objectness:
+        summary['current_candidate_ranks'] = views['current_candidate_ranks']['overall']
     write_json(report_path, dict(inputs=identity, unique_test_images=len(dataset),
                                  author_test_entries=len(manifest['evaluation']['image_source_ids']),
-                                 reference_budget=50, diagnostic_budget=300,
+                                 reference_budget=50, diagnostic_budget=diagnostic_budget,
                                  units='AP50, recall, precision and H-Score are fractions',
                                  summary=summary, views=views, status='complete'))
     print(json.dumps(summary, indent=2), flush=True)

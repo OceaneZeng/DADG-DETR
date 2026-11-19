@@ -65,13 +65,19 @@ def make_loader(image_root, annotation, batch, workers, shuffle=False, seed=42):
 
 
 def evaluate_views(model, loader, coco, variants, specification, old, current, device, protected_model=None,
-                   *, include_current_stats=False, print_freq=0):
+                   *, include_current_stats=False, compare_current_ranks=False, print_freq=0):
     import torch
     from models.graph_local.discovery import DiscoveryPostProcess
     from models.owod_benchmark_eval import evaluate_author_benchmark
     from util.box_ops import box_cxcywh_to_xyxy, box_iou
     processors = {key: DiscoveryPostProcess(known_ids=ids, max_detections=limit, scoring=scoring)
                   for key, (ids, scoring, limit) in variants.items()}
+    if compare_current_ranks:
+        if (protected_model is not None or len(variants) != 2
+                or any(limit != 50 or not set(current).issubset(ids) for ids, _, limit in variants.values())):
+            raise ValueError('Current candidate ranks require two Top-50 views of the same outputs')
+        from tools.owod.supervision_probe import current_candidate_rank_rows, summarize_candidate_ranks
+        rank_rows = []
     predictions = {key: {} for key in variants}
     stats = {key: dict(detections=0, old=0, current=0, unknown=0, score_sum=0.,
                        old_score_sum=0., current_score_sum=0.) for key in variants}
@@ -86,6 +92,7 @@ def evaluate_views(model, loader, coco, variants, specification, old, current, d
             outputs = model(samples.to(device))
             reference = protected_model(samples.to(device)) if protected_model is not None else None
             sizes = torch.stack([t['orig_size'] for t in targets]).to(device)
+            current_overlaps = {}
             batch_images = {}
             for index, target in enumerate(targets):
                 image_id = int(target['image_id'])
@@ -101,12 +108,18 @@ def evaluate_views(model, loader, coco, variants, specification, old, current, d
                         overlap = box_iou(box_cxcywh_to_xyxy(outputs['pred_boxes'][index]),
                                           box_cxcywh_to_xyxy(boxes))[0]
                         coverage[group]['hits'] += int((overlap.amax(0) > .5).sum())
+                        if compare_current_ranks and group == 'current':
+                            current_overlaps[index] = (target['labels'][selected].to(device), overlap)
+            score_tables = []
             for key, processor in processors.items():
                 if reference is not None:
                     from tools.owod.capacity_probe import isolated_predictions
                     processed = isolated_predictions(outputs, reference, processor, old, current, sizes)
                 else:
-                    processed = processor(outputs, sizes)
+                    processed = processor(outputs, sizes, include_top_indices=bool(current_overlaps))
+                    if current_overlaps:
+                        candidates, categories, _ = processor.candidate_scores(outputs)
+                        score_tables.append((candidates, categories, [result['top_indices'] for result in processed]))
                 for index, image_id in batch_images.items():
                     result = {k: processed[index][k].cpu() for k in ('boxes', 'labels', 'scores')}
                     predictions[key][image_id] = result
@@ -119,6 +132,8 @@ def evaluate_views(model, loader, coco, variants, specification, old, current, d
                     stats[key]['score_sum'] += float(result['scores'].sum())
                     stats[key]['old_score_sum'] += sum(s for s, label in zip(scores, labels) if label in old_set)
                     stats[key]['current_score_sum'] += sum(s for s, label in zip(scores, labels) if label in current_set)
+            for index, (labels, overlap) in current_overlaps.items():
+                rank_rows.append(current_candidate_rank_rows(labels, overlap, index, score_tables))
             if print_freq and (step % print_freq == 0 or step == len(loader)):
                 print(f'Inference {step}/{len(loader)} batches, {len(seen)} images', flush=True)
     report = {}
@@ -148,6 +163,8 @@ def evaluate_views(model, loader, coco, variants, specification, old, current, d
             'definition': 'class-agnostic all-query geometric coverage; not author U-Recall/AP'}
     if protected_model is not None:
         report['coverage_note'] = 'Raw box coverage describes the trained branch only, not the combined predictions.'
+    if compare_current_ranks:
+        report['current_candidate_ranks'] = summarize_candidate_ranks(rank_rows, tuple(variants), current)
     return report
 
 

@@ -495,12 +495,11 @@ class DiscoveryCriterion(nn.Module):
 class DiscoveryPostProcess(PostProcess):
     def __init__(self, *args, scoring='hierarchical', **kwargs):
         super().__init__(*args, **kwargs)
-        if scoring not in ('hierarchical', 'focal'):
+        if scoring not in ('hierarchical', 'focal', 'focal_class_only'):
             raise ValueError('Unknown discovery scoring rule')
         self.scoring = scoring
 
-    @torch.no_grad()
-    def forward(self, outputs, target_sizes):
+    def candidate_scores(self, outputs):
         # Hierarchical is the existing reference. Focal uses independent class
         # scores consistent with sigmoid training; they need not sum to one.
         logits = outputs['pred_logits'][..., self.known_ids]
@@ -510,13 +509,20 @@ class DiscoveryPostProcess(PostProcess):
         unknown = objectness * novelty
         # Focal heads learn independent class events. Preserve that link and
         # do not suppress a supervised known class a second time via novelty.
+        # The diagnostic class-only view omits the known objectness factor.
         known_mass = objectness * (1 - novelty) if self.scoring == 'hierarchical' else objectness
-        probabilities = known * known_mass[..., None]
+        probabilities = known if self.scoring == 'focal_class_only' else known * known_mass[..., None]
         categories = torch.tensor(self.known_ids, device=known.device)
         if len(self.known_ids) < 80:
             probabilities = torch.cat([probabilities, unknown[..., None]], -1)
             categories = torch.cat([categories, categories.new_tensor([91])])
-        values, positions = probabilities.flatten(1).topk(min(self.max_detections, probabilities[0].numel()), dim=1)
+        return probabilities, categories, unknown
+
+    @torch.no_grad()
+    def forward(self, outputs, target_sizes, *, include_top_indices=False):
+        probabilities, categories, unknown = self.candidate_scores(outputs)
+        scores = probabilities.flatten(1)
+        values, positions = scores.topk(min(self.max_detections, scores.shape[1]), dim=1)
         queries = positions // len(categories)
         labels = categories[positions % len(categories)]
         boxes = torch.gather(box_ops.box_cxcywh_to_xyxy(outputs['pred_boxes']), 1,
@@ -524,8 +530,12 @@ class DiscoveryPostProcess(PostProcess):
         h, w = target_sizes.unbind(1)
         boxes *= torch.stack([w, h, w, h], -1)[:, None]
         unknown = unknown.gather(1, queries)
-        return [dict(scores=s, labels=l, boxes=b, unknown_scores=u,
-                     unknown_mask=u >= self.unknown_threshold) for s, l, b, u in zip(values, labels, boxes, unknown)]
+        results = [dict(scores=s, labels=l, boxes=b, unknown_scores=u,
+                        unknown_mask=u >= self.unknown_threshold) for s, l, b, u in zip(values, labels, boxes, unknown)]
+        if include_top_indices:
+            for result, indices in zip(results, positions):
+                result['top_indices'] = indices
+        return results
 
 
 def build(args):

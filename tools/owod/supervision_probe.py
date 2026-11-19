@@ -38,6 +38,49 @@ def summarize_endpoint(image_hits, current):
                 per_class={str(c): counts(hits[hits[:, 0] == c]) for c in current})
 
 
+def current_candidate_rank_rows(labels, overlap, index, score_tables):
+    """Rank the best true-class candidate covering each GT across the whole image."""
+    covered = overlap > .5
+    keep = covered.any(0)
+    labels, covered = labels[keep], covered[:, keep]
+    rows = [labels]
+    for batch_scores, categories, top_indices in score_tables:
+        scores = batch_scores[index]
+        columns = (categories[:, None] == labels).nonzero(as_tuple=True)[0]
+        best = scores[:, columns].masked_fill(~covered, -torch.inf).amax(0)
+        flat = scores.flatten()
+        # Count scores strictly above the best match and measure the actual
+        # selected set separately, so ties at the cutoff follow torch.topk.
+        rank = (flat[:, None] > best).sum(0) + 1
+        selected = top_indices[index]
+        queries = selected // len(categories)
+        hits = (covered[queries] & ((selected % len(categories))[:, None] == columns)).any(0)
+        rows.extend((rank, hits))
+    return torch.stack(rows, dim=1).cpu()
+
+
+def summarize_candidate_ranks(rows, view_names, current):
+    values = torch.cat(rows) if rows else torch.empty((0, 5), dtype=torch.long)
+
+    def summarize_group(group):
+        reference_rank, reference_hit, treatment_rank, treatment_hit = group[:, 1:].unbind(1)
+        variants = {}
+        for name, rank, hit in zip(view_names, (reference_rank, treatment_rank), (reference_hit, treatment_hit)):
+            variants[name] = dict(median_best_rank=float(rank.float().quantile(.5)) if len(rank) else None,
+                                  top50_hits=int(hit.sum()))
+        return dict(gt_with_box=len(group), views=variants,
+                    rank_improved=int((treatment_rank < reference_rank).sum()),
+                    rank_worsened=int((treatment_rank > reference_rank).sum()),
+                    entered_top50=int(((reference_hit == 0) & (treatment_hit == 1)).sum()),
+                    left_top50=int(((reference_hit == 1) & (treatment_hit == 0)).sum()))
+
+    return dict(overall=summarize_group(values),
+                per_class={str(c): summarize_group(values[values[:, 0] == c]) for c in current},
+                definition=('Per unique test image, valid new-class GT with a query at IoU > 0.5. '
+                            'Best rank is 1 plus the number of strictly higher known/unknown scores. '
+                            'Top-50 hits use the actual selected candidates.'))
+
+
 @torch.no_grad()
 def probe_batch(outputs, targets, matcher, known):
     """One row per visible GT. Detection coverage is not one-to-one AP matching."""
