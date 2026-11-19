@@ -42,7 +42,8 @@ def main():
         model.cuda(); criterion.cuda()
         append_stage(model, dict(stage=1, class_ids=[3], old_ids=[1, 2], rank=8,
                                 last_n=1, risk_beta=2., risk=[[.2, .4]], routing='soft'))
-        configure_trainable(model, [3], [1, 2, 3], localization='bbox-last')
+        localization = 'decoder-bbox' if '--decoder-bbox' in sys.argv[1:] else 'bbox-last'
+        configure_trainable(model, [3], [1, 2, 3], localization=localization)
         model.train_discovery()
         criterion.weight_dict['loss_adapter_route'] = 1.
         criterion.epoch = args.discovery_warmup

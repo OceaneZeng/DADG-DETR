@@ -149,7 +149,8 @@ def get_args_parser():
                         help='Batched low-rank products for new runs; loop preserves legacy arithmetic')
     parser.add_argument('--graph-route-loss-coef', type=float, default=1.0)
     parser.add_argument('--graph-routing', choices=('hard', 'soft'), default='hard')
-    parser.add_argument('--graph-localization', choices=('frozen', 'bbox-last', 'cross-attn-last'), default='frozen')
+    parser.add_argument('--graph-localization', choices=('frozen', 'bbox-last', 'cross-attn-last', 'decoder-bbox'),
+                        default='frozen')
     parser.add_argument('--discovery-scoring', choices=('hierarchical', 'focal'), default='hierarchical')
     parser.add_argument('--graph-sketch-max-images', type=int, default=12)
     parser.add_argument('--owod-discovery', action='store_true')
@@ -577,7 +578,7 @@ def main(args):
 
     n_parameters = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print('number of trainable params:', n_parameters)
-    cross_attention_study = args.screen_author_eval and args.graph_localization == 'cross-attn-last'
+    report_screen_diagnostics = args.screen_author_eval and args.owod_stage > 0 and args.instance_mode != 'legacy'
     if args.lr_backbone == 0 and not args.with_tree:
         detector = model_without_ddp.detr if hasattr(model_without_ddp, 'detr') else model_without_ddp
         backbone_trainable = sum(p.numel() for p in detector.backbone.parameters() if p.requires_grad)
@@ -768,7 +769,7 @@ def main(args):
                 owod_previous_class_ids=args.owod_previous_class_ids,
                 owod_current_class_ids=args.owod_current_class_ids,
                 owod_specification=getattr(args, "owod_evaluation", None),
-                include_current_stats=cross_attention_study,
+                include_current_stats=report_screen_diagnostics,
                 print_freq=args.eval_print_freq,
             )
             resumed_test_stats = test_stats
@@ -781,7 +782,7 @@ def main(args):
                                               owod_previous_class_ids=args.owod_previous_class_ids,
                                               owod_current_class_ids=args.owod_current_class_ids,
                                               owod_specification=getattr(args, "owod_evaluation", None),
-                                              include_current_stats=cross_attention_study,
+                                              include_current_stats=report_screen_diagnostics,
                                               print_freq=args.eval_print_freq)
         if args.output_dir:
             utils.save_on_master(coco_evaluator.coco_eval["bbox"].eval, output_dir / "eval.pth")
@@ -846,13 +847,13 @@ def main(args):
                 off_projection_coef=args.off_projection_coef,
                 discovery_teacher=discovery_teacher, runtime_profile=runtime_profile)
         lr_scheduler.step()
-        if cross_attention_study and device.type == 'cuda':
+        if report_screen_diagnostics and device.type == 'cuda':
             train_stats['peak_allocated_mib'] = torch.cuda.max_memory_allocated(device) / 2**20
         if args.output_dir:
             recovery_fields = []
-            if args.discovery_pseudo_epoch_offset or cross_attention_study:
+            if args.discovery_pseudo_epoch_offset or report_screen_diagnostics:
                 recovery_fields.extend(('discovery_pseudo_scale', 'discovery_pseudo_per_image'))
-            if cross_attention_study:
+            if report_screen_diagnostics:
                 recovery_fields.extend(('discovery_alignment_count', 'peak_allocated_mib'))
             recovery_stats = {key: train_stats[key] for key in recovery_fields if key in train_stats}
             checkpoint_paths = [output_dir / 'checkpoint.pth']
@@ -891,7 +892,7 @@ def main(args):
                 owod_previous_class_ids=args.owod_previous_class_ids,
                 owod_current_class_ids=args.owod_current_class_ids,
                 owod_specification=getattr(args, "owod_evaluation", None),
-                include_current_stats=cross_attention_study,
+                include_current_stats=report_screen_diagnostics,
                 print_freq=args.eval_print_freq,
             )
         else:

@@ -6,7 +6,7 @@ import torch
 from torch import nn
 from torch.nn import functional as F
 
-from .lora import freeze_for_class_ids, target_decoder_layers
+from .lora import freeze_for_class_ids, open_decoder_and_bbox, target_decoder_layers
 from util.runtime_profile import scope
 
 
@@ -139,7 +139,7 @@ def append_stage(model, spec):
 def configure_trainable(model, current_ids, known_ids, finetune=False, localization='frozen'):
     """Increment: current bank/rows only. Balanced FT: all banks/known rows."""
     handles, _ = freeze_for_class_ids(model, known_ids if finetune else current_ids)
-    if localization not in ('frozen', 'bbox-last', 'cross-attn-last'):
+    if localization not in ('frozen', 'bbox-last', 'cross-attn-last', 'decoder-bbox'):
         raise ValueError('Unknown localization adaptation policy')
     if localization == 'bbox-last':
         detector = model.detr if hasattr(model, 'detr') else model
@@ -149,6 +149,8 @@ def configure_trainable(model, current_ids, known_ids, finetune=False, localizat
             head.layers[-1].requires_grad_(True)
     elif localization == 'cross-attn-last':
         target_decoder_layers(model, 1)[0].cross_attn.requires_grad_(True)
+    elif localization == 'decoder-bbox':
+        open_decoder_and_bbox(model)
     current = set(current_ids)
     for module in model.modules():
         if isinstance(module, RiskRoutedStage):

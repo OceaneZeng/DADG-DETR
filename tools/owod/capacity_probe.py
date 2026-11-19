@@ -1,6 +1,8 @@
 """Disposable parameter-capacity checks; never alter production training policy."""
 import torch
 
+from models.graph_local.lora import open_decoder_and_bbox as open_detection_parameters
+
 
 @torch.no_grad()
 def isolated_predictions(outputs, reference, processor, old, current, sizes):
@@ -22,15 +24,6 @@ def isolated_predictions(outputs, reference, processor, old, current, sizes):
         keep = merged['scores'].topk(min(processor.max_detections, len(merged['scores']))).indices
         results.append({key: value[keep] for key, value in merged.items()})
     return results
-
-
-def open_detection_parameters(model):
-    """Expose base decoder and complete bbox MLPs; keep existing row/bank masks."""
-    detector = model.detr
-    for name, parameter in detector.transformer.decoder.named_parameters():
-        if not any(part in name for part in ('graph_adapter', 'discovery_adapter', 'class_embed')):
-            parameter.requires_grad_(True)
-    detector.bbox_embed.requires_grad_(True)
 
 
 def parameter_group(name):

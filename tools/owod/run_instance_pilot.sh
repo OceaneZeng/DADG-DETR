@@ -14,6 +14,16 @@ export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1}"
 export OMP_NUM_THREADS=2
 export PYTHONUNBUFFERED=1
 export PYTHONPATH="$PWD/models/ops:$PWD${PYTHONPATH:+:$PYTHONPATH}"
+if [[ ${1:-} == --stronger-parent-study ]]; then
+  shift
+  if [[ ${1:-} == --plan ]]; then
+    exec "$python_bin" tools/owod/run_stronger_parent_study.py "$@"
+  fi
+  dir=output/m-instance-stronger-parent
+  mkdir -p "$dir"
+  flock -n "$dir/run.lock" "$python_bin" -u tools/owod/run_stronger_parent_study.py "$@" 2>&1 | tee -a "$dir/console.log"
+  exit
+fi
 if [[ ${1:-} == --cross-attention-study ]]; then
   shift
   if [[ ${1:-} == --plan ]]; then

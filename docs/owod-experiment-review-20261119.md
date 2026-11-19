@@ -72,3 +72,30 @@ tail -F output/m-instance-cross-attention/console.log
 ```
 
 `progress.json` 在各阶段评估后更新，完成后生成 `comparison.json`。各组的 `train.log`、`metrics.jsonl`、`coverage.json` 和 checkpoint 保存在 `output/m-instance-cross-attention/<arm>/<phase>/`。逐类 AP 用完整作者测试清单的 VOC 积分 AP50。框覆盖、最佳 IoU 处的分类和正确类别候选的中位排名来自独立的固定 128 张留出图。恢复时重跑同一启动命令。
+
+## 更充分的 Task 1 父模型与三种 Task 2 适配范围
+
+前一轮开放末层 cross-attention 的 Current AP50 提高了 0.671 个百分点，Previous 下降 0.273 个百分点，留出图上的原始框覆盖从 96/229 降到 93/229。真实历史匹配在均衡微调后仍略低于关闭迁移组。下一轮把时间用在区分父模型训练不足和新类适配容量不足。
+
+从同一份 DINO 权重训练一个 v10 Task 1 父模型。诊断训练从 6,144 图 × 8 轮扩大到 12,288 图 × 12 轮，约为此前三倍的图像训练次数。Task 2 使用同一批 1,536 张增量图训练 3 轮，再用完整作者均衡记忆训练 1 轮。固定同一 128 图留出集、seed 42、双 3090、每卡 batch 2、focal Top-50 和学习率。该计划创建独立诊断链。
+
+| 组 | Task 2 更新范围 |
+| --- | --- |
+| `frozen` | 现有分类行、适配器与发现分支，基础 decoder 和 bbox 头冻结 |
+| `cross-attn-last` | 在 frozen 基础上，开放最后一层 decoder cross-attention |
+| `decoder-bbox` | 在 frozen 基础上，开放基础 decoder 和完整 bbox MLP，作为有标注条件下的密集适配参照 |
+
+三组共用新父模型校准出的 GNN。增量阶段共用新父模型作为蒸馏教师，微调阶段各自使用本组的增量末轮权重。三组均关闭历史对齐、继续微调阶段的伪未知监督，并沿用相同分类行掩码和联合损失。额外开放的参数沿用 AdamW 分组，sampling offsets 仍按 0.1 倍学习率更新。密集适配参照包含与其余组相同的发现和保持机制，比较的变量是检测器可训练范围。
+
+同步 Git 后，在服务器 Linux/Bash 仓库根目录启动。确认 GPU 0、1 空闲。根据旧父模型每轮约 10 分钟的训练日志，整套先预留 **5–6 小时**，以新任务前两轮日志修正。启动会先核验 M 数据和双卡 CUDA 计算路径。
+
+```bash
+cd ~/disks/new-hdd/zhy/Tree-DETR
+git pull --ff-only origin mowodb &&
+tmux new-session -d -s m-stronger-parent 'CUDA_VISIBLE_DEVICES=0,1 bash tools/owod/run_instance_pilot.sh --stronger-parent-study'
+tail -F output/m-instance-stronger-parent/console.log
+```
+
+`output/m-instance-stronger-parent/progress.json` 记录新父模型和已完成的阶段。全部作业完成后查看同目录的 `comparison.json`。同一提交和输入下，中断后重跑启动命令可从各阶段已保存的 checkpoint 恢复。
+
+先核对新父模型的 Known AP50 和 pseudo 覆盖，再读三组均衡微调末轮。对照标准沿用 Current AP50 至少提高 1 个百分点、Previous AP50 下降不超过 1 个点，并检查 U-Recall、precision、A-OSE 和 WI。若密集适配提升，同时出现旧类或未知检测退化，下一轮针对这一代价重做适配约束。若各组仍然接近旧实验的低 Current AP50，用原始框覆盖和正确类排名决定优先查定位还是训练日程。正式结论需要完整协议与重复种子。

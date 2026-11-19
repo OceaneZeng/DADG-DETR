@@ -16,6 +16,10 @@ def configure_run(args):
         raise ValueError('Instance transfer requires discovery')
     if getattr(args, 'screen_author_eval', False) and not getattr(args, 'owod_screening', ''):
         raise ValueError('screen-author-eval requires a verified diagnostic training subset')
+    if getattr(args, 'graph_localization', 'frozen') == 'decoder-bbox' and not (
+            getattr(args, 'screen_branch_checkpoint', '') and getattr(args, 'screen_author_eval', False)
+            and getattr(args, 'graph_routed_adapter', False) and args.owod_stage == 1):
+        raise ValueError('decoder-bbox requires a shared-parent Task 2 diagnostic')
     risk_mode = getattr(args, 'graph_risk_mode', 'learned')
     compute = getattr(args, 'graph_adapter_compute', 'loop')
     if risk_mode not in ('learned', 'disabled') or compute not in ('loop', 'batched'):

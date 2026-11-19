@@ -37,10 +37,12 @@ PRE_EVAL_FIX = "41f42c12d9a64911291ca04e56df102bc5759ce6"
 FIXED_EVAL_BLOB = "675d49ed86e58a63a5522d04fdfb5fc94e22616e"
 
 
-def command(arm, phase, parent=None, gnn=None):
+def command(arm, phase, parent=None, gnn=None, *, output=None, screen=None, epochs=None):
+    output = OUTPUT if output is None else output
+    screen = SCREEN if screen is None else screen
     stage = int(phase != "task1")
-    folder = OUTPUT / arm / phase
-    epochs = EPOCHS[phase]
+    folder = output / arm / phase
+    epochs = EPOCHS[phase] if epochs is None else epochs
     lr = 5e-6 if phase == "finetune" else 5e-5
     image_root = resolve_image_root(MANIFEST, read_json(MANIFEST))
     cmd = [
@@ -55,7 +57,7 @@ def command(arm, phase, parent=None, gnn=None):
         arm,
         "--expanded-instance-bank",
         "--instance-cache",
-        str(OUTPUT / "retrieval"),
+        str(output / "retrieval"),
         "--owod-discovery",
         "--graph-routed-adapter",
         "--graph-routing",
@@ -75,7 +77,7 @@ def command(arm, phase, parent=None, gnn=None):
         "--activation-checkpointing",
         "--screen-author-eval",
         "--owod-screening",
-        str(SCREEN),
+        str(screen),
         "--owod-manifest",
         str(MANIFEST),
         "--owod-recipe",
@@ -156,8 +158,10 @@ def train(arm, phase, parent=None, gnn=None):
     return checkpoint, metrics(folder, EPOCHS[phase] - 1)
 
 
-def calibrate(arm, checkpoint):
-    folder = OUTPUT / arm / "gnn"
+def calibrate(arm, checkpoint, *, output=None, screen=None):
+    output = OUTPUT if output is None else output
+    screen = SCREEN if screen is None else screen
+    folder = output / arm / "gnn"
     path = folder / "gnn_stage0.pt"
     if not (folder / "calibration_complete.json").exists() or not path.is_file():
         run(
@@ -167,7 +171,7 @@ def calibrate(arm, checkpoint):
                 "--manifest",
                 str(MANIFEST),
                 "--owod-screening",
-                str(SCREEN),
+                str(screen),
                 "--stage",
                 "0",
                 "--checkpoint",
