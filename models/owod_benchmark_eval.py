@@ -34,7 +34,7 @@ def overlaps(box, boxes):
 
 
 def evaluate_author_benchmark(predictions, coco, known_ids, previous_ids, current_ids,
-                              specification):
+                              specification, *, include_current_stats=False):
     known = set(known_ids)
     gt, source_to_id = {}, {}
     for image_id, image in coco.imgs.items():
@@ -66,6 +66,7 @@ def evaluate_author_benchmark(predictions, coco, known_ids, previous_ids, curren
             detections[label].append((float(f'{score:.3f}'), image_id, box))
     ap, curves = {}, {}
     a_ose, fp_at_recall, total_at_recall = 0, [], []
+    current_stats = {}
     unknown_gt = sum(sum(not difficult for _, difficult in gt[i][-1]) for i in sequence)
     unknown_tp = unknown_count = 0
     for label in [*known_ids, -1]:
@@ -99,6 +100,10 @@ def evaluate_author_benchmark(predictions, coco, known_ids, previous_ids, curren
         precision = tp / np.maximum(tp + fp, np.finfo(float).eps)
         ap[label] = voc_ap(recall, precision, specification['ap_mode'])
         curves[label] = {'recall': recall, 'precision': precision}
+        if include_current_stats and label in current_ids:
+            current_stats[label] = dict(ap50=ap[label], gt=npos,
+                                        tp=int(tp[-1]) if len(tp) else 0,
+                                        fp=int(fp[-1]) if len(fp) else 0)
         if label == -1:
             unknown_tp = int(tp[-1]) if len(tp) else 0
             unknown_count = len(items)
@@ -113,6 +118,8 @@ def evaluate_author_benchmark(predictions, coco, known_ids, previous_ids, curren
         if ids:
             group_ap[name] = float(np.mean([ap[c] for c in ids]))
     result = {f'{name.lower()}_ap50': value for name, value in group_ap.items()}
+    if include_current_stats:
+        result['current_class_stats'] = current_stats
     if specification.get('known_only_screening'):
         return result
     result.update({'unknown_gt': float(unknown_gt), 'unknown_predictions': float(unknown_count)})

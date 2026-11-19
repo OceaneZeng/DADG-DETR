@@ -64,7 +64,8 @@ def make_loader(image_root, annotation, batch, workers, shuffle=False, seed=42):
     return dataset, loader
 
 
-def evaluate_views(model, loader, coco, variants, specification, old, current, device, protected_model=None):
+def evaluate_views(model, loader, coco, variants, specification, old, current, device, protected_model=None,
+                   *, include_current_stats=False, print_freq=0):
     import torch
     from models.graph_local.discovery import DiscoveryPostProcess
     from models.owod_benchmark_eval import evaluate_author_benchmark
@@ -75,15 +76,23 @@ def evaluate_views(model, loader, coco, variants, specification, old, current, d
     stats = {key: dict(detections=0, old=0, current=0, unknown=0, score_sum=0.,
                        old_score_sum=0., current_score_sum=0.) for key in variants}
     coverage = {group: {'hits': 0, 'gt': 0} for group in ('old', 'current')}
+    old_set, current_set = set(old), set(current)
+    seen = set()
     model.eval()
     if protected_model is not None:
         protected_model.eval()
     with torch.no_grad():
-        for samples, targets in loader:
+        for step, (samples, targets) in enumerate(loader, 1):
             outputs = model(samples.to(device))
             reference = protected_model(samples.to(device)) if protected_model is not None else None
             sizes = torch.stack([t['orig_size'] for t in targets]).to(device)
+            batch_images = {}
             for index, target in enumerate(targets):
+                image_id = int(target['image_id'])
+                if image_id in seen:
+                    continue
+                seen.add(image_id)
+                batch_images[index] = image_id
                 for group, ids in (('old', old), ('current', current)):
                     selected = torch.isin(target['labels'], torch.tensor(ids, dtype=torch.long))
                     boxes = target['boxes'][selected].to(device)
@@ -98,23 +107,30 @@ def evaluate_views(model, loader, coco, variants, specification, old, current, d
                     processed = isolated_predictions(outputs, reference, processor, old, current, sizes)
                 else:
                     processed = processor(outputs, sizes)
-                for target, result in zip(targets, processed):
-                    result = {k: v.cpu() for k, v in result.items()}
-                    predictions[key][int(target['image_id'])] = result
+                for index, image_id in batch_images.items():
+                    result = {k: processed[index][k].cpu() for k in ('boxes', 'labels', 'scores')}
+                    predictions[key][image_id] = result
                     labels = result['labels'].tolist()
+                    scores = result['scores'].tolist()
                     stats[key]['detections'] += len(labels)
-                    stats[key]['old'] += sum(label in old for label in labels)
-                    stats[key]['current'] += sum(label in current for label in labels)
+                    stats[key]['old'] += sum(label in old_set for label in labels)
+                    stats[key]['current'] += sum(label in current_set for label in labels)
                     stats[key]['unknown'] += labels.count(91)
                     stats[key]['score_sum'] += float(result['scores'].sum())
-                    stats[key]['old_score_sum'] += sum(float(s) for s, label in zip(result['scores'], labels) if label in old)
-                    stats[key]['current_score_sum'] += sum(float(s) for s, label in zip(result['scores'], labels) if label in current)
+                    stats[key]['old_score_sum'] += sum(s for s, label in zip(scores, labels) if label in old_set)
+                    stats[key]['current_score_sum'] += sum(s for s, label in zip(scores, labels) if label in current_set)
+            if print_freq and (step % print_freq == 0 or step == len(loader)):
+                print(f'Inference {step}/{len(loader)} batches, {len(seen)} images', flush=True)
     report = {}
     for key, (ids, scoring, limit) in variants.items():
         values = stats[key]
         count = max(1, values['detections'])
-        metrics = evaluate_author_benchmark(predictions[key], coco, ids,
-                           [c for c in old if c in ids], [c for c in current if c in ids], specification)
+        if print_freq:
+            print(f'Computing author metrics for {key}', flush=True)
+        metrics = evaluate_author_benchmark(predictions.pop(key), coco, ids,
+                           [c for c in old if c in ids], [c for c in current if c in ids], specification,
+                           include_current_stats=include_current_stats)
+        current_stats = metrics.pop('current_class_stats', None)
         if specification.get('diagnostic_current_only'):
             metrics = {'current_ap50': metrics['current_ap50']}
         elif specification.get('diagnostic_previous_only'):
@@ -124,6 +140,8 @@ def evaluate_views(model, loader, coco, variants, specification, old, current, d
                                        'mean_old_score': values['old_score_sum'] / max(1, values['old']),
                                        'mean_current_score': values['current_score_sum'] / max(1, values['current'])},
                        'scoring': scoring, 'max_detections': limit}
+        if current_stats is not None:
+            report[key]['current_class_stats'] = current_stats
     for group, values in coverage.items():
         report[f'raw_{group}_box_recall_iou50'] = {**values,
             'recall': values['hits'] / values['gt'] if values['gt'] else None,
