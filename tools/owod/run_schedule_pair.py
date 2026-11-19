@@ -29,7 +29,7 @@ def endpoint(folder, phase):
     return values
 
 
-def coverage(checkpoint, loader):
+def coverage(checkpoint, loader, *, include_top300=False):
     import torch
     from tools.owod.gnn_calibration import load_detector, move_targets
     from tools.owod.supervision_probe import current_endpoint_hits, summarize_endpoint
@@ -42,14 +42,19 @@ def coverage(checkpoint, loader):
     known, current = args.owod_known_class_ids, args.owod_current_class_ids
     process = DiscoveryPostProcess(known_ids=known, max_detections=args.owod_max_detections,
                                    scoring=args.discovery_scoring, unknown_threshold=args.unknown_threshold)
+    top300 = (DiscoveryPostProcess(known_ids=known, max_detections=300,
+                                  scoring=args.discovery_scoring, unknown_threshold=args.unknown_threshold)
+              if include_top300 else None)
     hits = []
     with torch.no_grad():
         for samples, targets in loader:
             targets = move_targets(targets, device)
             outputs = detector(samples.to(device))
-            results = process(outputs, torch.stack([t['orig_size'] for t in targets]))
-            for i, (target, result) in enumerate(zip(targets, results)):
-                hits.append(current_endpoint_hits(outputs, i, target, result, known, current).cpu())
+            sizes = torch.stack([t['orig_size'] for t in targets])
+            results = process(outputs, sizes)
+            expanded = top300(outputs, sizes) if top300 is not None else [None] * len(targets)
+            for i, (target, result, larger_result) in enumerate(zip(targets, results, expanded)):
+                hits.append(current_endpoint_hits(outputs, i, target, result, known, current, larger_result).cpu())
     return summarize_endpoint(hits, current)
 
 

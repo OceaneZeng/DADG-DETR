@@ -3,8 +3,8 @@ import torch
 from util.box_ops import box_cxcywh_to_xyxy, box_iou
 
 
-def current_endpoint_hits(outputs, batch, target, result, known, current):
-    """Per current GT: class ID, box coverage, correct argmax, actual final output coverage."""
+def current_endpoint_hits(outputs, batch, target, result, known, current, top300=None):
+    """Per current GT: box, correct argmax, and coverage at each output budget."""
     labels = target['labels']
     keep = torch.isin(labels, labels.new_tensor(current))
     labels = labels[keep]
@@ -14,17 +14,26 @@ def current_endpoint_hits(outputs, batch, target, result, known, current):
     classes = labels.new_tensor(known)
     argmax = classes[outputs['pred_logits'][batch][:, classes].argmax(dim=1)]
     height, width = target['orig_size'].unbind()
-    final = result['boxes'] / torch.stack((width, height, width, height))
-    final_hits = (box_iou(final, gt)[0] > .5) & (result['labels'][:, None] == labels)
-    return torch.stack((labels, covers.any(0), (covers & (argmax[:, None] == labels)).any(0),
-                        final_hits.any(0)), dim=1)
+    scale = torch.stack((width, height, width, height))
+
+    def output_hits(predictions):
+        boxes = predictions['boxes'] / scale
+        return ((box_iou(boxes, gt)[0] > .5) & (predictions['labels'][:, None] == labels)).any(0)
+
+    hits = [labels, covers.any(0), (covers & (argmax[:, None] == labels)).any(0), output_hits(result)]
+    if top300 is not None:
+        hits.append(output_hits(top300))
+    return torch.stack(hits, dim=1)
 
 
 def summarize_endpoint(image_hits, current):
     hits = torch.cat(image_hits)
+    names = ['any_box', 'correct_argmax', 'final_output']
+    if hits.shape[1] == 5:
+        names.append('top300_output')
+
     def counts(rows):
-        box, correct, final = rows[:, 1:].sum(0).tolist()
-        return dict(gt=len(rows), any_box=box, correct_argmax=correct, final_output=final)
+        return dict(gt=len(rows), **dict(zip(names, rows[:, 1:].sum(0).tolist())))
     return dict(images=len(image_hits), overall=counts(hits),
                 per_class={str(c): counts(hits[hits[:, 0] == c]) for c in current})
 
