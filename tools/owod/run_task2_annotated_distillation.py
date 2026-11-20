@@ -11,8 +11,7 @@ from tools.owod import probe_task2_distillation_selection as selection
 from tools.owod import probe_task2_duration_holdout as holdout
 from tools.owod import run_instance_pilot as pilot
 from tools.owod import run_stronger_parent_study as study
-from tools.owod.diagnose_learning import evaluate_views, make_loader
-from tools.owod.gnn_calibration import load_detector
+from tools.owod.diagnose_learning import make_loader
 from tools.owod.protocol import file_sha256, read_json, resolve_image_root
 from tools.owod.run_cross_attention_study import pin
 from tools.owod.screening_data import screening_files, write_json
@@ -90,30 +89,17 @@ def main():
     images = [img['owod_source_id'] for img in read_json(annotation)['images']]
     spec = dict(manifest['evaluation'], image_source_ids=images, known_only_screening=True)
     dataset, loader = make_loader(resolve_image_root(pilot.MANIFEST, manifest), annotation, 2, 2)
-    stage = manifest['stages'][1]
     rows, deltas = {}, {}
     for seed, job in plan['jobs'].items():
         rows[seed] = {}
         for arm, command in job['commands'].items():
             checkpoint, args = study.run_job(command, job['screen_sha256'])
-            digest = file_sha256(checkpoint)
-            path = checkpoint.parent / 'holdout.json'
-            if not path.exists():
-                model, _ = load_detector(args, checkpoint, torch.device('cuda'))
-                print(f'Evaluating seed {seed} {arm} on {len(images)} holdout images', flush=True)
-                views = evaluate_views(model, loader, dataset.coco, {'top50': (stage['active_classes'], 'focal', 50)},
-                                       spec, manifest['stages'][0]['classes'], stage['classes'], 'cuda',
-                                       include_current_stats=True, print_freq=64)
-                write_json(path, dict(view=views, plan_sha256=plan_hash, checkpoint_sha256=digest))
-                del model
-            report = read_json(path)
-            if report['plan_sha256'] != plan_hash or report['checkpoint_sha256'] != digest:
-                raise ValueError(f'Unexpected checkpoint or holdout evaluation: {path}')
+            report = holdout.evaluate_finetune_holdout(checkpoint, args, dataset, loader, spec, plan_hash)
             last = json.loads((checkpoint.parent / 'metrics.jsonl').read_text().splitlines()[-1])
             extra = last.get('train_distill_annotated_queries_unscaled', 0.)
             if last['epoch'] != 0 or (arm == 'annotated' and extra <= 0):
                 raise ValueError(f'Missing finetune endpoint or annotated query signal: {checkpoint}')
-            rows[seed][arm] = dict(heldout=report['view']['top50']['metrics'], checkpoint_sha256=digest,
+            rows[seed][arm] = dict(heldout=report['view']['top50']['metrics'], checkpoint_sha256=report['checkpoint_sha256'],
                                    distill_queries=last['train_distill_queries'], extra_queries=extra)
             write_json(OUTPUT / 'progress.json', dict(status='partial', plan_sha256=plan_hash, rows=rows))
         baseline = rows[seed]['control']['heldout']

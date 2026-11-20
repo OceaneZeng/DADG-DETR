@@ -93,3 +93,11 @@ flowchart LR
 实验开关 `--screen-annotated-distill` 只用于 Task 2 均衡微调。若一张训练图没有通过原门槛的候选，先找出在全部已知类中预测类别与已标注旧目标一致、且框 IoU > 0.5 的 query，再取旧类置信度最高的一个。没有匹配则不增加蒸馏位置。日志列 `distill_annotated_queries_unscaled` 记录每卡每批新增的 query 数。[选择与损失](../models/graph_local/distillation.py)
 
 两枚 seed 各自从同一增量末轮权重开始，在同一提交下运行原规则与补充规则，共四次单轮微调。以 1,024 张独立留出图上均衡微调末轮的 Previous AP50 为主端点，同时比较 Current 和 Known AP50。两枚 seed 均须达到 Previous 至少增加 0.5 个百分点、Current 至多下降 0.5 个百分点且 Known 上升，才进入下一轮验证。[配对启动器](../tools/owod/run_task2_annotated_distillation.py)
+
+补充规则在 seed 42/43 上分别降低 Previous AP50 0.182/0.192 个百分点，Known 也下降。后续对照保留原规则。
+
+## 六轮增量训练下的历史实例对齐
+
+两份使用 12,288 张图训练 12 轮的 Task 1 父模型，从各自历史库中分别匹配到 79 条、234 条实例记录，覆盖 12 个、13 个新类。每个 seed 的三条链共用其父模型、校准 GNN、实例库、训练图及优化配置。Task 2 各训练六轮增量、一轮均衡微调。真实匹配组按既有检索目标对齐；打乱组保留相同的当前实例和权重，重排历史槽位的目标特征；关闭组保留实例库与其余训练损失，仅关闭历史实例对齐。运行记录同时检查增量期实际对齐数和跨槽打乱数。
+
+主端点是 1,024 张独立留出图上的微调末轮 Current AP50，另记有匹配和无匹配类别的分组 AP50。在两个 seed 上，真实匹配相对两个对照均须增加至少 0.5 个百分点的 Current AP50，相对关闭组的 Previous 至多损失 0.5 个百分点且 Known 上升，才扩大验证。作者测试清单的阶段指标留作报告。[运行计划及端点](../tools/owod/run_task2_history_alignment.py)

@@ -23,6 +23,23 @@ IMAGES_PER_TASK = 512
 SELECTION_SEED = 44
 
 
+def evaluate_finetune_holdout(checkpoint, args, dataset, loader, spec, plan_hash):
+    """Persist a single fixed-weight focal Top-50 evaluation beside its checkpoint."""
+    digest = file_sha256(checkpoint)
+    path = checkpoint.parent / 'holdout.json'
+    if not path.exists():
+        model, _ = load_detector(args, checkpoint, torch.device('cuda'))
+        print(f'Evaluating {checkpoint.parent} on {len(dataset)} holdout images', flush=True)
+        views = evaluate_views(model, loader, dataset.coco, {'top50': (args.owod_known_class_ids, 'focal', 50)},
+                               spec, args.owod_previous_class_ids, args.owod_current_class_ids, 'cuda',
+                               include_current_stats=True, print_freq=64)
+        write_json(path, dict(view=views, plan_sha256=plan_hash, checkpoint_sha256=digest))
+    report = read_json(path)
+    if report['plan_sha256'] != plan_hash or report['checkpoint_sha256'] != digest:
+        raise ValueError(f'Unexpected checkpoint or holdout evaluation: {path}')
+    return report
+
+
 def fresh_annotations():
     manifest, first = screening_files(MANIFEST, study.SCREEN, 0)
     _, second = screening_files(MANIFEST, study.SCREEN, 1)

@@ -31,12 +31,13 @@ if [[ ${1:-} == --task2-exposure-pair ]]; then
   flock -n "$dir/run.lock" "$python_bin" -u -m tools.owod.run_task2_exposure_pair 2>&1 | tee -a "$dir/console.log"
   exit
 fi
-if [[ ${1:-} == --task2-annotated-distillation ]]; then
-  dir=output/m-instance-task2-annotated-distillation
+if [[ ${1:-} == --task2-annotated-distillation || ${1:-} == --task2-history-alignment ]]; then
+  study="${1#--}"
+  dir="output/m-instance-$study"
   export TMPDIR="$PWD/output/.tmp-owod"
   mkdir -p "$dir"
   mkdir -p -m 700 "$TMPDIR"
-  flock -n "$dir/run.lock" "$python_bin" -u -m tools.owod.run_task2_annotated_distillation 2>&1 | tee -a "$dir/console.log"
+  flock -n "$dir/run.lock" "$python_bin" -u -m "tools.owod.run_${study//-/_}" 2>&1 | tee -a "$dir/console.log"
   exit
 fi
 if [[ ${1:-} == --task2-six-epochs || ${1:-} == --task2-six-epochs-seed43 ]]; then
