@@ -15,23 +15,38 @@ from tools.owod.run_cross_attention_study import differences, pin
 from tools.owod.run_schedule_pair import endpoint
 from tools.owod.screening_data import screening_files, write_json
 
-OUTPUT = ROOT / 'output/m-instance-decoder-bbox-lr-half'
-LR_MULTIPLIER = 0.5
 CONTROL = 'decoder-bbox'
-ARM = 'decoder-bbox-lr-half'
+HALF = 'decoder-bbox-lr-half'
+THREE_QUARTER = 'decoder-bbox-lr-three-quarter'
+LR_MULTIPLIERS = {HALF: 0.5, THREE_QUARTER: 0.75}
 
 
-def treatment_commands(reference):
+def treatment_commands(reference, output, multiplier):
     commands = {phase: list(reference[phase]) for phase in study.PHASES}
     for phase, command in commands.items():
-        command[command.index('--output_dir') + 1] = str(OUTPUT / phase)
-        command.extend(['--decoder-bbox-lr-mult', str(LR_MULTIPLIER)])
+        command[command.index('--output_dir') + 1] = str(output / phase)
+        command.extend(['--decoder-bbox-lr-mult', str(multiplier)])
     finetune = commands['finetune']
-    finetune[finetune.index('--pretrained') + 1] = str(OUTPUT / 'increment/checkpoint.pth')
+    finetune[finetune.index('--pretrained') + 1] = str(output / 'increment/checkpoint.pth')
     return commands
 
 
-def run_pair(task1, arms):
+def completed_half_arm(provenance, controls, seed):
+    folder = ROOT / 'output' / f'm-instance-{HALF}'
+    path = folder / 'comparison.json'
+    if not path.is_file():
+        print(f'Half-rate results unavailable: {path}', flush=True)
+        return None
+    plan, results = read_json(folder / 'plan.json'), read_json(path)
+    if (any(plan.get(key) != value for key, value in provenance.items())
+            or results['status'] != 'complete' or results['seed'] != seed
+            or results['decoder_bbox_lr_mult'] != LR_MULTIPLIERS[HALF]
+            or any(results['rows'][name] != row for name, row in controls.items())):
+        raise ValueError(f'Half-rate results do not match the source study: {path}')
+    return results['rows'][HALF]
+
+
+def run_pair(task1, arms, arm, output):
     import torch
     from torch.utils.data import DataLoader
     from tools.owod.gnn_calibration import build_calibration_dataset
@@ -74,43 +89,52 @@ def run_pair(task1, arms):
     if control_increment.graph_adapter_specs[-1]['instances']['cache_sha256'] != cache_hash:
         raise ValueError('Original instance cache changed')
 
-    commands = treatment_commands(original['arms'][CONTROL])
-    pin(OUTPUT / 'plan.json', dict(commands=commands, commit=subprocess.check_output(
-        ['git', 'rev-parse', 'HEAD'], cwd=ROOT, text=True).strip(),
+    multiplier = LR_MULTIPLIERS[arm]
+    commands = treatment_commands(original['arms'][CONTROL], output, multiplier)
+    provenance = dict(
         source_plan_sha256=file_sha256(plan_path), source_comparison_sha256=file_sha256(results_path),
-        parent_sha256=parent_hash, gnn_sha256=gnn_hash, screen_sha256=screen_hash, cache_sha256=cache_hash))
+        parent_sha256=parent_hash, gnn_sha256=gnn_hash, screen_sha256=screen_hash, cache_sha256=cache_hash)
+    if arm == THREE_QUARTER:
+        half = completed_half_arm(provenance, rows, results['seed'])
+        if half is not None:
+            rows[HALF] = half
+    pin(output / 'plan.json', dict(commands=commands, commit=subprocess.check_output(
+        ['git', 'rev-parse', 'HEAD'], cwd=ROOT, text=True).strip(), **provenance))
     dataset = build_calibration_dataset(Path(parent_args.owod_image_root), files['full_val'])
     loader = DataLoader(dataset, batch_size=2, num_workers=2, collate_fn=collate_fn)
-    rows[ARM] = {}
+    rows[arm] = {}
     report = dict(status='partial', rows=rows, seed=results['seed'], paper_comparable=False,
-                  primary_endpoint='finetune', decoder_bbox_lr_mult=LR_MULTIPLIER, units=results['units'])
-    write_json(OUTPUT / 'progress.json', report)
+                  primary_endpoint='finetune', decoder_bbox_lr_mult=multiplier, units=results['units'])
+    write_json(output / 'progress.json', report)
     for phase, cmd in commands.items():
         path, args = study.run_job(cmd, screen_hash)
         row = study.study_endpoint(path, args, phase, loader, parent_hash, gnn_hash, cache_hash)
         if row['trainable_parameters'] != rows[CONTROL][phase]['trainable_parameters']:
             raise ValueError(f'Trainable parameter count changed: {path}')
-        rows[ARM][phase] = row
-        write_json(OUTPUT / 'progress.json', report)
+        rows[arm][phase] = row
+        write_json(output / 'progress.json', report)
 
-    deltas = {name: {phase: differences(rows[ARM][phase]['metrics'], baseline[phase]['metrics'])
+    deltas = {name: {phase: differences(rows[arm][phase]['metrics'], baseline[phase]['metrics'])
                      for phase in study.PHASES}
-              for name, baseline in rows.items() if name != ARM}
+              for name, baseline in rows.items() if name != arm}
     final = deltas['frozen']['finetune']
     passed = final['current_ap50'] >= .01 and final['previous_ap50'] >= -.01
     report.update(status='complete', deltas=deltas, capacity_screen_passed=passed)
-    write_json(OUTPUT / 'comparison.json', report)
-    write_json(OUTPUT / 'progress.json', report)
+    write_json(output / 'comparison.json', report)
+    write_json(output / 'progress.json', report)
     print(json.dumps(dict(deltas=deltas, capacity_screen_passed=passed), indent=2))
-    print('Comparison saved:', OUTPUT / 'comparison.json', flush=True)
+    print('Comparison saved:', output / 'comparison.json', flush=True)
 
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--plan', action='store_true', help='Print the two jobs without training')
+    parser.add_argument('--three-quarter', action='store_true', help='Use a 0.75 multiplier instead of 0.5')
     options = parser.parse_args()
+    arm = THREE_QUARTER if options.three_quarter else HALF
+    output = ROOT / 'output' / f'm-instance-{arm}'
     task1, arms = study.study_commands()
     if options.plan:
-        print(json.dumps(treatment_commands(arms[CONTROL]), indent=2))
+        print(json.dumps(treatment_commands(arms[CONTROL], output, LR_MULTIPLIERS[arm]), indent=2))
     else:
-        run_pair(task1, arms)
+        run_pair(task1, arms, arm, output)
