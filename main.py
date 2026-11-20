@@ -48,6 +48,19 @@ def load_local_checkpoint(path):
         return torch.load(path, map_location='cpu', weights_only=True)
 
 
+def scale_decoder_bbox_lr(model, groups, multiplier):
+    from models.graph_local.lora import decoder_bbox_parameters
+
+    selected = set(decoder_bbox_parameters(model))
+    scaled_groups = []
+    for group in groups:
+        dense = [parameter for parameter in group['params'] if parameter in selected]
+        if dense:
+            group['params'] = [parameter for parameter in group['params'] if parameter not in selected]
+            scaled_groups.append({**group, 'params': dense, 'lr': group['lr'] * multiplier})
+    return groups + scaled_groups
+
+
 def get_args_parser():
     parser = argparse.ArgumentParser('Deformable DETR Detector', add_help=False)
     parser.add_argument('--lr', default=2e-4, type=float)
@@ -263,6 +276,8 @@ def get_args_parser():
     parser.add_argument('--focal_alpha', default=0.25, type=float)
     parser.add_argument('--class_embed_lr_mult', default=1.0, type=float,
                         help='learning-rate multiplier for a newly initialized classifier')
+    parser.add_argument('--decoder-bbox-lr-mult', default=1.0, type=float,
+                        help='scale the base decoder and bbox learning rates in the decoder-bbox diagnostic')
     # dataset parameters
     parser.add_argument('--dataset_file', default='coco')
     parser.add_argument('--coco_path', default='./data/coco', type=str)
@@ -680,6 +695,12 @@ def main(args):
                                      (args.graph_routed_adapter and args.owod_stage > 0)) else args.weight_decay,
         }
     ]
+    decoder_bbox_lr_mult = getattr(args, 'decoder_bbox_lr_mult', 1.0)
+    if decoder_bbox_lr_mult != 1.0:
+        param_dicts = scale_decoder_bbox_lr(model_without_ddp, param_dicts, decoder_bbox_lr_mult)
+        print('Decoder/bbox LR multiplier:', decoder_bbox_lr_mult)
+        print('Optimizer groups (learning rate, parameter count):',
+              [(group['lr'], sum(p.numel() for p in group['params'])) for group in param_dicts])
     if args.sgd:
         optimizer = torch.optim.SGD(param_dicts, lr=args.lr, momentum=0.9,
                                     weight_decay=args.weight_decay)

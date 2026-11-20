@@ -62,6 +62,23 @@ def run_job(command, screen_hash):
     return checkpoint, saved['args']
 
 
+def study_endpoint(path, args, phase, loader, parent_hash, gnn_hash, cache_hash):
+    spec = args.graph_adapter_specs[-1]
+    if (spec['source_checkpoint_sha256'] != parent_hash
+            or spec['gnn_sha256'] != gnn_hash
+            or spec['instances']['cache_sha256'] != cache_hash
+            or spec['alignment_summary']['applied'] != 0):
+        raise ValueError(f'Different parent/GNN/cache or nonzero alignment: {path}')
+    metrics = endpoint(path.parent, phase)
+    if phase == 'finetune' and metrics['discovery_pseudo_scale'] != 1.:
+        raise ValueError(f'Finetuning did not continue the pseudo schedule: {path}')
+    last = json.loads((path.parent / 'metrics.jsonl').read_text(encoding='utf-8').splitlines()[-1])
+    return dict(metrics=metrics, current_classes=last['test_owod_current_class_stats'],
+                trainable_parameters=last['n_parameters'],
+                peak_allocated_mib_rank0=last['train_peak_allocated_mib'],
+                heldout=endpoint_coverage(path, loader, path.parent / 'coverage.json'))
+
+
 def run_study(task1, jobs):
     import torch
     from torch.utils.data import DataLoader
@@ -115,21 +132,7 @@ def run_study(task1, jobs):
         rows[arm] = {}
         for phase, cmd in phases.items():
             path, args = run_job(cmd, screen_hash)
-            spec = args.graph_adapter_specs[-1]
-            if (spec['source_checkpoint_sha256'] != parent_hash
-                    or spec['gnn_sha256'] != gnn_hash
-                    or spec['instances']['cache_sha256'] != file_sha256(cache)
-                    or spec['alignment_summary']['applied'] != 0):
-                raise ValueError(f'Different parent/GNN/cache or nonzero alignment: {path}')
-            metrics = endpoint(path.parent, phase)
-            if phase == 'finetune' and metrics['discovery_pseudo_scale'] != 1.:
-                raise ValueError(f'Finetuning did not continue the pseudo schedule: {path}')
-            last = json.loads((path.parent / 'metrics.jsonl').read_text(encoding='utf-8').splitlines()[-1])
-            rows[arm][phase] = dict(
-                metrics=metrics, current_classes=last['test_owod_current_class_stats'],
-                trainable_parameters=last['n_parameters'],
-                peak_allocated_mib_rank0=last['train_peak_allocated_mib'],
-                heldout=endpoint_coverage(path, loader, path.parent / 'coverage.json'))
+            rows[arm][phase] = study_endpoint(path, args, phase, loader, parent_hash, gnn_hash, file_sha256(cache))
             write_json(OUTPUT / 'progress.json', report)
     deltas = {
         arm: {phase: differences(rows[arm][phase]['metrics'], rows['frozen'][phase]['metrics'])

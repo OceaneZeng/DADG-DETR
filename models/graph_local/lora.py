@@ -24,13 +24,19 @@ def target_decoder_layers(model: nn.Module, last_n: int = 2) -> Sequence[nn.Modu
     return layers[-last_n:]
 
 
-def open_decoder_and_bbox(model: nn.Module):
-    """Train the base decoder and bbox head while preserving adapter and class masks."""
+def decoder_bbox_parameters(model: nn.Module):
+    """Yield base decoder and bbox parameters, excluding adapters and the classifier."""
     detector = _detector(model)
     for name, parameter in detector.transformer.decoder.named_parameters():
         if not any(part in name for part in ('graph_adapter', 'discovery_adapter', 'class_embed')):
-            parameter.requires_grad_(True)
-    detector.bbox_embed.requires_grad_(True)
+            yield parameter
+    yield from detector.bbox_embed.parameters()
+
+
+def open_decoder_and_bbox(model: nn.Module):
+    """Train the base decoder and bbox head while preserving adapter and class masks."""
+    for parameter in decoder_bbox_parameters(model):
+        parameter.requires_grad_(True)
 
 
 def target_base_weights(model: nn.Module, last_n: int = 2) -> List[nn.Parameter]:

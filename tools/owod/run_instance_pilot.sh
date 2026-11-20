@@ -14,6 +14,18 @@ export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1}"
 export OMP_NUM_THREADS=2
 export PYTHONUNBUFFERED=1
 export PYTHONPATH="$PWD/models/ops:$PWD${PYTHONPATH:+:$PYTHONPATH}"
+if [[ ${1:-} == --decoder-bbox-lr-pair ]]; then
+  shift
+  if [[ ${1:-} == --plan ]]; then
+    exec "$python_bin" tools/owod/run_decoder_bbox_lr_pair.py "$@"
+  fi
+  dir=output/m-instance-decoder-bbox-lr-half
+  export TMPDIR="$PWD/output/.tmp-owod"
+  mkdir -p "$dir"
+  mkdir -p -m 700 "$TMPDIR"
+  flock -n "$dir/run.lock" "$python_bin" -u tools/owod/run_decoder_bbox_lr_pair.py "$@" 2>&1 | tee -a "$dir/console.log"
+  exit
+fi
 if [[ ${1:-} == --stronger-parent-study ]]; then
   shift
   if [[ ${1:-} == --plan ]]; then

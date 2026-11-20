@@ -39,6 +39,7 @@ def validate_plan_arguments(run, saved):
                    'discovery_known_rank_coef': 0.,
                    'discovery_feature_grad_scale': 1.,
                    'discovery_background_negative': False,
+                   'decoder_bbox_lr_mult': 1.,
                    'initialization_audit': '',
                    'graph_risk_mode': 'learned', 'graph_adapter_compute': 'loop',
                    'instance_mode': 'legacy', 'instance_cache': '', 'screen_author_eval': False,

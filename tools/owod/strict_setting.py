@@ -16,7 +16,12 @@ def configure_run(args):
         raise ValueError('Instance transfer requires discovery')
     if getattr(args, 'screen_author_eval', False) and not getattr(args, 'owod_screening', ''):
         raise ValueError('screen-author-eval requires a verified diagnostic training subset')
-    if getattr(args, 'graph_localization', 'frozen') == 'decoder-bbox' and not (
+    localization = getattr(args, 'graph_localization', 'frozen')
+    decoder_bbox_lr_mult = getattr(args, 'decoder_bbox_lr_mult', 1.)
+    if (not 0 < decoder_bbox_lr_mult <= 1
+            or (decoder_bbox_lr_mult != 1. and localization != 'decoder-bbox')):
+        raise ValueError('Decoder/bbox LR multiplier must be in (0, 1] and requires decoder-bbox when reduced')
+    if localization == 'decoder-bbox' and not (
             getattr(args, 'screen_branch_checkpoint', '') and getattr(args, 'screen_author_eval', False)
             and getattr(args, 'graph_routed_adapter', False) and args.owod_stage == 1):
         raise ValueError('decoder-bbox requires a shared-parent Task 2 diagnostic')
@@ -216,6 +221,8 @@ def validate_checkpoint(args, checkpoint, resume=False):
                  and args.owod_phase == 'increment' and getattr(saved, 'owod_stage', None) == 0
                  and getattr(saved, 'owod_phase', None) == 'increment'
                  and not getattr(saved, 'graph_adapter_specs', []))
+    if not branching and getattr(saved, 'decoder_bbox_lr_mult', 1.) != getattr(args, 'decoder_bbox_lr_mult', 1.):
+        raise ValueError('Decoder/bbox LR multiplier differs from the checkpoint')
     if shared_parent and (not getattr(args, 'owod_screening_sha256', None) or args.owod_stage != 1
                           or not getattr(args, 'owod_discovery', False)
                           or not getattr(args, 'graph_routed_adapter', False)):
