@@ -59,7 +59,7 @@ def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
                     off_neighborhood_basis: torch.Tensor | None = None,
                     off_projection_coef: float = 0.0,
                     discovery_teacher: torch.nn.Module | None = None,
-                    runtime_profile=None):
+                    runtime_profile=None, distill_annotated_known_ids=None):
     model.train()
     criterion.train()
     discovery_epoch = epoch + getattr(criterion, 'pseudo_epoch_offset', 0)
@@ -69,7 +69,7 @@ def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
         delimiter="  ",
         visible_meters={"lr", "class_error", "grad_norm", "loss", "loss_ce",
                         "loss_bbox", "loss_giou", "loss_distill_cls",
-                        "loss_distill_bbox", "distill_queries", "pseudo_labels",
+                        "loss_distill_bbox", "distill_queries", "distill_annotated_queries_unscaled", "pseudo_labels",
                         "loss_local_margin", "loss_off_projection", "loss_adapter_route",
                         "adapter_active_fraction", "loss_objectness", "loss_unknown",
                         "loss_discovery_route", "loss_discovery_consistency", "loss_affinity",
@@ -131,7 +131,9 @@ def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
                 distill_losses, distill_query_count = old_class_distillation_losses(
                     outputs, teacher_outputs, distill_old_class_ids or [],
                     score_threshold=distill_score_threshold,
-                    max_queries_per_image=distill_max_queries)
+                    max_queries_per_image=distill_max_queries,
+                    annotated_targets=targets if distill_annotated_known_ids else None,
+                    known_ids=distill_annotated_known_ids)
             loss_dict.update(distill_losses)
             weight_dict.update({
                 'loss_distill_cls': float(distill_class_coef),

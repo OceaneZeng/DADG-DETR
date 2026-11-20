@@ -72,3 +72,24 @@ tail -f output/m-instance-expanded/console.log
 每阶段的 train.log、metrics.jsonl 和 checkpoint.pth 位于对应组别目录。comparison.json 记录实例库实际扫描图数、保留的代表和不同来源图数、接受的类别，以及各组在 increment、balanced finetune 固定末轮的指标和差值。candidate_coverage.json 单独统计 Task 1 的候选覆盖。先看 matched 的末轮 Current AP50 是否同时高于 off 和 shuffled，再看 Previous/Known AP50、U-Recall、precision、预测数、WI 和 A-OSE 的变化。一次短程单种子结果用于决定是否扩大训练。
 
 按全局 batch 4 计，Task 1 约 12,288 步，三个 Task 2 合计约 4,764 步，另含七次完整评估、一次 GNN 校准及历史库提取。双 3090 空闲时先预留 5–9 小时。历史 M 全量 Task 1 的训练与评估耗时见[双卡记录](owod-control-lr-quarter-epoch8-analysis-20261111.md)；v10 的实际吞吐和磁盘读取速度要以本次日志为准。
+
+## Task 2 均衡微调的旧类蒸馏对照
+
+六轮增量后的教师在均衡训练图上很少给出超过 0.3 的旧类分数。seed 42 和 43 分别有 2,993 和 3,360 个旧类目标拥有定位正确、旧类中分类正确的候选，但其所有正确候选都低于门槛。每张空选图直接补入一个高分候选时，均衡图上的正确匹配率分别为 51.49% 和 56.49%。本诊断检验均衡图中已释放的标注能否帮助选择蒸馏位置，改善训练后的旧类 AP50。
+
+```mermaid
+flowchart LR
+    teacher["冻结的 Task 2 增量教师"] --> predictions["query 分类分数与预测框"]
+    predictions --> gate["现有置信度筛选"]
+    gate -->|已有候选| slots["蒸馏位置"]
+    gate -->|该图无候选| match["按已知类预测和 IoU 匹配旧类标注"]
+    predictions --> match
+    gt["均衡微调图的已释放旧类标注"] --> match
+    match -->|有匹配时补一个| slots
+    slots --> loss["同位置旧类 logits 的 KL 与框的 Smooth L1"]
+    student["学生 query 的预测"] --> loss
+```
+
+实验开关 `--screen-annotated-distill` 只用于 Task 2 均衡微调。若一张训练图没有通过原门槛的候选，先找出在全部已知类中预测类别与已标注旧目标一致、且框 IoU > 0.5 的 query，再取旧类置信度最高的一个。没有匹配则不增加蒸馏位置。日志列 `distill_annotated_queries_unscaled` 记录每卡每批新增的 query 数。[选择与损失](../models/graph_local/distillation.py)
+
+两枚 seed 各自从同一增量末轮权重开始，在同一提交下运行原规则与补充规则，共四次单轮微调。以 1,024 张独立留出图上均衡微调末轮的 Previous AP50 为主端点，同时比较 Current 和 Known AP50。两枚 seed 均须达到 Previous 至少增加 0.5 个百分点、Current 至多下降 0.5 个百分点且 Known 上升，才进入下一轮验证。[配对启动器](../tools/owod/run_task2_annotated_distillation.py)

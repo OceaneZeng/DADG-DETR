@@ -150,6 +150,8 @@ def get_args_parser():
     parser.add_argument('--distill-bbox-coef', default=5.0, type=float)
     parser.add_argument('--distill-score-threshold', default=0.3, type=float)
     parser.add_argument('--distill-max-queries', default=20, type=int)
+    parser.add_argument('--screen-annotated-distill', action='store_true',
+                        help='Add one label-matched old teacher query on empty balanced finetuning images')
     parser.add_argument('--neighbor-scoped-lora', action='store_true',
                         help='train a temporary stage-level LoRA on the final decoder FFNs')
     parser.add_argument('--graph-routed-adapter', action='store_true',
@@ -862,6 +864,8 @@ def main(args):
                 distill_bbox_coef=args.distill_bbox_coef,
                 distill_score_threshold=args.distill_score_threshold,
                 distill_max_queries=args.distill_max_queries,
+                distill_annotated_known_ids=(args.owod_known_class_ids
+                                            if getattr(args, 'screen_annotated_distill', False) else None),
                 teacher_completion=args.teacher_completion,
                 teacher_old_class_ids=args.teacher_old_class_ids,
                 teacher_score_threshold=args.teacher_score_threshold,
