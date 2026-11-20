@@ -8,6 +8,22 @@ import torch
 import torch.nn.functional as F
 
 
+def select_distillation_queries(confidence: torch.Tensor, score_threshold: float,
+                               max_queries_per_image: int) -> torch.Tensor:
+    """Select the teacher-confident query slots used by old-class distillation."""
+    selected = torch.zeros_like(confidence, dtype=torch.bool)
+    limit = max(0, int(max_queries_per_image))
+    for image_index in range(confidence.shape[0]):
+        candidates = torch.nonzero(
+            confidence[image_index] >= float(score_threshold), as_tuple=False,
+        ).flatten()
+        if limit and candidates.numel() > limit:
+            ranking = confidence[image_index, candidates].argsort(descending=True)
+            candidates = candidates[ranking[:limit]]
+        selected[image_index, candidates] = True
+    return selected
+
+
 def old_class_distillation_losses(student_outputs: dict[str, torch.Tensor],
                                   teacher_outputs: dict[str, torch.Tensor],
                                   old_class_ids: Iterable[int],
@@ -31,16 +47,7 @@ def old_class_distillation_losses(student_outputs: dict[str, torch.Tensor],
     teacher_old = teacher_logits[..., class_ids] / temperature
     teacher_probability = teacher_old.sigmoid()
     confidence = teacher_probability.amax(dim=-1)
-    selected = torch.zeros_like(confidence, dtype=torch.bool)
-    limit = max(0, int(max_queries_per_image))
-    for image_index in range(confidence.shape[0]):
-        candidates = torch.nonzero(
-            confidence[image_index] >= float(score_threshold), as_tuple=False,
-        ).flatten()
-        if limit and candidates.numel() > limit:
-            ranking = confidence[image_index, candidates].argsort(descending=True)
-            candidates = candidates[ranking[:limit]]
-        selected[image_index, candidates] = True
+    selected = select_distillation_queries(confidence, score_threshold, max_queries_per_image)
 
     if not selected.any():
         zero = student_logits.sum() * 0.0
