@@ -14,21 +14,25 @@ export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1}"
 export OMP_NUM_THREADS=2
 export PYTHONUNBUFFERED=1
 export PYTHONPATH="$PWD/models/ops:$PWD${PYTHONPATH:+:$PYTHONPATH}"
-if [[ ${1:-} == --decoder-bbox-lr-pair || ${1:-} == --decoder-bbox-lr-three-quarter ]]; then
+if [[ ${1:-} == --decoder-bbox-lr-pair || ${1:-} == --decoder-bbox-lr-three-quarter || ${1:-} == --decoder-bbox-seed43 ]]; then
+  script=tools/owod/run_decoder_bbox_lr_pair.py
   dir=output/m-instance-decoder-bbox-lr-half
   lr_args=()
   if [[ $1 == --decoder-bbox-lr-three-quarter ]]; then
     dir=output/m-instance-decoder-bbox-lr-three-quarter
     lr_args+=(--three-quarter)
+  elif [[ $1 == --decoder-bbox-seed43 ]]; then
+    dir=output/m-instance-decoder-bbox-seed43
+    script=tools/owod/run_decoder_bbox_seed_pair.py
   fi
   shift
   if [[ ${1:-} == --plan ]]; then
-    exec "$python_bin" tools/owod/run_decoder_bbox_lr_pair.py "${lr_args[@]}" "$@"
+    exec "$python_bin" "$script" "${lr_args[@]}" "$@"
   fi
   export TMPDIR="$PWD/output/.tmp-owod"
   mkdir -p "$dir"
   mkdir -p -m 700 "$TMPDIR"
-  flock -n "$dir/run.lock" "$python_bin" -u tools/owod/run_decoder_bbox_lr_pair.py "${lr_args[@]}" "$@" 2>&1 | tee -a "$dir/console.log"
+  flock -n "$dir/run.lock" "$python_bin" -u "$script" "${lr_args[@]}" "$@" 2>&1 | tee -a "$dir/console.log"
   exit
 fi
 if [[ ${1:-} == --stronger-parent-study ]]; then

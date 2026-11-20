@@ -21,17 +21,17 @@ ARMS = ('frozen', 'cross-attn-last', 'decoder-bbox')
 PHASES = ('increment', 'finetune')
 
 
-def study_commands():
-    task1 = pilot.command('off', 'task1', output=OUTPUT, screen=SCREEN, epochs=PARENT_EPOCHS)
-    parent = OUTPUT / 'off/task1/checkpoint.pth'
-    gnn = OUTPUT / 'off/gnn/gnn_stage0.pt'
+def study_commands(*, output=OUTPUT, screen=SCREEN, seed=42, arms=ARMS):
+    task1 = pilot.command('off', 'task1', output=output, screen=screen, epochs=PARENT_EPOCHS, seed=seed)
+    parent = output / 'off/task1/checkpoint.pth'
+    gnn = output / 'off/gnn/gnn_stage0.pt'
     jobs = {}
-    for arm in ARMS:
+    for arm in arms:
         jobs[arm] = {}
         for phase in PHASES:
-            previous = parent if phase == 'increment' else OUTPUT / arm / 'increment/checkpoint.pth'
-            cmd = pilot.command('off', phase, previous, gnn, output=OUTPUT, screen=SCREEN)
-            cmd[cmd.index('--output_dir') + 1] = str(OUTPUT / arm / phase)
+            previous = parent if phase == 'increment' else output / arm / 'increment/checkpoint.pth'
+            cmd = pilot.command('off', phase, previous, gnn, output=output, screen=screen, seed=seed)
+            cmd[cmd.index('--output_dir') + 1] = str(output / arm / phase)
             cmd[cmd.index('--graph-localization') + 1] = arm
             cmd.extend(['--screen-branch-checkpoint', str(parent)])
             if phase == 'finetune':
@@ -81,11 +81,7 @@ def study_endpoint(path, args, phase, loader, parent_hash, gnn_hash, cache_hash)
 
 def run_study(task1, jobs):
     import torch
-    from torch.utils.data import DataLoader
     from models.graph_local.instance_transfer import bank_settings
-    from tools.owod.gnn_calibration import build_calibration_dataset
-    from tools.owod.instance_coverage import task1_coverage
-    from util.misc import collate_fn
 
     gpus = [torch.cuda.get_device_name(i) for i in range(torch.cuda.device_count())]
     if len(gpus) != 2 or any('3090' not in device for device in gpus):
@@ -97,43 +93,12 @@ def run_study(task1, jobs):
         task1_images=PARENT_IMAGES, task2_images=pilot.TASK2_IMAGES, heldout_images=128,
         seed=42, instance_settings=bank_settings(expanded=True),
         devices=os.environ.get('CUDA_VISIBLE_DEVICES'), gpus=gpus, torch_version=str(torch.__version__)))
-    pilot.run([sys.executable, str(ROOT / 'tools/owod/manage_data.py'), 'verify',
-               '--benchmark', 'm-owodb', '--output-root', str(ROOT / 'data/owod')])
-    pilot.run([sys.executable, '-m', 'torch.distributed.run', '--standalone', '--nproc_per_node', '2',
-               str(ROOT / 'tools/owod/server_cuda_check.py'), '--instances', '--decoder-bbox'])
+    check_data_and_cuda()
 
     screen = prepare_screen(pilot.MANIFEST, SCREEN.parent, PARENT_IMAGES, 128, 42,
                             task2_images=pilot.TASK2_IMAGES)
-    screen_hash = file_sha256(screen)
-    _, files = screening_files(pilot.MANIFEST, screen, 1)
-    parent, parent_args = run_job(task1, screen_hash)
-    parent_hash = file_sha256(parent)
-    parent_report = parent.parent / 'candidate_coverage.json'
-    if not parent_report.exists():
-        write_json(parent_report, dict(checkpoint_sha256=parent_hash,
-                                       coverage=task1_coverage(parent, pilot.MANIFEST, screen)))
-    observed = read_json(parent_report)
-    if observed['checkpoint_sha256'] != parent_hash:
-        raise ValueError('Task 1 coverage belongs to a different checkpoint')
-    rows = {}
-    report = dict(status='partial', paper_comparable=False, seed=42, primary_endpoint='finetune',
-                  units='AP50, recall and precision are fractions',
-                  task1=dict(checkpoint_sha256=parent_hash, coverage=observed['coverage'],
-                             metrics=pilot.metrics(parent.parent, PARENT_EPOCHS - 1)), rows=rows)
-    write_json(OUTPUT / 'progress.json', report)
-
-    gnn = pilot.calibrate('off', parent, output=OUTPUT, screen=screen)
-    gnn_hash = file_sha256(gnn)
-    report['common_gnn_sha256'] = gnn_hash
-    dataset = build_calibration_dataset(Path(parent_args.owod_image_root), files['full_val'])
-    loader = DataLoader(dataset, batch_size=2, num_workers=2, collate_fn=collate_fn)
-    cache = OUTPUT / 'retrieval' / f'instances-stage-1-{parent_hash}.json'
-    for arm, phases in jobs.items():
-        rows[arm] = {}
-        for phase, cmd in phases.items():
-            path, args = run_job(cmd, screen_hash)
-            rows[arm][phase] = study_endpoint(path, args, phase, loader, parent_hash, gnn_hash, file_sha256(cache))
-            write_json(OUTPUT / 'progress.json', report)
+    report = train_shared_parent_arms(task1, jobs, OUTPUT, screen, 42)
+    rows = report['rows']
     deltas = {
         arm: {phase: differences(rows[arm][phase]['metrics'], rows['frozen'][phase]['metrics'])
               for phase in PHASES}
@@ -146,6 +111,55 @@ def run_study(task1, jobs):
     write_json(OUTPUT / 'progress.json', report)
     print(json.dumps(dict(deltas_vs_frozen=deltas, capacity_screen_passed=screen_passed), indent=2))
     print('Comparison saved:', OUTPUT / 'comparison.json', flush=True)
+
+
+def check_data_and_cuda():
+    pilot.run([sys.executable, str(ROOT / 'tools/owod/manage_data.py'), 'verify',
+               '--benchmark', 'm-owodb', '--output-root', str(ROOT / 'data/owod')])
+    pilot.run([sys.executable, '-m', 'torch.distributed.run', '--standalone', '--nproc_per_node', '2',
+               str(ROOT / 'tools/owod/server_cuda_check.py'), '--instances', '--decoder-bbox'])
+
+
+def train_shared_parent_arms(task1, jobs, output, screen, seed):
+    from torch.utils.data import DataLoader
+    from tools.owod.gnn_calibration import build_calibration_dataset
+    from tools.owod.instance_coverage import task1_coverage
+    from util.misc import collate_fn
+
+    screen_hash = file_sha256(screen)
+    _, files = screening_files(pilot.MANIFEST, screen, 1)
+    parent, parent_args = run_job(task1, screen_hash)
+    parent_hash = file_sha256(parent)
+    parent_report = parent.parent / 'candidate_coverage.json'
+    if not parent_report.exists():
+        write_json(parent_report, dict(checkpoint_sha256=parent_hash,
+                                       coverage=task1_coverage(parent, pilot.MANIFEST, screen)))
+    observed = read_json(parent_report)
+    if observed['checkpoint_sha256'] != parent_hash:
+        raise ValueError('Task 1 coverage belongs to a different checkpoint')
+    rows = {}
+    report = dict(status='partial', paper_comparable=False, seed=seed, primary_endpoint='finetune',
+                  units='AP50, recall and precision are fractions',
+                  task1=dict(checkpoint_sha256=parent_hash, coverage=observed['coverage'],
+                             metrics=pilot.metrics(parent.parent, PARENT_EPOCHS - 1)), rows=rows)
+    write_json(output / 'progress.json', report)
+
+    gnn = pilot.calibrate('off', parent, output=output, screen=screen, seed=seed)
+    gnn_hash = file_sha256(gnn)
+    report['common_gnn_sha256'] = gnn_hash
+    dataset = build_calibration_dataset(Path(parent_args.owod_image_root), files['full_val'])
+    loader = DataLoader(dataset, batch_size=2, num_workers=2, collate_fn=collate_fn)
+    cache = output / 'retrieval' / f'instances-stage-1-{parent_hash}.json'
+    for arm, phases in jobs.items():
+        rows[arm] = {}
+        for phase, cmd in phases.items():
+            path, args = run_job(cmd, screen_hash)
+            cache_hash = file_sha256(cache)
+            if cache_hash != report.setdefault('common_cache_sha256', cache_hash):
+                raise ValueError(f'Shared instance cache changed: {cache}')
+            rows[arm][phase] = study_endpoint(path, args, phase, loader, parent_hash, gnn_hash, cache_hash)
+            write_json(output / 'progress.json', report)
+    return report
 
 
 if __name__ == '__main__':

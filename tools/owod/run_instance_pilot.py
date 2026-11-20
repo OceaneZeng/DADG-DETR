@@ -37,7 +37,7 @@ PRE_EVAL_FIX = "41f42c12d9a64911291ca04e56df102bc5759ce6"
 FIXED_EVAL_BLOB = "675d49ed86e58a63a5522d04fdfb5fc94e22616e"
 
 
-def command(arm, phase, parent=None, gnn=None, *, output=None, screen=None, epochs=None):
+def command(arm, phase, parent=None, gnn=None, *, output=None, screen=None, epochs=None, seed=42):
     output = OUTPUT if output is None else output
     screen = SCREEN if screen is None else screen
     stage = int(phase != "task1")
@@ -103,7 +103,7 @@ def command(arm, phase, parent=None, gnn=None, *, output=None, screen=None, epoc
         "--backbone-weights",
         str(WEIGHTS),
         "--seed",
-        "42",
+        str(seed),
         "--epochs",
         str(epochs),
         "--eval_interval",
@@ -158,7 +158,7 @@ def train(arm, phase, parent=None, gnn=None):
     return checkpoint, metrics(folder, EPOCHS[phase] - 1)
 
 
-def calibrate(arm, checkpoint, *, output=None, screen=None):
+def calibrate(arm, checkpoint, *, output=None, screen=None, seed=42):
     output = OUTPUT if output is None else output
     screen = SCREEN if screen is None else screen
     folder = output / arm / "gnn"
@@ -187,7 +187,7 @@ def calibrate(arm, checkpoint, *, output=None, screen=None):
                 "--probe-steps",
                 "3",
                 "--seed",
-                "42",
+                str(seed),
             ]
         )
     return path

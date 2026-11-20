@@ -152,7 +152,9 @@ def configure_run(args):
         from tools.owod.protocol import read_json
         _, screen_files = screening_files(Path(args.owod_manifest), Path(args.owod_screening), args.owod_stage)
         screen = read_json(Path(args.owod_screening))
-        if args.seed != screen['seed'] or not getattr(args, 'owod_discovery', False):
+        # The original screen uses one seed for sampling and training. Replications
+        # can register a training seed while keeping the same selected images.
+        if args.seed != screen.get('training_seed', screen['seed']) or not getattr(args, 'owod_discovery', False):
             raise ValueError('Screen requires discovery method and the registered paired seed')
         args.owod_screening_sha256 = file_sha256(Path(args.owod_screening))
         args.train_ann = str(screen_files['increment_train' if phase == 'increment' else 'train'])
