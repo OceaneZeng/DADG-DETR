@@ -14,12 +14,17 @@ export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1}"
 export OMP_NUM_THREADS=2
 export PYTHONUNBUFFERED=1
 export PYTHONPATH="$PWD/models/ops:$PWD${PYTHONPATH:+:$PYTHONPATH}"
-if [[ ${1:-} == --task2-six-epochs ]]; then
+if [[ ${1:-} == --task2-six-epochs || ${1:-} == --task2-six-epochs-seed43 ]]; then
   dir=output/m-instance-task2-six-epochs
+  seed=42
+  if [[ $1 == --task2-six-epochs-seed43 ]]; then
+    seed=43
+    dir="$dir-seed43"
+  fi
   export TMPDIR="$PWD/output/.tmp-owod"
   mkdir -p "$dir"
   mkdir -p -m 700 "$TMPDIR"
-  flock -n "$dir/run.lock" "$python_bin" -u -m tools.owod.run_task2_duration_pair 2>&1 | tee -a "$dir/console.log"
+  flock -n "$dir/run.lock" "$python_bin" -u -m tools.owod.run_task2_duration_pair --seed "$seed" 2>&1 | tee -a "$dir/console.log"
   exit
 fi
 if [[ ${1:-} == --decoder-bbox-lr-pair || ${1:-} == --decoder-bbox-lr-three-quarter || ${1:-} == --decoder-bbox-seed43 ]]; then
