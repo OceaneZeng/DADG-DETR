@@ -72,6 +72,27 @@ class DistributedSampler(Sampler):
         self.epoch = epoch
 
 
+class ExposureSampler(DistributedSampler):
+    """Use the original per-epoch shuffle and rank split on one of two fixed pools."""
+
+    def __init__(self, dataset, first_names, mode, num_replicas, rank):
+        first = set(first_names)
+        pools = ([], [])
+        for index, image_id in enumerate(dataset.ids):
+            name = dataset.coco.imgs[image_id]['owod_source_id']
+            pools[int(name not in first)].append(index)
+        size = len(pools[0])
+        if not size or size != len(first) or size != len(pools[1]) or size % num_replicas:
+            raise ValueError('Expected two complete equal image pools divisible across ranks')
+        super().__init__(pools[0], num_replicas=num_replicas, rank=rank)
+        self.pools = pools
+        self.mode = mode
+
+    def __iter__(self):
+        pool = self.pools[self.epoch % 2] if self.mode == 'alternate' else self.pools[0]
+        return (pool[i] for i in super().__iter__())
+
+
 class ReplayBalancedSampler(Sampler):
     """Sample a fixed replay fraction on every distributed rank each epoch."""
 

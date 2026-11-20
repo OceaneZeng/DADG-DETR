@@ -125,6 +125,8 @@ def get_args_parser():
                         help='Pinned common Task 1 parent for a diagnostic Task 2 comparison only')
     parser.add_argument('--screen-no-distill', action='store_true',
                         help='Disable only old-class output distillation in a shared-parent Task 2 diagnostic')
+    parser.add_argument('--screen-exposure', choices=('repeat', 'alternate'), default='',
+                        help='Task 2 diagnostic SGD over one registered half or alternating equal halves')
     parser.add_argument('--owod-stage', default=None, type=int,
                         help='Stage index in --owod-manifest, recorded in run metadata')
     parser.add_argument('--owod-phase', choices=('increment', 'finetune'), default='increment')
@@ -645,6 +647,11 @@ def main(args):
         sampler_train = torch.utils.data.RandomSampler(dataset_train)
         sampler_val = torch.utils.data.SequentialSampler(dataset_val)
 
+    if getattr(args, 'screen_exposure', '') and args.owod_phase == 'increment':
+        from tools.owod.protocol import read_json
+        first = read_json(Path(args.owod_screening))['exposure_first_source_ids']
+        sampler_train = samplers.ExposureSampler(dataset_train, first, args.screen_exposure,
+                                                  utils.get_world_size(), utils.get_rank())
     batch_sampler_train = torch.utils.data.BatchSampler(
         sampler_train, args.batch_size, drop_last=True)
 
@@ -838,7 +845,7 @@ def main(args):
         epoch_state['value'] = epoch
         if args.paper_baseline or args.owod_discovery:
             criterion.epoch = epoch
-        if args.distributed:
+        if args.distributed or isinstance(sampler_train, samplers.ExposureSampler):
             sampler_train.set_epoch(epoch)
         with RuntimeProfile(args.output_dir, device,
                 steps=getattr(args, 'profile_runtime_steps', 0) if epoch == args.start_epoch else 0,

@@ -22,6 +22,14 @@ if [[ ${1:-} == --task2-duration-holdout ]]; then
   flock -n "$dir/run.lock" "$python_bin" -u -m tools.owod.probe_task2_duration_holdout 2>&1 | tee -a "$dir/console.log"
   exit
 fi
+if [[ ${1:-} == --task2-exposure-pair ]]; then
+  dir=output/m-instance-task2-exposure-pair
+  export TMPDIR="$PWD/output/.tmp-owod"
+  mkdir -p "$dir"
+  mkdir -p -m 700 "$TMPDIR"
+  flock -n "$dir/run.lock" "$python_bin" -u -m tools.owod.run_task2_exposure_pair 2>&1 | tee -a "$dir/console.log"
+  exit
+fi
 if [[ ${1:-} == --task2-six-epochs || ${1:-} == --task2-six-epochs-seed43 ]]; then
   dir=output/m-instance-task2-six-epochs
   seed=42

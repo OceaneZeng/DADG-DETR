@@ -69,7 +69,7 @@ def study_endpoint(path, args, phase, loader, parent_hash, gnn_hash, cache_hash)
             or spec['instances']['cache_sha256'] != cache_hash
             or spec['alignment_summary']['applied'] != 0):
         raise ValueError(f'Different parent/GNN/cache or nonzero alignment: {path}')
-    metrics = endpoint(path.parent, phase)
+    metrics = endpoint(path.parent, phase, epoch=args.epochs - 1)
     if phase == 'finetune' and metrics['discovery_pseudo_scale'] != 1.:
         raise ValueError(f'Finetuning did not continue the pseudo schedule: {path}')
     last = json.loads((path.parent / 'metrics.jsonl').read_text(encoding='utf-8').splitlines()[-1])

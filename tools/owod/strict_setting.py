@@ -7,6 +7,11 @@ from tools.owod.protocol import (file_sha256, resolve_image_root, stage_files,
 
 
 def configure_run(args):
+    exposure = getattr(args, 'screen_exposure', '')
+    if exposure and not (exposure in ('repeat', 'alternate') and args.owod_stage == 1
+                         and args.owod_screening and args.screen_branch_checkpoint and args.screen_author_eval
+                         and not args.cache_mode and not args.replay_sampling_fraction):
+        raise ValueError('Exposure sampling requires shared-parent Task 2 screening without cache or replay sampling')
     offset = getattr(args, 'discovery_pseudo_epoch_offset', 0)
     if offset < 0 or (offset and not (getattr(args, 'owod_discovery', False)
             and getattr(args, 'owod_screening', '') and args.owod_phase == 'finetune')):
@@ -152,6 +157,8 @@ def configure_run(args):
         from tools.owod.protocol import read_json
         _, screen_files = screening_files(Path(args.owod_manifest), Path(args.owod_screening), args.owod_stage)
         screen = read_json(Path(args.owod_screening))
+        if exposure and not screen.get('exposure_first_source_ids'):
+            raise ValueError('Exposure sampling requires a registered first image pool')
         # The original screen uses one seed for sampling and training. Replications
         # can register a training seed while keeping the same selected images.
         if args.seed != screen.get('training_seed', screen['seed']) or not getattr(args, 'owod_discovery', False):
@@ -230,6 +237,8 @@ def validate_checkpoint(args, checkpoint, resume=False):
                           or not getattr(args, 'graph_routed_adapter', False)):
         raise ValueError('Shared-parent branching is restricted to screening Task 2')
     if not branching:
+        if getattr(saved, 'screen_exposure', '') != getattr(args, 'screen_exposure', ''):
+            raise ValueError('Cannot change the exposure arm within a checkpoint chain')
         if bool(getattr(saved, 'screen_no_distill', False)) != bool(getattr(args, 'screen_no_distill', False)):
             raise ValueError('Checkpoint cannot change screen_no_distill within Task 2')
         for field in ('screen_branch_checkpoint_sha256', 'screen_branch_gnn_sha256'):

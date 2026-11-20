@@ -15,8 +15,9 @@ from tools.owod.screening_data import screening_files, write_json
 OUTPUT = ROOT / 'output/m-instance-schedule-pair'
 
 
-def endpoint(folder, phase):
-    epoch = pilot.EPOCHS[phase] - 1
+def endpoint(folder, phase, *, epoch=None):
+    if epoch is None:
+        epoch = pilot.EPOCHS[phase] - 1
     if read_json(folder / 'training_complete.json')['last_epoch'] != epoch:
         raise ValueError(f'Incomplete {phase}: {folder}')
     values = pilot.metrics(folder, epoch)
