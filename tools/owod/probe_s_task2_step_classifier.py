@@ -1,4 +1,5 @@
-"""Separate classification-head and remaining-weight effects in the S finetune step-size comparison."""
+"""Cross a frozen output head between matched S finetune step-size endpoints."""
+import argparse
 from hashlib import sha256
 import os
 from pathlib import Path
@@ -74,45 +75,95 @@ def prepare():
                           'the native Current gain at both fixed bodies. Use the same rule for the remaining weights '
                           'at both fixed classifiers. Report both or neither, interaction, Previous, Known, both proxy '
                           'folds and released FP families. The frozen crosses are diagnostics only.')
-    pin(OUTPUT/'plan.json', plan)
     return plan, manifest, order, references
 
 
+def register_box_probe(plan, refs):
+    offset = HALF.with_name('s-instance-task2-finetune-offset-rate')
+    result = read_json(offset/'comparison.json')
+    offset_plan = read_json(offset/'plan.json')
+    half_record = OUTPUT/'half-half.json'
+    half = read_json(half_record)
+    endpoint = plan['endpoints']['half']
+    if (file_sha256(offset/'comparison.json') != 'ffe0ed26c5819ac3a56be5a325db7ef287cd3e936b787420a2b024d0a8c113da'
+            or result['plan_sha256'] != file_sha256(offset/'plan.json') or result['follow_up'] or result['old_coverage_pass']
+            or offset_plan['increment_sha256'] != plan['increment_sha256']
+            or offset_plan['source_classifier_sha256'] != file_sha256(OUTPUT/'comparison.json')
+            or offset_plan['half_reference_sha256'] != file_sha256(half_record)
+            or half['plan_sha256'] != file_sha256(OUTPUT/'plan.json')
+            or half['body_checkpoint'] != endpoint['sha256'] or half['classifier_checkpoint'] != endpoint['sha256']):
+        raise ValueError('Changed offset study or half-rate native endpoint')
+    for fold in FOLDS:
+        if any(half['views'][fold][k] != refs['half'][fold][k] for k in ('composition', 'metrics')):
+            raise ValueError('Different native half-rate predictions')
+    refs['half'] = half['views']
+    endpoint.update(reference=str(half_record), reference_sha256=file_sha256(half_record))
+    counts = [refs[arm]['raw_old_box_recall_iou50'] for arm in ARMS]
+    if counts[0]['gt'] != counts[1]['gt'] or counts[0]['hits'] - counts[1]['hits'] != 162:
+        raise ValueError('Changed native old geometry deficit')
+    plan.update(offset_result_sha256=file_sha256(offset/'comparison.json'), threshold=offset_plan['old_hits_to_recover'],
+                criterion='Use full minus half for both factors. Attribute old coverage to a factor if both '
+                          'conditional gains reach 81 old targets with all-query IoU > 0.5. Report both factors, '
+                          'interaction, released AP50, proxy folds and FP sources. Do not advance a hybrid checkpoint.')
+
+
+def conditional_effects(values, positive, negative, factor, threshold):
+    head = {b: values[b+'-'+positive] - values[b+'-'+negative] for b in ARMS}
+    rest = {h: values[positive+'-'+h] - values[negative+'-'+h] for h in ARMS}
+    return {factor: head, 'rest': rest, 'interaction': head[positive]-head[negative], 'threshold': threshold,
+            'supported': [k for k, v in ((factor, head), ('rest', rest)) if min(v.values()) >= threshold]}
+
+
 def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--box-head', action='store_true', help='Attribute old geometry using the frozen box readout')
+    box = parser.parse_args().box_head
+    output = OUTPUT.with_name('s-instance-task2-step-box') if box else OUTPUT
     print('Checking matched finetune endpoints and frozen native references', flush=True)
     plan, manifest, order, refs = prepare()
-    digest = file_sha256(OUTPUT/'plan.json')
+    if box:
+        register_box_probe(plan, refs)
+    pin(output/'plan.json', plan)
+    digest = file_sha256(output/'plan.json')
     ds, loader = make_loader(resolve_image_root(MANIFEST, manifest), Path(plan['annotation']), 2, 2)
-    models, heads = {}, {}
+    models, heads, modules = {}, {}, {}
     for arm, record in plan['endpoints'].items():
         models[arm], _ = load_detector(None, Path(record['checkpoint']), torch.device('cuda'))
-        heads[arm] = {k: v.detach().cpu().clone() for k, v in models[arm].detr.class_embed.state_dict().items()}
+        detr = models[arm].detr
+        if box and (detr.transformer.decoder.bbox_embed is not None or len({id(m) for m in detr.bbox_embed}) != 1):
+            raise ValueError('Box readout probe requires the shared non-iterative box head')
+        modules[arm] = detr.bbox_embed if box else detr.class_embed
+        heads[arm] = {k: v.detach().cpu().clone() for k, v in modules[arm].state_dict().items()}
     if all(torch.equal(v, heads['full'][k]) for k, v in heads['half'].items()):
-        raise ValueError('Classifier weights are identical')
+        raise ValueError('Matched head weights are identical')
 
     cells = {}
     for body in ARMS:
         for head in ARMS:
             name = f'{body}-{head}'
-            if name == 'full-full':
-                views = refs['full']
+            if name == 'full-full' or (box and body == head):
+                views = refs[body]
             else:
-                path = OUTPUT/f'{name}.json'
-                identity = dict(plan_sha256=digest, body_checkpoint=plan['endpoints'][body]['sha256'],
-                                classifier_checkpoint=plan['endpoints'][head]['sha256'])
+                path = output/f'{name}.json'
+                identity = dict(plan_sha256=digest, body_checkpoint=plan['endpoints'][body]['sha256'])
+                identity['bbox_checkpoint' if box else 'classifier_checkpoint'] = plan['endpoints'][head]['sha256']
                 if not path.exists():
                     print(f'Evaluating {name} on {len(ds)} images', flush=True)
                     model = models[body]
-                    model.detr.class_embed.load_state_dict(heads[head], strict=True)
+                    modules[body].load_state_dict(heads[head], strict=True)
                     views = evaluate_heldout(model, ds, loader, manifest, order, proxies=True, fp_sources=True)
                     write_json(path, dict(**identity, views=views))
                 row = read_json(path)
                 if any(row[k] != v for k, v in identity.items()):
                     raise ValueError(f'Changed classifier cross: {name}')
                 views = row['views']
-            for key in ('raw_old_box_recall_iou50', 'raw_current_box_recall_iou50'):
-                if views[key] != refs[body][key]:
-                    raise ValueError(f'Changed all-query box coverage at fixed body: {name}, {key}')
+            if box:
+                if any(views[f]['composition'] != refs[body][f]['composition'] for f in FOLDS):
+                    raise ValueError(f'Box intervention changed native score composition: {name}')
+            else:
+                for key in ('raw_old_box_recall_iou50', 'raw_current_box_recall_iou50'):
+                    if views[key] != refs[body][key]:
+                        raise ValueError(f'Changed all-query box coverage at fixed body: {name}, {key}')
             if body == head and any(views[f][k] != refs[body][f][k] for f in FOLDS for k in ('composition', 'metrics')):
                 raise ValueError(f'Native predictions did not replay: {name}')
             rel = views['released']
@@ -120,15 +171,22 @@ def main():
             cells[name] = dict(metrics={f: views[f]['metrics'] for f in FOLDS}, composition=rel['composition'],
                                fp_families=families)
 
-    current = {name: c['metrics']['released']['current_ap50'] for name, c in cells.items()}
-    classifier = {b: current[b+'-half'] - current[b+'-full'] for b in ARMS}
-    rest = {h: current['half-'+h] - current['full-'+h] for h in ARMS}
-    effects = dict(classifier=classifier, rest=rest, interaction=classifier['half']-classifier['full'],
-                   threshold=plan['threshold'], supported=[k for k, v in (('classifier', classifier), ('rest', rest))
-                                                           if min(v.values()) >= plan['threshold']])
-    write_json(OUTPUT/'comparison.json', dict(status='complete', plan_sha256=digest, paper_comparable=False,
-                                              current_effects=effects, cells=cells))
-    print('Finetune classifier comparison saved', flush=True)
+            if box:
+                for group in ('old', 'current'):
+                    key = f'raw_{group}_box_recall_iou50'
+                    if views[key]['gt'] != refs[body][key]['gt']:
+                        raise ValueError(f'Different target population: {name}, {group}')
+                    cells[name][key] = views[key]
+
+    result = dict(status='complete', plan_sha256=digest, paper_comparable=False, cells=cells)
+    if box:
+        hits = {name: c['raw_old_box_recall_iou50']['hits'] for name, c in cells.items()}
+        result['old_hit_effects'] = conditional_effects(hits, 'full', 'half', 'box_head', plan['threshold'])
+    else:
+        current = {name: c['metrics']['released']['current_ap50'] for name, c in cells.items()}
+        result['current_effects'] = conditional_effects(current, 'half', 'full', 'classifier', plan['threshold'])
+    write_json(output/'comparison.json', result)
+    print('Finetune head comparison saved', flush=True)
 
 
 if __name__ == '__main__':
