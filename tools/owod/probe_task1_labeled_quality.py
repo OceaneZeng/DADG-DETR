@@ -89,10 +89,12 @@ def fit(model, criterion, ema, loader):
 
 
 @torch.inference_mode()
-def evaluate(model, criterion, ema, loader, fit_row, current, previous):
+def evaluate(model, criterion, ema, loader, fit_row, current, previous, *, view_ablation=False):
     slopes = torch.tensor(fit_row['slopes'], device='cuda', dtype=torch.float32)
     classes = torch.tensor(current, device='cuda')
-    arms = ('original', 'soft', 'equal_cues', 'fitted')
+    arms = ['original', 'soft', 'fitted']
+    arms.extend(['geometry_only', 'fitted_with_views'] if view_ablation else ['equal_cues'])
+    paired_arms = ('original', 'soft', 'fitted') if view_ablation else ('original', 'soft')
     counts = {arm: Counter() for arm in arms}
     errors = {name: Counter() for name in ('known_task1', 'released_task2')}
     images = {}
@@ -103,12 +105,18 @@ def evaluate(model, criterion, ema, loader, fit_row, current, previous):
             boxes = output['pred_boxes'][i]
             cues = cue_matrix(output, mined, traces[i], i)
             estimate = (cues @ slopes + fit_row['intercept']).clamp(0, 1)
-            average = cues.clamp_min(0).prod(1).pow(1 / len(CUES))
             base_score, pool = soft.continuous_evidence(output, mined, traces[i], i)
             semantic = mined['semantic_weights'][i]
             masks = {'original': original}
             fallback = {}
-            for arm, score in [('soft', base_score), ('equal_cues', average * semantic), ('fitted', estimate * semantic)]:
+            scores = dict(soft=base_score, fitted=estimate * semantic)
+            if view_ablation:
+                scores['geometry_only'] = cues[:, 0] * semantic
+                scores['fitted_with_views'] = soft.view_semantic_weight(mined, traces[i], i) * estimate
+            else:
+                average = cues.clamp_min(0).prod(1).pow(1 / len(CUES))
+                scores['equal_cues'] = average * semantic
+            for arm, score in scores.items():
                 ids = select_distinct_boxes(boxes, pool, score, quota)
                 fallback[arm] = len(ids) != quota
                 masks[arm] = original if fallback[arm] else torch.zeros_like(original).scatter_(0, ids, True)
@@ -117,12 +125,14 @@ def evaluate(model, criterion, ema, loader, fit_row, current, previous):
             edges = (box_iou(box_cxcywh_to_xyxy(boxes), box_cxcywh_to_xyxy(truth))[0] >= .5).cpu()
             image = int(target['image_id'].item())
             row = dict(gt=len(truth), quota=quota, hits={}, ids={})
+            reference = previous[str(image)]
+            reference_ids = reference['ids'] if view_ablation else reference['query_ids']
             for arm, mask in masks.items():
                 mask = mask.cpu()
                 ids = row['ids'][arm] = mask.nonzero().flatten().tolist()
                 hits = row['hits'][arm] = gates.measure_boxes(edges, mask, quota)['one_to_one']
-                if len(ids) != quota or (arm in ('original', 'soft') and
-                       (ids != previous[str(image)]['query_ids'][arm] or hits != previous[str(image)]['hits'][arm])):
+                if len(ids) != quota or (arm in paired_arms and
+                       (ids != reference_ids[arm] or hits != reference['hits'][arm])):
                     raise ValueError(f'Unpaired {arm} selection at {image}')
                 counts[arm].update(hits=hits, gt=len(truth), proposals=quota, fallback=int(fallback.get(arm, False)))
             images[image] = row

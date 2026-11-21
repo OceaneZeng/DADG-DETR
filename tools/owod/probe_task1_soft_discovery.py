@@ -20,9 +20,13 @@ OUTPUT = ROOT / 'output/m-instance-task1-soft-discovery'
 ARMS = ('original', 'hard_rescore', 'soft')
 
 
-def continuous_evidence(output, mined, trace, index):
+def view_semantic_weight(mined, trace, index):
     score = (mined['saliency'][index] * trace['matched_saliency']).sqrt()
-    score = score * mined['consistency'][index] * mined['semantic_weights'][index] * output['geometry_quality'][index]
+    return score * mined['consistency'][index] * mined['semantic_weights'][index]
+
+
+def continuous_evidence(output, mined, trace, index):
+    score = view_semantic_weight(mined, trace, index) * output['geometry_quality'][index]
     soft = trace['eligible'] & (mined['matches'][index] >= 0) & ~mined['background'][index]
     return score, soft & (score > 0)
 
