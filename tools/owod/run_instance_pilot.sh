@@ -14,7 +14,7 @@ export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1}"
 export OMP_NUM_THREADS=2
 export PYTHONUNBUFFERED=1
 export PYTHONPATH="$PWD/models/ops:$PWD${PYTHONPATH:+:$PYTHONPATH}"
-if [[ ${1:-} == --s-task1-known-fraction || ${1:-} == --s-task1-input-scale || ${1:-} == --s-task1-proposal-stages || ${1:-} == --s-task1-finest-anchor || ${1:-} == --s-task1-anchor-choice || ${1:-} == --s-task1-released-seed || ${1:-} == --s-task1-small-slot || ${1:-} == --s-task1-crop-refill || ${1:-} == --s-task1-crop-proxy || ${1:-} == --s-task1-crop-timeline ]]; then
+if [[ ${1:-} == --s-task1-known-fraction || ${1:-} == --s-task1-input-scale || ${1:-} == --s-task1-proposal-stages || ${1:-} == --s-task1-finest-anchor || ${1:-} == --s-task1-anchor-choice || ${1:-} == --s-task1-released-seed || ${1:-} == --s-task1-small-slot || ${1:-} == --s-task1-crop-refill || ${1:-} == --s-task1-crop-proxy || ${1:-} == --s-task1-crop-timeline || ${1:-} == --s-task1-region-geometry ]]; then
   study="${1#--s-task1-}"
   dir="output/s-instance-task1-$study"
   export TMPDIR="$PWD/output/.tmp-owod"
