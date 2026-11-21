@@ -25,18 +25,20 @@ LIMIT, OLD_POOL, DEDUP_IOU = 50, 300, .70
 
 
 class OldClassRefill(DiscoveryPostProcess):
-    def __init__(self, known, previous):
+    def __init__(self, known, previous, *, old_only=False):
         super().__init__(known_ids=known, max_detections=LIMIT, scoring='focal')
         self.old_columns = [i for i, label in enumerate(known) if label in previous]
+        self.locked_labels = [91] + ([c for c in known if c not in previous] if old_only else [])
 
     def candidate_scores(self, outputs):
         probabilities, categories, unknown = super().candidate_scores(outputs)
         columns = len(categories)
         flat = probabilities.flatten(1)
         native = flat.topk(LIMIT, dim=1).indices
-        locked_unknown = torch.zeros_like(flat, dtype=torch.bool)
-        locked_unknown.scatter_(1, native, native % columns == columns - 1)
-        known_quota = LIMIT - locked_unknown.sum(dim=1)
+        locked_columns = torch.isin(categories, categories.new_tensor(self.locked_labels))
+        locked = torch.zeros_like(flat, dtype=torch.bool)
+        locked.scatter_(1, native, locked_columns[native % columns])
+        refill_quota = LIMIT - locked.sum(dim=1)
 
         old_columns = categories.new_tensor(self.old_columns)
         old_scores = probabilities[..., old_columns].flatten(1)
@@ -45,7 +47,7 @@ class OldClassRefill(DiscoveryPostProcess):
         labels = old_columns[positions % len(old_columns)]
         boxes = box_cxcywh_to_xyxy(outputs['pred_boxes'])
         filtered = probabilities.clone()
-        filtered[..., -1] = -torch.inf
+        filtered[..., locked_columns] = -torch.inf
         for row, query in enumerate(queries):
             kept = batched_nms(boxes[row, query] + 1., scores[row], labels[row], DEDUP_IOU)
             suppressed = torch.ones_like(query, dtype=torch.bool)
@@ -53,9 +55,9 @@ class OldClassRefill(DiscoveryPostProcess):
             filtered[row, query[suppressed], labels[row, suppressed]] = -torch.inf
 
         remaining_known = filtered.flatten(1).topk(LIMIT, dim=1).indices
-        within_quota = torch.arange(LIMIT, device=flat.device)[None, :] < known_quota[:, None]
-        keep_known = torch.zeros_like(locked_unknown).scatter_(1, remaining_known, within_quota)
-        budgeted = flat.masked_fill(~(keep_known | locked_unknown), -torch.inf).reshape_as(probabilities)
+        within_quota = torch.arange(LIMIT, device=flat.device)[None, :] < refill_quota[:, None]
+        keep_known = torch.zeros_like(locked).scatter_(1, remaining_known, within_quota)
+        budgeted = flat.masked_fill(~(keep_known | locked), -torch.inf).reshape_as(probabilities)
         return budgeted, categories, unknown
 
 

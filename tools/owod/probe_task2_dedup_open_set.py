@@ -1,4 +1,5 @@
 """Audit old-class refill and open-set confusion using already released Task 2 labels."""
+import argparse
 from hashlib import sha256
 import os
 from pathlib import Path
@@ -27,9 +28,9 @@ SOURCES = {
 }
 
 
-def unknown_predictions(results):
+def protected_predictions(results, protected_labels):
     labels = torch.stack([row['labels'] for row in results])
-    mask = labels == 91
+    mask = torch.isin(labels, labels.new_tensor(protected_labels))
     indices = torch.stack([row['top_indices'] for row in results]).masked_fill(~mask, -1)
     indices, order = indices.sort(dim=1)
     scores = torch.stack([row['scores'] for row in results]).masked_fill(~mask, 0.)
@@ -38,8 +39,8 @@ def unknown_predictions(results):
 
 
 class AuditedRefill(OldClassRefill):
-    def __init__(self, known, previous):
-        super().__init__(known, previous)
+    def __init__(self, known, previous, *, old_only=False):
+        super().__init__(known, previous, old_only=old_only)
         self.native = DiscoveryPostProcess(known_ids=known, max_detections=LIMIT, scoring='focal')
         self.checked_images = 0
 
@@ -47,8 +48,10 @@ class AuditedRefill(OldClassRefill):
     def forward(self, outputs, target_sizes, *, include_top_indices=False):
         native = self.native(outputs, target_sizes, include_top_indices=True)
         refill = super().forward(outputs, target_sizes, include_top_indices=True)
-        if not all(torch.equal(a, b) for a, b in zip(unknown_predictions(native), unknown_predictions(refill))):
-            raise ValueError('Refill changed an unknown query, box or score')
+        before = protected_predictions(native, self.locked_labels)
+        after = protected_predictions(refill, self.locked_labels)
+        if not all(torch.equal(a, b) for a, b in zip(before, after)):
+            raise ValueError('Refill changed a protected label/query, box or score')
         self.checked_images += len(native)
         if not include_top_indices:
             for row in refill:
@@ -88,7 +91,7 @@ def inputs(protocol, manifest_path, source, arms, ap_mode):
                 visible_current_ids=subsets, images=len(order))
 
 
-def evaluate_protocol(protocol, manifest_path, source, plan, plan_hash):
+def evaluate_protocol(protocol, manifest_path, source, plan, plan_hash, *, output=OUTPUT, old_only=False):
     manifest = read_json(manifest_path)
     source_arms = read_json(source / 'comparison.json')['arms']
     annotation = Path(plan['annotation'])
@@ -99,7 +102,7 @@ def evaluate_protocol(protocol, manifest_path, source, plan, plan_hash):
     variants, processors, auditors = {}, {}, {}
     for fold, visible in plan['visible_current_ids'].items():
         known = previous + visible
-        auditor = AuditedRefill(known, previous)
+        auditor = AuditedRefill(known, previous, old_only=old_only)
         for view, processor in (('native', auditor.native), ('dedup', auditor)):
             key = f'{fold}_{view}'
             variants[key] = (known, 'focal', LIMIT)
@@ -108,23 +111,33 @@ def evaluate_protocol(protocol, manifest_path, source, plan, plan_hash):
 
     rows = {}
     for arm, entry in plan['checkpoints'].items():
-        path = OUTPUT / f'{protocol}-{arm}.json'
+        path = output / f'{protocol}-{arm}.json'
+        check_key = 'current_and_unknown_identity_checks' if old_only else 'unknown_identity_checks'
         if not path.is_file():
             print(f'Evaluating {protocol} {arm}: released labels and two proxy folds', flush=True)
             model, _ = load_detector(None, Path(entry['path']), torch.device('cuda'))
             for auditor in auditors.values():
                 auditor.checked_images = 0
             views = evaluate_views(model, loader, dataset.coco, variants, spec, previous, current, 'cuda',
-                                   postprocessors=processors, print_freq=64)
+                                   postprocessors=processors, print_freq=64, include_wi_sources=old_only)
             write_json(path, dict(plan_sha256=plan_hash, checkpoint_sha256=entry['sha256'], views=views,
-                                  unknown_identity_checks={k: v.checked_images for k, v in auditors.items()}))
+                                  **{check_key: {k: v.checked_images for k, v in auditors.items()}}))
             del model
         report = read_json(path)
         if (report['plan_sha256'] != plan_hash or report['checkpoint_sha256'] != entry['sha256'] or
-                report['unknown_identity_checks'] != dict.fromkeys(auditors, len(order))):
-            raise ValueError(f'Incomplete unknown identity check: {path}')
+                report[check_key] != dict.fromkeys(auditors, len(order))):
+            raise ValueError(f'Incomplete protected prediction check: {path}')
         views = report['views']
-        for view in ('native', 'dedup'):
+        if old_only:
+            parent = read_json(OUTPUT / path.name)
+            if (parent['checkpoint_sha256'] != entry['sha256'] or
+                    parent['plan_sha256'] != file_sha256(OUTPUT / 'plan.json')):
+                raise ValueError(f'Changed source endpoint: {path.name}')
+            for fold in auditors:
+                name = f'{fold}_native'
+                if any(views[name][k] != parent['views'][name][k] for k in ('metrics', 'composition')):
+                    raise ValueError(f'Native replay differs: {path.name}, {name}')
+        for view in (('native',) if old_only else ('native', 'dedup')):
             metrics = views[f'released_{view}']['metrics']
             if (metrics['unknown_gt'] or any(metrics[k] != v for k, v in source_arms[arm][view]['metrics'].items()) or
                     views[f'released_{view}']['composition'] != source_arms[arm][view]['composition']):
@@ -147,6 +160,9 @@ def evaluate_protocol(protocol, manifest_path, source, plan, plan_hash):
 
 
 def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--old-only', action='store_true', help='Reserve native Current and unknown predictions')
+    old_only = parser.parse_args().old_only
     if torch.cuda.device_count() != 1 or '3090' not in torch.cuda.get_device_name():
         raise ValueError('Select one RTX 3090 for the frozen open-set audit')
     print('Verifying completed M/S holdouts and all three frozen checkpoints', flush=True)
@@ -160,12 +176,32 @@ def main():
                 criterion='Exact per-image unknown query/box/score invariance in every view. For every checkpoint, '
                           'across the two proxy folds: mean Previous delta >= +0.75 pp, Current >= -0.25 pp, '
                           'Known > 0 pp, summed A-OSE and mean WI do not increase.')
-    plan_path = OUTPUT / 'plan.json'
+    output = OUTPUT
+    protocol_order = list(SOURCES)
+    if old_only:
+        attribution = ROOT / 'output/s-instance-task2-dedup-wi-sources/comparison.json'
+        parent = read_json(OUTPUT / 'plan.json')
+        if (file_sha256(attribution) != 'fe635a708a38c890dc5e6e6c70621c030d7d617214e0f2d729bbe8ce0d6d6100' or
+                file_sha256(OUTPUT / 'comparison.json') != '8e98021a8b491bb4b0c8113953c8dd1c87b08d4cde237b2a6ac44ece26d36398' or
+                protocols != parent['protocols'] or file_sha256(OUTPUT / 'plan.json') != read_json(OUTPUT / 'comparison.json')['plan_sha256']):
+            raise ValueError('Expected archived WI attribution and parent inputs')
+        output = OUTPUT.with_name('instance-task2-old-only-refill')
+        protocol_order = ['s-owodb', 'm-owodb']
+        plan.update(wi_attribution_sha256=file_sha256(attribution), parent_comparison_sha256=file_sha256(OUTPUT / 'comparison.json'),
+                    policy='Fill vacated slots only from Previous. Preserve each native Current and unknown '
+                           'query/class, box and score. Use the existing two-fold gate. Stop after S if it fails, '
+                           'otherwise evaluate both M seeds before considering independent validation.')
+    plan_path = output / 'plan.json'
     pin(plan_path, plan)
     plan_hash = file_sha256(plan_path)
-    rows = {protocol: evaluate_protocol(protocol, manifest_path, source, protocols[protocol], plan_hash)
-            for protocol, (manifest_path, source, _, _) in SOURCES.items()}
-    result = OUTPUT / 'comparison.json'
+    rows = {}
+    for protocol in protocol_order:
+        manifest_path, source, _, _ = SOURCES[protocol]
+        rows[protocol] = evaluate_protocol(protocol, manifest_path, source, protocols[protocol], plan_hash,
+                                           output=output, old_only=old_only)
+        if old_only and not all(row['follow_up'] for row in rows[protocol].values()):
+            break
+    result = output / 'comparison.json'
     write_json(result, dict(status='complete', plan_sha256=plan_hash, paper_comparable=False, protocols=rows,
                             follow_up=all(row['follow_up'] for arms in rows.values() for row in arms.values())))
     print('Comparison saved:', result, flush=True)
