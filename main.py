@@ -166,7 +166,8 @@ def get_args_parser():
                         help='Batched low-rank products for new runs; loop preserves legacy arithmetic')
     parser.add_argument('--graph-route-loss-coef', type=float, default=1.0)
     parser.add_argument('--graph-routing', choices=('hard', 'soft'), default='hard')
-    parser.add_argument('--graph-localization', choices=('frozen', 'bbox-last', 'cross-attn-last', 'decoder-bbox'),
+    parser.add_argument('--graph-localization', choices=('frozen', 'bbox-last', 'cross-attn-last', 'decoder-bbox',
+                                                         'decoder-bbox-increment-quality'),
                         default='frozen')
     parser.add_argument('--discovery-scoring', choices=('hierarchical', 'focal'), default='hierarchical')
     parser.add_argument('--graph-sketch-max-images', type=int, default=12)

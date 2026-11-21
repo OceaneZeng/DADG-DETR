@@ -28,10 +28,13 @@ def configure_run(args):
         raise ValueError('screen-author-eval requires a verified diagnostic training subset')
     localization = getattr(args, 'graph_localization', 'frozen')
     decoder_bbox_lr_mult = getattr(args, 'decoder_bbox_lr_mult', 1.)
+    opens_decoder = localization in ('decoder-bbox', 'decoder-bbox-increment-quality')
+    if localization == 'decoder-bbox-increment-quality' and instance_mode == 'legacy':
+        raise ValueError('Proposal quality training requires the instance proposal model')
     if (not 0 < decoder_bbox_lr_mult <= 1
-            or (decoder_bbox_lr_mult != 1. and localization != 'decoder-bbox')):
+            or (decoder_bbox_lr_mult != 1. and not opens_decoder)):
         raise ValueError('Decoder/bbox LR multiplier must be in (0, 1] and requires decoder-bbox when reduced')
-    if localization == 'decoder-bbox' and not (
+    if opens_decoder and not (
             getattr(args, 'screen_branch_checkpoint', '') and getattr(args, 'screen_author_eval', False)
             and getattr(args, 'graph_routed_adapter', False) and args.owod_stage == 1):
         raise ValueError('decoder-bbox requires a shared-parent Task 2 diagnostic')

@@ -27,7 +27,7 @@ OUTPUT = DURATION.with_name('s-instance-task2-increment-giou')
 PHASES = ('increment', 'finetune')
 
 
-def prepare(output=OUTPUT, *, classifier_lr=False):
+def prepare(output=OUTPUT, *, variant='giou'):
     phase_plan = read_json(PHASE_SOURCE / 'plan.json')
     evidence = read_json(PHASE_SOURCE / 'comparison.json')
     duration_plan = read_json(DURATION / 'plan.json')
@@ -62,9 +62,11 @@ def prepare(output=OUTPUT, *, classifier_lr=False):
             raise ValueError('Unexpected control loss, assignment cost, batch or seed')
         cmd = list(baseline)
         cmd[cmd.index('--output_dir')+1] = str(output/phase)
-        if phase == 'increment':
-            cmd.extend(['--class_embed_lr_mult', '2'] if classifier_lr else ['--giou_loss_coef', '4'])
-        else:
+        if variant == 'proposal-quality':
+            cmd[cmd.index('--graph-localization') + 1] = 'decoder-bbox-increment-quality'
+        elif phase == 'increment':
+            cmd.extend(['--class_embed_lr_mult', '2'] if variant == 'classifier-lr' else ['--giou_loss_coef', '4'])
+        if phase == 'finetune':
             cmd[cmd.index('--pretrained')+1] = str(output/'increment/checkpoint.pth')
         jobs[phase], controls[phase] = cmd, ref
     plan = dict(commit=subprocess.check_output(['git', 'rev-parse', 'HEAD'], cwd=pilot.ROOT, text=True).strip(),
@@ -78,7 +80,10 @@ def prepare(output=OUTPUT, *, classifier_lr=False):
                 criterion='Advance if Current gains at least 1.00 pp, Previous drops at most 1.00 pp and Known rises. '
                           'Also require mean masked-fold U-Recall not to fall, mean WI and summed A-OSE not to rise. '
                           'Record whether incremental raw Current box coverage improves. No author-test model selection.')
-    if classifier_lr:
+    if variant == 'proposal-quality':
+        from tools.owod.s_task2_proposal_quality import add_evidence
+        add_evidence(plan, CHECKPOINT)
+    if variant == 'classifier-lr':
         matched = DURATION.with_name('s-instance-task2-matched-exposure')
         reports = {matched:'b0500f0ed19822b5dd4b5de2f3ed42372b38069fdf495aa119a44cc02dc97bb4',
                    OUTPUT:'1ba2488652817ac039d22f05165f0a345a681840b397b6558406423b6f695f1a'}
@@ -116,11 +121,16 @@ def evaluate(name, checkpoint, plan, dataset, loader, manifest, order, *, proxie
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--classifier-lr', action='store_true', help='Double only the increment classifier LR')
-    classifier_lr = parser.parse_args().classifier_lr
-    output = OUTPUT.with_name('s-instance-task2-increment-classifier-lr') if classifier_lr else OUTPUT
+    options = parser.add_mutually_exclusive_group()
+    options.add_argument('--classifier-lr', dest='variant', action='store_const', const='classifier-lr',
+                         help='Double only the increment classifier LR')
+    options.add_argument('--proposal-quality', dest='variant', action='store_const', const='proposal-quality',
+                         help='Train the existing proposal quality head during increment')
+    parser.set_defaults(variant='giou')
+    variant = parser.parse_args().variant
+    output = OUTPUT.with_name('s-instance-task2-increment-' + variant)
     print('Verifying S duration controls, original cache and stage evidence', flush=True)
-    plan, evidence = prepare(output, classifier_lr=classifier_lr)
+    plan, evidence = prepare(output, variant=variant)
     pilot.run([sys.executable, str(pilot.ROOT/'tools/owod/manage_data.py'), 'verify',
                '--benchmark', 's-owodb', '--output-root', str(MANIFEST.parent.parent)])
     annotation = Path(plan['annotation'])
@@ -136,8 +146,8 @@ def main():
         if (adapter['source_checkpoint_sha256'] != plan['identity']['checkpoint_sha256']
                 or adapter['gnn_sha256'] != plan['identity']['gnn_sha256']
                 or adapter['instances']['cache_sha256'] != plan['cache_sha256']
-                or args.giou_loss_coef != (4 if phase == 'increment' and not classifier_lr else 2)
-                or args.class_embed_lr_mult != (2 if phase == 'increment' and classifier_lr else 1)):
+                or args.giou_loss_coef != (4 if phase == 'increment' and variant == 'giou' else 2)
+                or args.class_embed_lr_mult != (2 if phase == 'increment' and variant == 'classifier-lr' else 1)):
             raise ValueError('Different training inputs or objective')
         views = evaluate('candidate-'+phase, path, plan, ds, loader, manifest, order, proxies=phase=='finetune', output=output)
         stats = views['released']['metrics']
@@ -146,6 +156,16 @@ def main():
         report['phases'][phase] = dict(checkpoint_sha256=file_sha256(path), heldout=stats, raw_current=raw,
             delta_raw_hits=raw['hits']-(reference['gt']-reference['no_box']), author=endpoint(path.parent, phase, epoch=args.epochs-1),
             delta={k:stats[k]-reference[k] for k in ('current_ap50','previous_ap50','known_ap50')})
+        if variant == 'proposal-quality':
+            from tools.owod.s_task2_proposal_quality import compare_shortlist, quality_digest
+            head_digest = quality_digest(path)
+            report['phases'][phase]['quality_sha256'] = head_digest
+            if phase == 'increment':
+                if head_digest == plan['parent_quality_sha256']:
+                    raise ValueError('Increment training did not change the proposal quality head')
+                report['proposal_coverage'] = compare_shortlist(path, output, loader, manifest, plan)
+            elif head_digest != report['phases']['increment']['quality_sha256']:
+                raise ValueError('Balanced finetuning changed the frozen proposal quality head')
         write_json(output/'progress.json', report)
     control = evaluate('control-finetune', Path(plan['control']['finetune']['path']), plan, ds, loader, manifest, order,
                        proxies=True, output=output)
@@ -162,6 +182,10 @@ def main():
     open_pass = (mean(f['u_recall'] for f in folds.values()) >= 0 and sum(f['a_ose'] for f in folds.values()) <= 0
                  and mean(f['wi'] for f in folds.values()) <= 0)
     report.update(status='complete', proxy_deltas=folds, known_pass=known_pass, open_pass=open_pass, follow_up=known_pass and open_pass)
+    if variant == 'proposal-quality':
+        shortlist = report['proposal_coverage']['shortlist']
+        report['shortlist_pass'] = shortlist['candidate'] > shortlist['control']
+        report['follow_up'] = report['follow_up'] and report['shortlist_pass']
     write_json(output/'comparison.json', report)
     print('Increment comparison saved:', output/'comparison.json', flush=True)
 
