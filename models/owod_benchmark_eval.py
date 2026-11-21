@@ -71,7 +71,6 @@ def evaluate_author_benchmark(predictions, coco, known_ids, previous_ids, curren
     unknown_tp = unknown_count = 0
     for label in [*known_ids, -1]:
         track_previous = include_previous_stats and label in previous_ids
-        duplicates = 0
         records = {i: {'boxes': [b for b, _ in gt[i][label]],
                        'difficult': [d for _, d in gt[i][label]],
                        'matched': set()} for i in gt}
@@ -79,6 +78,7 @@ def evaluate_author_benchmark(predictions, coco, known_ids, previous_ids, curren
         items = detections[label]
         order = np.argsort(-np.asarray([item[0] for item in items]))
         tp, fp, fp_open = np.zeros(len(items)), np.zeros(len(items)), np.zeros(len(items))
+        duplicate_fp = np.zeros(len(items)) if track_previous else None
         for rank, index in enumerate(order):
             _, image_id, box = items[index]
             record = records[image_id]
@@ -89,7 +89,7 @@ def evaluate_author_benchmark(predictions, coco, known_ids, previous_ids, curren
                     if best in record['matched']:
                         fp[rank] = 1.
                         if track_previous:
-                            duplicates += 1
+                            duplicate_fp[rank] = 1.
                     else:
                         tp[rank] = 1.
                         record['matched'].add(best)
@@ -111,9 +111,12 @@ def evaluate_author_benchmark(predictions, coco, known_ids, previous_ids, curren
         if track_previous:
             # Hold the matched TP set fixed and rank every TP above the FPs.
             ceiling = voc_ap(recall[-1:], np.ones(1), specification['ap_mode']) if len(tp) and tp[-1] else 0.
+            filtered_fp = fp - np.cumsum(duplicate_fp)
+            filtered_precision = tp / np.maximum(tp + filtered_fp, np.finfo(float).eps)
             previous_stats[label] = dict(ap50=ap[label], gt=npos, recall_ceiling_ap50=ceiling,
-                                         tp=int(tp[-1]) if len(tp) else 0,
-                                         fp=int(fp[-1]) if len(fp) else 0, fp_duplicates=duplicates)
+                                         ap50_without_duplicate_fp=voc_ap(recall, filtered_precision, specification['ap_mode']),
+                                         tp=int(tp[-1]) if len(tp) else 0, fp=int(fp[-1]) if len(fp) else 0,
+                                         fp_duplicates=int(duplicate_fp.sum()))
         if label == -1:
             unknown_tp = int(tp[-1]) if len(tp) else 0
             unknown_count = len(items)

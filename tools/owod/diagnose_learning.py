@@ -66,13 +66,15 @@ def make_loader(image_root, annotation, batch, workers, shuffle=False, seed=42):
 
 def evaluate_views(model, loader, coco, variants, specification, old, current, device, protected_model=None,
                    *, include_current_stats=False, include_previous_stats=False, compare_current_ranks=False,
-                   exclude_unknown=(), print_freq=0):
+                   exclude_unknown=(), postprocessors=None, print_freq=0):
     import torch
     from models.graph_local.discovery import DiscoveryPostProcess
     from models.owod_benchmark_eval import evaluate_author_benchmark
     from util.box_ops import box_cxcywh_to_xyxy, box_iou
-    processors = {key: DiscoveryPostProcess(known_ids=ids, max_detections=limit, scoring=scoring)
-                  for key, (ids, scoring, limit) in variants.items()}
+    processors = dict(postprocessors or {})
+    for key, (ids, scoring, limit) in variants.items():
+        if key not in processors:
+            processors[key] = DiscoveryPostProcess(known_ids=ids, max_detections=limit, scoring=scoring)
     if exclude_unknown and (protected_model is not None or
                             any(variants[key][1] == 'hierarchical' for key in exclude_unknown)):
         raise ValueError('Unknown suppression requires focal views of a single model')
