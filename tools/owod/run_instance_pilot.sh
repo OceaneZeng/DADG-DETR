@@ -14,12 +14,13 @@ export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1}"
 export OMP_NUM_THREADS=2
 export PYTHONUNBUFFERED=1
 export PYTHONPATH="$PWD/models/ops:$PWD${PYTHONPATH:+:$PYTHONPATH}"
-if [[ ${1:-} == --s-task1-known-fraction ]]; then
-  dir=output/s-instance-task1-known-fraction
+if [[ ${1:-} == --s-task1-known-fraction || ${1:-} == --s-task1-input-scale ]]; then
+  study="${1#--s-task1-}"
+  dir="output/s-instance-task1-$study"
   export TMPDIR="$PWD/output/.tmp-owod"
   mkdir -p "$dir"
   mkdir -p -m 700 "$TMPDIR"
-  flock -n "$dir/run.lock" "$python_bin" -u -m tools.owod.run_s_task1_known_fraction 2>&1 | tee -a "$dir/console.log"
+  flock -n "$dir/run.lock" "$python_bin" -u -m "tools.owod.run_s_task1_${study//-/_}" 2>&1 | tee -a "$dir/console.log"
   exit
 fi
 if [[ ${1:-} == --task2-duration-holdout || ${1:-} == --task2-distillation-teachers || ${1:-} == --task2-distillation-selection || ${1:-} == --task2-history-retrieval || ${1:-} == --task2-slot-naming || ${1:-} == --task2-slot-features || ${1:-} == --task1-discovery-gates || ${1:-} == --task1-soft-discovery || ${1:-} == --task1-empty-allocation || ${1:-} == --task1-labeled-quality || ${1:-} == --task1-quality-views || ${1:-} == --task1-view-boxes || ${1:-} == --task1-decoder-depth || ${1:-} == --task1-encoder-levels || ${1:-} == --task1-encoder-counts || ${1:-} == --task1-encoder-residual || ${1:-} == --task1-encoder-transfer || ${1:-} == --task1-encoder-neighborhood || ${1:-} == --task1-unknown-budget || ${1:-} == --task1-unknown-factors || ${1:-} == --task1-visible-classes || ${1:-} == --task1-known-queries || ${1:-} == --task1-known-confirmation || ${1:-} == --task1-known-fraction ]]; then
