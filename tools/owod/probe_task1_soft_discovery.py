@@ -20,14 +20,19 @@ OUTPUT = ROOT / 'output/m-instance-task1-soft-discovery'
 ARMS = ('original', 'hard_rescore', 'soft')
 
 
+def continuous_evidence(output, mined, trace, index):
+    score = (mined['saliency'][index] * trace['matched_saliency']).sqrt()
+    score = score * mined['consistency'][index] * mined['semantic_weights'][index] * output['geometry_quality'][index]
+    soft = trace['eligible'] & (mined['matches'][index] >= 0) & ~mined['background'][index]
+    return score, soft & (score > 0)
+
+
 def selections(output, mined, trace, index):
     original = mined['pseudo'][index]
     quota = int(original.sum())
     choices = {'original': original}
     fallback = {}
-    score = (mined['saliency'][index] * trace['matched_saliency']).sqrt()
-    score = score * mined['consistency'][index] * mined['semantic_weights'][index] * output['geometry_quality'][index]
-    soft = trace['eligible'] & (mined['matches'][index] >= 0) & ~mined['background'][index]
+    score, soft = continuous_evidence(output, mined, trace, index)
     for arm, pool in [('hard_rescore', trace['confident']), ('soft', soft)]:
         indices = select_distinct_boxes(output['pred_boxes'][index], pool & (score > 0), score, quota)
         fallback[arm] = len(indices) != quota
