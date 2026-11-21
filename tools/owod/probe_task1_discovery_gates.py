@@ -44,12 +44,9 @@ def measure_boxes(overlap, mask, quota):
                 positive_queries=int(edges.any(1).sum()), one_to_one=matched, same_quota=min(matched, quota))
 
 
-@torch.inference_mode()
-def measure(model, criterion, ema, loader, new_classes, source_of):
-    counters = defaultdict(lambda: defaultdict(Counter))
-    images, new_ids = set(), torch.tensor(new_classes, device='cuda')
+def candidate_batches(model, criterion, ema, loader):
     known_ids = torch.tensor(model.known_ids, device='cuda')
-    for step, (images_batch, targets) in enumerate(loader, 1):
+    for images_batch, targets in loader:
         samples = images_batch.to('cuda')
         targets = move_targets(targets, 'cuda')
         known = []
@@ -61,6 +58,14 @@ def measure(model, criterion, ema, loader, new_classes, source_of):
         mined = mine_candidates(output, known, criterion.matcher(output, known), model.known_ids,
                                 ema.forward_teacher(flip_samples(samples)), criterion.top_k,
                                 criterion.saliency_threshold, criterion.consistency_threshold, gate_trace=trace)
+        yield targets, output, trace, mined
+
+
+@torch.inference_mode()
+def measure(model, criterion, ema, loader, new_classes, source_of):
+    counters = defaultdict(lambda: defaultdict(Counter))
+    images, new_ids = set(), torch.tensor(new_classes, device='cuda')
+    for step, (targets, output, trace, mined) in enumerate(candidate_batches(model, criterion, ema, loader), 1):
         for i, target in enumerate(targets):
             image = int(target['image_id'].item())
             if image in images:
@@ -96,6 +101,16 @@ def matching_headroom(row):
     return {name: 100 * value / gt for name, value in delta.items()}
 
 
+def frozen_miner(checkpoint, manifest):
+    model, criterion = load_detector(None, checkpoint, torch.device('cuda'))
+    model.eval()
+    ema = make_ema(model)
+    ema.load_state_dict(load_local_checkpoint(checkpoint)['discovery_ema'], strict=True)
+    if set(model.known_ids) != set(manifest['stages'][0]['classes']):
+        raise ValueError(f'Unexpected Task 1 known classes: {checkpoint}')
+    return model, criterion, ema
+
+
 def main():
     last = read_json(features.OUTPUT / 'comparison.json')
     source = read_json(features.OUTPUT / 'plan.json')
@@ -129,12 +144,7 @@ def main():
     rows, headroom = {}, {}
     for seed, job in jobs.items():
         checkpoint = Path(job['parent'])
-        model, criterion = load_detector(None, checkpoint, torch.device('cuda'))
-        model.eval()
-        ema = make_ema(model)
-        ema.load_state_dict(load_local_checkpoint(checkpoint)['discovery_ema'], strict=True)
-        if set(model.known_ids) != set(manifest['stages'][0]['classes']):
-            raise ValueError(f'Unexpected Task 1 known classes for seed {seed}')
+        model, criterion, ema = frozen_miner(checkpoint, manifest)
         rows[seed] = {}
         for label, annotation in [('reference128', Path(job['small'])), ('holdout1024', large)]:
             path = OUTPUT / f'seed{seed}-{label}.json'

@@ -106,6 +106,22 @@ def view_matches(outputs, teacher):
     return torch.stack(matches), torch.stack(confidence), boxes
 
 
+def select_distinct_boxes(boxes, eligible, scores, limit):
+    ranked = torch.where(eligible)[0]
+    ranked = ranked[torch.argsort(scores[ranked], descending=True)]
+    chosen = []
+    for query in ranked:
+        if len(chosen) >= limit:
+            break
+        if chosen:
+            overlap = box_iou(box_cxcywh_to_xyxy(boxes[query:query + 1]),
+                              box_cxcywh_to_xyxy(boxes[torch.stack(chosen)]))[0]
+            if overlap.max() > .7:
+                continue
+        chosen.append(query)
+    return torch.stack(chosen) if chosen else ranked[:0]
+
+
 @torch.no_grad()
 def mine_candidates(outputs, targets, indices, known_ids, teacher=None, top_k=5,
                     saliency_threshold=.65, consistency_threshold=.5, *, gate_trace=None):
@@ -137,30 +153,19 @@ def mine_candidates(outputs, targets, indices, known_ids, teacher=None, top_k=5,
         consistent = consistency[batch] >= consistency_threshold
         confident = eligible & salient & consistent
         if teacher_saliency is not None:
-            other_salient = ((maps[batch] >= 0)
-                             & (teacher_saliency[batch, maps[batch].clamp_min(0)] >= saliency_threshold))
+            matched_saliency = teacher_saliency[batch, maps[batch].clamp_min(0)]
+            other_salient = (maps[batch] >= 0) & (matched_saliency >= saliency_threshold)
             confident &= other_salient
         if gate_trace is not None:
             gate_trace.append(dict(valid=valid, eligible=eligible, salient=salient, consistent=consistent,
                                    other_salient=other_salient if teacher_saliency is not None else torch.ones_like(valid),
-                                   confident=confident))
-        ranked = torch.where(confident)[0]
+                                   confident=confident,
+                                   matched_saliency=matched_saliency if teacher_saliency is not None else None))
         quality = saliency[batch] * consistency[batch] * semantic[batch]
         if 'geometry_quality' in outputs:
             quality = quality * outputs['geometry_quality'][batch].detach()
-        ranked = ranked[torch.argsort(quality[ranked], descending=True)]
-        chosen = []
-        for query in ranked:
-            if len(chosen) >= top_k:
-                break
-            if chosen:
-                overlap = box_iou(box_cxcywh_to_xyxy(box[query:query + 1]),
-                                  box_cxcywh_to_xyxy(box[torch.stack(chosen)]))[0]
-                if overlap.max() > .7:
-                    continue
-            chosen.append(query)
-        if chosen:
-            chosen = torch.stack(chosen)
+        chosen = select_distinct_boxes(box, confident, quality, top_k)
+        if chosen.numel():
             pseudo[batch, chosen] = True
             weights[batch, chosen] = quality[chosen]
         # Lack of a semantic label is insufficient evidence of background.
