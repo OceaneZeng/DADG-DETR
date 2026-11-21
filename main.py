@@ -150,6 +150,8 @@ def get_args_parser():
     parser.add_argument('--distill-bbox-coef', default=5.0, type=float)
     parser.add_argument('--distill-score-threshold', default=0.3, type=float)
     parser.add_argument('--distill-max-queries', default=20, type=int)
+    parser.add_argument('--screen-double-old-box-loss', action='store_true',
+                        help='double L1 and GIoU on matched released old boxes during diagnostic balanced finetuning')
     parser.add_argument('--screen-annotated-distill', action='store_true',
                         help='Add one label-matched old teacher query on empty balanced finetuning images')
     parser.add_argument('--neighbor-scoped-lora', action='store_true',

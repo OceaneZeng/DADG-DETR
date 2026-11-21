@@ -251,6 +251,7 @@ class SetCriterion(nn.Module):
         self.losses = losses
         self.focal_alpha = focal_alpha
         self.active_class_ids = None
+        self.register_buffer('double_weight_box_ids', None, persistent=False)
 
     def loss_labels(self, outputs, targets, indices, num_boxes, log=True):
         """Classification loss (NLL)
@@ -316,11 +317,17 @@ class SetCriterion(nn.Module):
         loss_bbox = F.l1_loss(src_boxes, target_boxes, reduction='none')
 
         losses = {}
-        losses['loss_bbox'] = loss_bbox.sum() / num_boxes
-
         loss_giou = 1 - torch.diag(box_ops.generalized_box_iou(
             box_ops.box_cxcywh_to_xyxy(src_boxes),
             box_ops.box_cxcywh_to_xyxy(target_boxes)))
+        if self.training and self.double_weight_box_ids is not None:
+            labels = torch.cat([t['labels'][i] for t, (_, i) in zip(targets, indices)])
+            old = torch.isin(labels, self.double_weight_box_ids)
+            weights = 1 + old.to(loss_bbox.dtype)
+            loss_bbox = loss_bbox * weights[:, None]
+            loss_giou = loss_giou * weights
+            losses['old_box_matches'] = old.sum().to(loss_bbox.dtype)
+        losses['loss_bbox'] = loss_bbox.sum() / num_boxes
         losses['loss_giou'] = loss_giou.sum() / num_boxes
         return losses
 
@@ -567,6 +574,8 @@ def build(args):
     criterion = SetCriterion(num_classes, matcher, weight_dict, losses,
                              focal_alpha=args.focal_alpha)
     criterion.active_class_ids = getattr(args, 'owod_known_class_ids', None)
+    if getattr(args, 'screen_double_old_box_loss', False):
+        criterion.double_weight_box_ids = torch.tensor(args.owod_previous_class_ids, dtype=torch.long)
     criterion.to(device)
     postprocessors = {'bbox': PostProcess(
         unknown_threshold=getattr(args, 'unknown_threshold', 0.5),

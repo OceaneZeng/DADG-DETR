@@ -32,7 +32,7 @@ REFERENCES = {
 }
 
 
-def prepare(output=OUTPUT, *, restore_offsets=False):
+def prepare(output=OUTPUT, *, restore_offsets=False, double_old_boxes=False):
     source = read_json(SOURCE/'plan.json')
     fitted = read_json(SOURCE/'comparison.json')
     timing = read_json(TIMING/'comparison.json')
@@ -91,7 +91,7 @@ def prepare(output=OUTPUT, *, restore_offsets=False):
                 criterion='Against both the same-parent full-rate finetune and the original duration control: '
                           'Current +1.00 pp or more, Previous no worse than -1.00 pp, Known improves; mean proxy '
                           'U-Recall does not drop, mean WI and summed A-OSE do not rise. Use only release-source holdout.')
-    if restore_offsets:
+    if restore_offsets or double_old_boxes:
         swap = OUTPUT.with_name('s-instance-task2-step-classifier')
         trace = read_json(swap/'comparison.json')
         swap_plan = read_json(swap/'plan.json')
@@ -111,10 +111,27 @@ def prepare(output=OUTPUT, *, restore_offsets=False):
         old_loss = refs['candidate']['raw_old_box_recall_iou50']['hits'] - refs['half']['raw_old_box_recall_iou50']['hits']
         if old_loss != 162 or '--lr_linear_proj_mult' in command:
             raise ValueError('Changed old coverage deficit or projection-rate control')
-        command.extend(['--lr_linear_proj_mult', '0.2'])
         plan.update(source_classifier_sha256=file_sha256(swap/'comparison.json'), half_reference_sha256=file_sha256(swap/'half-half.json'),
-                    old_hits_to_recover=old_loss//2, intervention='Restore the decoder sampling-offset group to full rate; '
-                    'all other groups keep their half rate. Compare all groups against the recorded optimizer.')
+                    old_hits_to_recover=old_loss//2)
+        if restore_offsets:
+            command.extend(['--lr_linear_proj_mult', '0.2'])
+            plan['intervention'] = ('Restore the decoder sampling-offset group to full rate; '
+                                    'all other groups keep their half rate. Compare all groups against the recorded optimizer.')
+        else:
+            box = OUTPUT.with_name('s-instance-task2-step-box')
+            evidence = read_json(box/'comparison.json')
+            box_plan = read_json(box/'plan.json')
+            box_sha = file_sha256(box/'comparison.json')
+            if (box_sha != '7584b96b66a9ba868ac0a47247441d937de7819456998741efc8baa587733aab'
+                    or evidence['plan_sha256'] != file_sha256(box/'plan.json') or evidence['old_hit_effects']['supported'] != ['rest']
+                    or box_plan['increment_sha256'] != inc['checkpoint_sha256']
+                    or box_plan['endpoints']['half']['sha256'] != half['checkpoint_sha256']
+                    or box_plan['endpoints']['full']['sha256'] != fitted['phases']['finetune']['checkpoint_sha256']):
+                raise ValueError('Changed frozen box-head evidence')
+            command.append('--screen-double-old-box-loss')
+            plan.update(source_box_sha256=box_sha, intervention='Double matched previous-class GT L1 and GIoU terms '
+                        'at all supervised decoder layers during balanced finetuning. Keep the original global box '
+                        'normalization and the half-rate optimizer, matching costs, classification and discovery terms.')
         plan['criterion'] += (' Separately test whether at least 81 of the 162 lost old raw box hits return '
                               'versus the half-rate endpoint. Report Current and FP-family differences against that endpoint.')
     pin(output/'plan.json', plan)
@@ -138,11 +155,17 @@ def compare(views, ref):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--restore-offsets', action='store_true', help='Restore only the decoder sampling-offset rate')
-    restore_offsets = parser.parse_args().restore_offsets
-    output = OUTPUT.with_name('s-instance-task2-finetune-offset-rate') if restore_offsets else OUTPUT
+    variants = parser.add_mutually_exclusive_group()
+    variants.add_argument('--restore-offsets', action='store_true', help='Restore only the decoder sampling-offset rate')
+    variants.add_argument('--double-old-boxes', action='store_true', help='Double only the released old-GT localization terms')
+    options = parser.parse_args()
+    output = OUTPUT
+    if options.restore_offsets:
+        output = OUTPUT.with_name('s-instance-task2-finetune-offset-rate')
+    elif options.double_old_boxes:
+        output = OUTPUT.with_name('s-instance-task2-finetune-old-box-loss')
     print('Verifying S timing evidence and matched finetune inputs', flush=True)
-    plan, manifest, order, refs = prepare(output, restore_offsets=restore_offsets)
+    plan, manifest, order, refs = prepare(output, restore_offsets=options.restore_offsets, double_old_boxes=options.double_old_boxes)
     pilot.run([sys.executable, str(pilot.ROOT/'tools/owod/manage_data.py'), 'verify',
                '--benchmark', 's-owodb', '--output-root', str(MANIFEST.parent.parent)])
     checkpoint, args = run_job(plan['command'], plan['identity']['screening_sha256'])
@@ -155,22 +178,31 @@ def main():
         raise ValueError('Unexpected effective rates, adapter inputs or frozen quality head')
     ds, loader = make_loader(resolve_image_root(MANIFEST, manifest), Path(plan['annotation']), 2, 2)
     views = evaluate('candidate-finetune', checkpoint, plan, ds, loader, manifest, order, proxies=True,
-                     output=output, fp_sources=restore_offsets)
+                     output=output, fp_sources='half' in refs)
     comparisons = {arm: compare(views, ref) for arm, ref in refs.items()}
     report = dict(
         status='complete', paper_comparable=False, plan_sha256=file_sha256(output/'plan.json'),
         checkpoint_sha256=file_sha256(checkpoint), author=endpoint(checkpoint.parent, 'finetune', epoch=0),
         heldout=views['released']['metrics'], comparisons=comparisons,
         follow_up=all(comparisons[arm]['known_pass'] and comparisons[arm]['open_pass'] for arm in REFERENCES))
-    if restore_offsets:
+    if 'half' in refs:
         from tools.owod.probe_s_task2_current_fp_sources import summarize
 
         before = optimizer_groups(OUTPUT/'finetune/train.log')
         after = optimizer_groups(output/'finetune/train.log')
-        expected = [(rate * 2 if size == 394752 else rate, size) for rate, size in before]
-        if (after != expected or sum(size == 394752 for _, size in before) != 1
-                or not any(size == 394752 and isclose(rate, 3.75e-7) for rate, size in after)):
-            raise ValueError('Expected only the nonempty sampling-offset group to regain full rate')
+        if options.restore_offsets:
+            expected = [(rate * 2 if size == 394752 else rate, size) for rate, size in before]
+            if (after != expected or sum(size == 394752 for _, size in before) != 1
+                    or not any(size == 394752 and isclose(rate, 3.75e-7) for rate, size in after)):
+                raise ValueError('Expected only the nonempty sampling-offset group to regain full rate')
+        else:
+            import json
+            epoch = json.loads((output/'finetune/metrics.jsonl').read_text().splitlines()[-1])
+            counts = {k: v for k, v in epoch.items() if k.startswith('train_old_box_matches') and k.endswith('_unscaled')}
+            if (after != before or not args.screen_double_old_box_loss or len(counts) != args.dec_layers
+                    or min(counts.values()) <= 0 or epoch['epoch'] != 0):
+                raise ValueError('Expected nonempty weighted old matches at every layer and the unchanged half-rate optimizer')
+            report['old_matches_per_rank_batch'] = counts
         old = views['raw_old_box_recall_iou50']
         base = refs['half']['raw_old_box_recall_iou50']
         if old['gt'] != base['gt']:
