@@ -1,4 +1,5 @@
-"""Test a single increase in incremental matched-box GIoU weight on the S duration control."""
+"""Test a single increment-stage training change on the S three-epoch duration control."""
+import argparse
 from hashlib import sha256
 import os
 from pathlib import Path
@@ -26,7 +27,7 @@ OUTPUT = DURATION.with_name('s-instance-task2-increment-giou')
 PHASES = ('increment', 'finetune')
 
 
-def prepare():
+def prepare(output=OUTPUT, *, classifier_lr=False):
     phase_plan = read_json(PHASE_SOURCE / 'plan.json')
     evidence = read_json(PHASE_SOURCE / 'comparison.json')
     duration_plan = read_json(DURATION / 'plan.json')
@@ -56,14 +57,15 @@ def prepare():
             raise ValueError(f'Changed historical control: {phase}')
         args = load_checkpoint_metadata(Path(ref['path']))['args']
         validate_plan_arguments({'command': baseline}, args)
-        if (args.giou_loss_coef, args.bbox_loss_coef, args.set_cost_giou, args.batch_size, args.seed) != (2, 5, 2, 2, 42):
+        if (args.giou_loss_coef, args.bbox_loss_coef, args.set_cost_giou, args.batch_size, args.seed,
+                args.class_embed_lr_mult) != (2, 5, 2, 2, 42, 1):
             raise ValueError('Unexpected control loss, assignment cost, batch or seed')
         cmd = list(baseline)
-        cmd[cmd.index('--output_dir')+1] = str(OUTPUT/phase)
+        cmd[cmd.index('--output_dir')+1] = str(output/phase)
         if phase == 'increment':
-            cmd.extend(['--giou_loss_coef', '4'])
+            cmd.extend(['--class_embed_lr_mult', '2'] if classifier_lr else ['--giou_loss_coef', '4'])
         else:
-            cmd[cmd.index('--pretrained')+1] = str(OUTPUT/'increment/checkpoint.pth')
+            cmd[cmd.index('--pretrained')+1] = str(output/'increment/checkpoint.pth')
         jobs[phase], controls[phase] = cmd, ref
     plan = dict(commit=subprocess.check_output(['git', 'rev-parse', 'HEAD'], cwd=pilot.ROOT, text=True).strip(),
                 protocol='s-owodb', paper_comparable=False, seed=42, gpus=devices, devices=duration_plan['devices'],
@@ -76,14 +78,25 @@ def prepare():
                 criterion='Advance if Current gains at least 1.00 pp, Previous drops at most 1.00 pp and Known rises. '
                           'Also require mean masked-fold U-Recall not to fall, mean WI and summed A-OSE not to rise. '
                           'Record whether incremental raw Current box coverage improves. No author-test model selection.')
-    pin(OUTPUT/'plan.json', plan)
+    if classifier_lr:
+        matched = DURATION.with_name('s-instance-task2-matched-exposure')
+        reports = {matched:'b0500f0ed19822b5dd4b5de2f3ed42372b38069fdf495aa119a44cc02dc97bb4',
+                   OUTPUT:'1ba2488652817ac039d22f05165f0a345a681840b397b6558406423b6f695f1a'}
+        for folder, digest in reports.items():
+            if (file_sha256(folder/'comparison.json') != digest
+                    or read_json(folder/'comparison.json')['plan_sha256'] != file_sha256(folder/'plan.json')):
+                raise ValueError(f'Changed evidence for classifier comparison: {folder}')
+        plan.update(source_results={f.name:h for f,h in reports.items()},
+                    intervention='Increment current-class classifier rows LR x2; finetune head LR x1. '
+                                 'Same three-epoch control, GIoU coefficient 2 in both phases.')
+    pin(output/'plan.json', plan)
     return plan, evidence
 
 
-def evaluate(name, checkpoint, plan, dataset, loader, manifest, order, *, proxies):
-    path = OUTPUT/f'{name}-heldout.json'
+def evaluate(name, checkpoint, plan, dataset, loader, manifest, order, *, proxies, output=OUTPUT):
+    path = output/f'{name}-heldout.json'
     digest = file_sha256(checkpoint)
-    plan_hash = file_sha256(OUTPUT/'plan.json')
+    plan_hash = file_sha256(output/'plan.json')
     if not path.exists():
         print(f'Evaluating {name} on 1024 held-out images', flush=True)
         model, _ = load_detector(None, checkpoint, torch.device('cuda'))
@@ -102,8 +115,12 @@ def evaluate(name, checkpoint, plan, dataset, loader, manifest, order, *, proxie
 
 
 def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--classifier-lr', action='store_true', help='Double only the increment classifier LR')
+    classifier_lr = parser.parse_args().classifier_lr
+    output = OUTPUT.with_name('s-instance-task2-increment-classifier-lr') if classifier_lr else OUTPUT
     print('Verifying S duration controls, original cache and stage evidence', flush=True)
-    plan, evidence = prepare()
+    plan, evidence = prepare(output, classifier_lr=classifier_lr)
     pilot.run([sys.executable, str(pilot.ROOT/'tools/owod/manage_data.py'), 'verify',
                '--benchmark', 's-owodb', '--output-root', str(MANIFEST.parent.parent)])
     annotation = Path(plan['annotation'])
@@ -112,24 +129,26 @@ def main():
     if len(order) != 1024 or sha256('\n'.join(order).encode()).hexdigest() != plan['eval_order_sha256']:
         raise ValueError('Changed holdout order')
     ds, loader = make_loader(resolve_image_root(MANIFEST, manifest), annotation, 2, 2)
-    report = dict(status='partial', plan_sha256=file_sha256(OUTPUT/'plan.json'), paper_comparable=False, phases={})
+    report = dict(status='partial', plan_sha256=file_sha256(output/'plan.json'), paper_comparable=False, phases={})
     for phase in PHASES:
         path, args = run_job(plan['jobs'][phase], plan['identity']['screening_sha256'])
         adapter = args.graph_adapter_specs[-1]
         if (adapter['source_checkpoint_sha256'] != plan['identity']['checkpoint_sha256']
                 or adapter['gnn_sha256'] != plan['identity']['gnn_sha256']
                 or adapter['instances']['cache_sha256'] != plan['cache_sha256']
-                or args.giou_loss_coef != (4 if phase == 'increment' else 2)):
+                or args.giou_loss_coef != (4 if phase == 'increment' and not classifier_lr else 2)
+                or args.class_embed_lr_mult != (2 if phase == 'increment' and classifier_lr else 1)):
             raise ValueError('Different training inputs or objective')
-        views = evaluate('candidate-'+phase, path, plan, ds, loader, manifest, order, proxies=phase=='finetune')
+        views = evaluate('candidate-'+phase, path, plan, ds, loader, manifest, order, proxies=phase=='finetune', output=output)
         stats = views['released']['metrics']
         reference = evidence['arms']['3epochs'][phase]
         raw = views['raw_current_box_recall_iou50']
         report['phases'][phase] = dict(checkpoint_sha256=file_sha256(path), heldout=stats, raw_current=raw,
             delta_raw_hits=raw['hits']-(reference['gt']-reference['no_box']), author=endpoint(path.parent, phase, epoch=args.epochs-1),
             delta={k:stats[k]-reference[k] for k in ('current_ap50','previous_ap50','known_ap50')})
-        write_json(OUTPUT/'progress.json', report)
-    control = evaluate('control-finetune', Path(plan['control']['finetune']['path']), plan, ds, loader, manifest, order, proxies=True)
+        write_json(output/'progress.json', report)
+    control = evaluate('control-finetune', Path(plan['control']['finetune']['path']), plan, ds, loader, manifest, order,
+                       proxies=True, output=output)
     if any(control['released']['metrics'][k] != evidence['arms']['3epochs']['finetune'][k] for k in ('previous_ap50','current_ap50','known_ap50')):
         raise ValueError('Historical native finetune AP did not replay')
     folds = {}
@@ -143,8 +162,8 @@ def main():
     open_pass = (mean(f['u_recall'] for f in folds.values()) >= 0 and sum(f['a_ose'] for f in folds.values()) <= 0
                  and mean(f['wi'] for f in folds.values()) <= 0)
     report.update(status='complete', proxy_deltas=folds, known_pass=known_pass, open_pass=open_pass, follow_up=known_pass and open_pass)
-    write_json(OUTPUT/'comparison.json', report)
-    print('GIoU comparison saved:', OUTPUT/'comparison.json', flush=True)
+    write_json(output/'comparison.json', report)
+    print('Increment comparison saved:', output/'comparison.json', flush=True)
 
 
 if __name__ == '__main__':

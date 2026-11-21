@@ -14,7 +14,8 @@ export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1}"
 export OMP_NUM_THREADS=2
 export PYTHONUNBUFFERED=1
 export PYTHONPATH="$PWD/models/ops:$PWD${PYTHONPATH:+:$PYTHONPATH}"
-if [[ ${1:-} == --s-task2-wi-sources || ${1:-} == --task2-old-only-independent || ${1:-} == --s-task2-current-phase || ${1:-} == --s-task2-increment-giou || ${1:-} == --s-task2-current-fp-sources || ${1:-} == --s-task2-current-exposure || ${1:-} == --s-task2-matched-exposure ]]; then
+if [[ ${1:-} == --s-task2-wi-sources || ${1:-} == --task2-old-only-independent || ${1:-} == --s-task2-current-phase || ${1:-} == --s-task2-increment-giou || ${1:-} == --s-task2-increment-classifier-lr || ${1:-} == --s-task2-current-fp-sources || ${1:-} == --s-task2-current-exposure || ${1:-} == --s-task2-matched-exposure ]]; then
+  flags=()
   dir=output/s-instance-task2-dedup-wi-sources
   module=tools.owod.probe_s_task2_wi_sources
   if [[ $1 == --task2-old-only-independent ]]; then
@@ -26,6 +27,10 @@ if [[ ${1:-} == --s-task2-wi-sources || ${1:-} == --task2-old-only-independent |
   elif [[ $1 == --s-task2-increment-giou ]]; then
     dir=output/s-instance-task2-increment-giou
     module=tools.owod.run_s_task2_increment_giou
+  elif [[ $1 == --s-task2-increment-classifier-lr ]]; then
+    dir=output/s-instance-task2-increment-classifier-lr
+    module=tools.owod.run_s_task2_increment_giou
+    flags=(--classifier-lr)
   elif [[ $1 == --s-task2-current-fp-sources ]]; then
     dir=output/s-instance-task2-current-fp-sources
     module=tools.owod.probe_s_task2_current_fp_sources
@@ -40,7 +45,7 @@ if [[ ${1:-} == --s-task2-wi-sources || ${1:-} == --task2-old-only-independent |
   mkdir -p "$dir"
   mkdir -p -m 700 "$TMPDIR"
   if [[ -f "$dir/comparison.json" ]]; then exit 0; fi
-  flock -n "$dir/run.lock" "$python_bin" -u -m "$module" 2>&1 | tee -a "$dir/console.log"
+  flock -n "$dir/run.lock" "$python_bin" -u -m "$module" "${flags[@]}" 2>&1 | tee -a "$dir/console.log"
   exit
 fi
 if [[ ${1:-} == --task2-dedup-open-set || ${1:-} == --task2-old-only-refill ]]; then
