@@ -92,21 +92,19 @@ def prepare():
     return manifest, plan
 
 
-def main():
-    print('Checking exposure identities and rebuilding released annotations', flush=True)
-    manifest, plan = prepare()
-    digest = file_sha256(OUTPUT/'plan.json')
+def evaluate_groups(output, manifest, plan):
+    digest = file_sha256(output/'plan.json')
     supported = plan['common_classes']
     old, stage = manifest['stages'][:2]
-    summary, gaps = {}, {}
+    summary = {}
     for arm, entry in plan['checkpoints'].items():
         model, _ = load_detector(None, Path(entry['path']), torch.device('cuda'))
         rows = summary[arm] = {}
         for group, names in plan['groups'].items():
-            path = OUTPUT/f'{arm}-{group}.json'
+            path = output/f'{arm}-{group}.json'
             if not path.exists():
                 print(f'Evaluating {arm} {group}: {len(names)} images', flush=True)
-                ds, loader = make_loader(resolve_image_root(MANIFEST, manifest), OUTPUT/f'{group}-annotations.json', 2, 2)
+                ds, loader = make_loader(resolve_image_root(MANIFEST, manifest), output/f'{group}-annotations.json', 2, 2)
                 views = evaluate_views(model, loader, ds.coco, {'native': (stage['active_classes'], 'focal', 50)},
                                        dict(manifest['evaluation'], image_source_ids=names, known_only_screening=True),
                                        old['classes'], stage['classes'], 'cuda', include_current_stats=True, print_freq=64)
@@ -122,6 +120,17 @@ def main():
                                common_current_ap50=mean(stats[str(k)]['ap50'] for k in supported) if supported else None,
                                voc_tp=sum(c['tp'] for c in stats.values()), voc_fp=sum(c['fp'] for c in stats.values()))
         del model
+    return summary
+
+
+def main():
+    print('Checking exposure identities and rebuilding released annotations', flush=True)
+    manifest, plan = prepare()
+    digest = file_sha256(OUTPUT/'plan.json')
+    supported = plan['common_classes']
+    summary = evaluate_groups(OUTPUT, manifest, plan)
+    gaps = {}
+    for arm, rows in summary.items():
         gaps[arm] = rows['task2_only']['common_current_ap50']-rows['heldout']['common_current_ap50'] if supported else None
     focus = 'inconclusive'
     if len(supported) >= 11:
