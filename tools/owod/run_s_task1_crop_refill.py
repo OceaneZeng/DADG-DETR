@@ -33,7 +33,11 @@ def crop_window(width, height, right, bottom):
     return x, y, x + w, y + h
 
 
-def crop_predictions(model, post, dataset, keys, sizes):
+def owned_centers(boxes, tile):
+    return ((boxes[:, 0] >= .5) == (tile % 2)) & ((boxes[:, 1] >= .5) == (tile // 2))
+
+
+def crop_predictions(model, post, dataset, keys, sizes, *, include_unowned=False):
     photos = [dataset.get_image(dataset.coco.imgs[k]['file_name']) for k in keys]
     if [list(photo.size[::-1]) for photo in photos] != sizes.tolist():
         raise ValueError('Original image dimensions differ from the evaluation target')
@@ -50,9 +54,8 @@ def crop_predictions(model, post, dataset, keys, sizes):
             b = out['pred_boxes'][i]
             boxes = b * b.new_tensor([(x2-x)/w, (y2-y)/h, (x2-x)/w, (y2-y)/h])
             boxes[:, :2] += b.new_tensor([x/w, y/h])
-            owned = ((boxes[:, 0] >= .5) == bool(right)) & ((boxes[:, 1] >= .5) == bool(bottom))
             # Keep a stable identity for the crop and its original query.
-            ids = torch.where(owned)[0]
+            ids = torch.arange(len(b), device=b.device) if include_unowned else torch.where(owned_centers(boxes, tile))[0]
             groups[i].append((boxes[ids], scores[i, ids], categories[labels[i, ids]], ids + tile * len(b)))
     return [tuple(torch.cat(parts) for parts in zip(*group)) for group in groups]
 
