@@ -15,7 +15,7 @@ from tools.owod.probe_task1_unknown_factors import best_target
 from tools.owod.probe_task1_view_boxes import overlap
 from tools.owod.protocol import file_sha256, read_json, resolve_image_root
 from tools.owod.run_cross_attention_study import pin
-from tools.owod.run_s_task1_input_scale import valid_annotations
+from tools.owod.run_s_task1_input_scale import OUTPUT as SCALE, valid_annotations
 from tools.owod.run_s_task1_known_fraction import MANIFEST, OUTPUT as PARENT
 from tools.owod.run_s_task1_proposal_stages import OUTPUT as TRACE
 from tools.owod.run_s_task1_released_seed import OUTPUT as RELEASED, replace
@@ -78,14 +78,19 @@ def rank_cells(geo, i, size):
     return choice, ordered
 
 
-def measure(out, i, det, truth, anns, known, proxy):
+def measure(out, i, det, truth, anns, known, proxy, baseline=None):
     queries = det['top_indices'] // (len(known) + 1)
     unknown = det['labels'] == 91
+    if baseline is not None and (queries[unknown].tolist() != baseline['picks']['native']
+                                 or det['top_indices'][~unknown].tolist() != baseline['known_positions']):
+        raise ValueError('Changed native Top-50 on the proxy slice')
     record = dict(unknown_outputs=int(unknown.sum()))
     matched = {}
     for group, classes, use in [('known', known, ~unknown), ('proxy', proxy, unknown)]:
         idx = [j for j, a in enumerate(anns) if a['category_id'] in classes]
         assign = best_target(out['pred_boxes'][i], truth[idx])
+        if baseline is not None and assign.tolist() != baseline['known_gt' if group == 'known' else 'hidden_gt']:
+            raise ValueError(f'Changed native {group} target assignments on the proxy slice')
         matched[group] = assign[queries] >= 0
         selected = assign[queries[use]].tolist()
         hits = {anns[idx[j]]['id'] for j, label in zip(selected, det['labels'][use].tolist())
@@ -108,9 +113,21 @@ def first_cover(boxes, orders, truth, anns):
     return result
 
 
-@torch.inference_mode()
-def evaluate(label, model, post, loader, known, proxy, reference):
+def summarize(images):
     totals = {arm: Counter() for arm in ('native', *RANKERS)}
+    for row in images.values():
+        small = {int(j) for j in row['first_cover']['quality']}
+        for arm in totals:
+            record = row['outcomes'][arm]
+            totals[arm].update(images=1, eligible_recovered=int(row['eligible_id'] in record['known']),
+                               known=len(record['known']), proxy=len(record['proxy']),
+                               small_proxy=sum(j in small for j in record['proxy']),
+                               unknown_outputs=record['unknown_outputs'], unknown_only_known=record['unknown_only_known'])
+    return totals
+
+
+@torch.inference_mode()
+def evaluate(label, model, post, loader, known, proxy, reference, baseline):
     images = {}
     module = model.detr.transformer.instance_proposals
     for step, (samples, targets) in enumerate(loader, 1):
@@ -136,34 +153,27 @@ def evaluate(label, model, post, loader, known, proxy, reference):
             row = dict(choice=choices[i], pool=len(orders['quality']), eligible_id=eligible['annotation_id'] if eligible else None,
                        first_cover=first_cover(geo['boxes'][i], orders, truth, anns), outcomes={})
             images[key] = row
-            rows.append((row, truth, anns, ref))
-        for arm in totals:
+            rows.append((row, truth, anns, ref, baseline[key] if baseline is not None else None))
+        for arm in ('native', *RANKERS):
             out = native
             if arm != 'native' and any(choices):
                 hook = partial(replace, choices=choices, geometry=arm, content=arm)
                 with module.register_forward_hook(hook):
                     out = model(samples)
             detections = post(out, sizes, include_top_indices=True)
-            for i, (row, truth, anns, ref) in enumerate(rows):
-                record = measure(out, i, detections[i], truth, anns, known, proxy)
+            for i, (row, truth, anns, ref, native_ref) in enumerate(rows):
+                record = measure(out, i, detections[i], truth, anns, known, proxy,
+                                 native_ref if arm == 'native' else None)
                 row['outcomes'][arm] = record
-                if arm == 'native':
-                    if label == 'proxy' and set(record['known'] + record['proxy']) != set(ref['emitted_best']):
-                        raise ValueError('Changed native proxy-slice predictions')
-                    if row['eligible_id'] is not None:
-                        expected = {ref['annotation_ids'][j] for j in ref['outcomes']['native']['correct_ids']}
-                        if set(record['known']) != expected:
-                            raise ValueError('Changed native released-slice predictions')
-                small = row['first_cover']['quality']
-                totals[arm].update(images=1, eligible_recovered=int(row['eligible_id'] in record['known']),
-                                   known=len(record['known']), proxy=len(record['proxy']),
-                                   small_proxy=sum(j in small for j in record['proxy']),
-                                   unknown_outputs=record['unknown_outputs'], unknown_only_known=record['unknown_only_known'])
+                if arm == 'native' and row['eligible_id'] is not None:
+                    expected = {ref['annotation_ids'][j] for j in ref['outcomes']['native']['correct_ids']}
+                    if set(record['known']) != expected:
+                        raise ValueError('Changed native released-slice predictions')
         if step == 1 or step % 64 == 0 or step == len(loader):
             print(f'{datetime.now().isoformat(timespec="seconds")} {label} {step}/{len(loader)} batches', flush=True)
     if images.keys() != reference.keys():
         raise ValueError('Incomplete paired slice')
-    return images, totals
+    return images
 
 
 def main():
@@ -191,8 +201,25 @@ def main():
                 criterion='Independently for either arm: recover >=11 of the previously designated released misses; '
                           'maintain total correct known hits on each slice and total emitted proxy hits; strictly increase '
                           'small emitted proxy hits. Passing warrants independent held-out verification only.')
-    pin(OUTPUT / 'plan.json', plan)
-    digest = file_sha256(OUTPUT / 'plan.json')
+    path = OUTPUT / 'plan.json'
+    standard_path = SCALE / 'standard.json'
+    if file_sha256(standard_path) != trace['reference_sha256']:
+        raise ValueError('Changed native proxy reference')
+    execution_commit = plan['commit']
+    legacy = path.exists() and file_sha256(path) == 'd08eaa16b78f639798bcd5e8e38d66f070e69c51223a10bedb2a104293ac63d3'
+    if legacy:
+        # Resume the verified released endpoint from the interrupted first execution.
+        if file_sha256(OUTPUT / 'released.json') != 'fd742cc30210863908fa5fbc9771f5f53b6bdc2fe6cf7c17238069fbdf73aea0':
+            raise ValueError('Changed completed released endpoint')
+        plan['commit'] = '97b2b2a26b5bc4d690322d6c0ae50ffdb36e37c3'
+    pin(path, plan)
+    digest = file_sha256(path)
+    if legacy:
+        pin(OUTPUT / 'recovery' / 'plan.json', dict(commit=execution_commit, original_plan_sha256=digest,
+            released_sha256=file_sha256(OUTPUT / 'released.json'), native_reference_sha256=trace['reference_sha256']))
+    standard = read_json(standard_path)
+    if standard['plan_sha256'] != trace['parent_plan_sha256']:
+        raise ValueError('Unpaired native proxy reference')
     manifest = read_json(MANIFEST)
     known, proxy = [s['classes'] for s in manifest['stages'][:2]]
     args = load_checkpoint_metadata(checkpoint)['args']
@@ -204,14 +231,24 @@ def main():
         ref = read_json(refs[label])
         if ref['plan_sha256'] != parents[label]:
             raise ValueError(f'Unpaired reference for {label}')
-        _, loader = make_loader(resolve_image_root(MANIFEST, manifest), path, plan['batch_size'], 2)
-        images, totals[label] = evaluate(label, model, post, loader, known, proxy, ref['images'])
-        write_json(OUTPUT / f'{label}.json', dict(plan_sha256=digest, images=images))
+        endpoint = OUTPUT / f'{label}.json'
+        if endpoint.exists():
+            saved = read_json(endpoint)
+            if saved['plan_sha256'] != digest or saved['images'].keys() != ref['images'].keys():
+                raise ValueError(f'Changed saved {label} endpoint')
+            images = saved['images']
+            print(f'Reusing {len(images)} verified {label} image records', flush=True)
+        else:
+            _, loader = make_loader(resolve_image_root(MANIFEST, manifest), path, plan['batch_size'], 2)
+            images = evaluate(label, model, post, loader, known, proxy, ref['images'],
+                              standard['images'] if label == 'proxy' else None)
+            write_json(endpoint, dict(plan_sha256=digest, images=images))
+        totals[label] = summarize(images)
     r, p = totals['released'], totals['proxy']
     passing = [a for a in RANKERS if r[a]['eligible_recovered'] >= 11 and r[a]['known'] >= r['native']['known']
                and p[a]['known'] >= p['native']['known'] and p[a]['proxy'] >= p['native']['proxy']
                and p[a]['small_proxy'] > p['native']['small_proxy']]
-    write_json(OUTPUT / 'comparison.json', dict(status='complete', plan_sha256=digest, rows=totals,
+    write_json(OUTPUT / 'comparison.json', dict(status='complete', plan_sha256=digest, execution_commit=execution_commit, rows=totals,
                                                 passing=passing, follow_up=bool(passing), paper_comparable=False))
     print('Comparison saved:', OUTPUT / 'comparison.json', flush=True)
 
