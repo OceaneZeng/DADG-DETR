@@ -93,7 +93,7 @@ def inputs(protocol, manifest_path, source, arms, ap_mode):
 
 def evaluate_protocol(protocol, manifest_path, source, plan, plan_hash, *, output=OUTPUT, old_only=False):
     manifest = read_json(manifest_path)
-    source_arms = read_json(source / 'comparison.json')['arms']
+    source_arms = read_json(source / 'comparison.json')['arms'] if source is not None else None
     annotation = Path(plan['annotation'])
     order = [row['owod_source_id'] for row in read_json(annotation)['images']]
     dataset, loader = make_loader(resolve_image_root(manifest_path, manifest), annotation, 2, 2)
@@ -128,7 +128,7 @@ def evaluate_protocol(protocol, manifest_path, source, plan, plan_hash, *, outpu
                 report[check_key] != dict.fromkeys(auditors, len(order))):
             raise ValueError(f'Incomplete protected prediction check: {path}')
         views = report['views']
-        if old_only:
+        if old_only and source_arms is not None:
             parent = read_json(OUTPUT / path.name)
             if (parent['checkpoint_sha256'] != entry['sha256'] or
                     parent['plan_sha256'] != file_sha256(OUTPUT / 'plan.json')):
@@ -139,7 +139,11 @@ def evaluate_protocol(protocol, manifest_path, source, plan, plan_hash, *, outpu
                     raise ValueError(f'Native replay differs: {path.name}, {name}')
         for view in (('native',) if old_only else ('native', 'dedup')):
             metrics = views[f'released_{view}']['metrics']
-            if (metrics['unknown_gt'] or any(metrics[k] != v for k, v in source_arms[arm][view]['metrics'].items()) or
+            if metrics['unknown_gt']:
+                raise ValueError(f'Released view contains unknown labels: {path}')
+            if source_arms is None:
+                continue
+            if (any(metrics[k] != v for k, v in source_arms[arm][view]['metrics'].items()) or
                     views[f'released_{view}']['composition'] != source_arms[arm][view]['composition']):
                 raise ValueError(f'Prior released-category result differs from {path}: {view}')
         folds = {}

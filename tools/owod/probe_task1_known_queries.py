@@ -25,13 +25,13 @@ OUTPUT = ROOT / 'output/m-instance-task1-known-queries'
 SOURCES = ('t1_train', 't2_train')
 
 
-def fresh_origins(manifest, excluded, seed):
+def fresh_origins(manifest, excluded, seed, per_source=(512, 512)):
     blocked = set(excluded)
     origins = {}
-    for source in SOURCES:
+    for source, count in zip(SOURCES, per_source, strict=True):
         pool = set(manifest['splits'][source]) - blocked
-        chosen = sorted(pool, key=lambda s: hashlib.sha256(f'{seed}:{s}'.encode()).digest())[:512]
-        if len(chosen) != 512:
+        chosen = sorted(pool, key=lambda s: hashlib.sha256(f'{seed}:{s}'.encode()).digest())[:count]
+        if len(chosen) != count:
             raise ValueError(f'Incomplete independent pool for {source}')
         origins.update(dict.fromkeys(chosen, source))
         blocked.update(chosen)

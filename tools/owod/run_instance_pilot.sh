@@ -14,13 +14,18 @@ export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1}"
 export OMP_NUM_THREADS=2
 export PYTHONUNBUFFERED=1
 export PYTHONPATH="$PWD/models/ops:$PWD${PYTHONPATH:+:$PYTHONPATH}"
-if [[ ${1:-} == --s-task2-wi-sources ]]; then
+if [[ ${1:-} == --s-task2-wi-sources || ${1:-} == --task2-old-only-independent ]]; then
   dir=output/s-instance-task2-dedup-wi-sources
+  module=tools.owod.probe_s_task2_wi_sources
+  if [[ $1 == --task2-old-only-independent ]]; then
+    dir=output/instance-task2-old-only-independent
+    module=tools.owod.probe_task2_old_only_independent
+  fi
   export TMPDIR="$PWD/output/.tmp-owod"
   mkdir -p "$dir"
   mkdir -p -m 700 "$TMPDIR"
   if [[ -f "$dir/comparison.json" ]]; then exit 0; fi
-  flock -n "$dir/run.lock" "$python_bin" -u -m tools.owod.probe_s_task2_wi_sources 2>&1 | tee -a "$dir/console.log"
+  flock -n "$dir/run.lock" "$python_bin" -u -m "$module" 2>&1 | tee -a "$dir/console.log"
   exit
 fi
 if [[ ${1:-} == --task2-dedup-open-set || ${1:-} == --task2-old-only-refill ]]; then
