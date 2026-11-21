@@ -44,14 +44,14 @@ def stage_coverage(out, i, truth):
 
 
 @torch.inference_mode()
-def evaluate(model, post, loader, known, proxy, reference):
+def evaluate(model, post, loader, known, proxy, reference=None):
     images, totals = {}, defaultdict(Counter)
     for step, (samples, targets) in enumerate(loader, 1):
         out = model(samples.to('cuda'))
         native = post(out, torch.stack([t['orig_size'] for t in targets]).cuda(), include_top_indices=True)
         for i, target in enumerate(targets):
             key = str(target['image_id'].item())
-            ref = reference[key]
+            ref = reference[key] if reference is not None else None
             truth = target['boxes'].cuda()
             labels = target['labels'].tolist()
             anns = valid_annotations(loader.dataset, int(key))
@@ -61,20 +61,23 @@ def evaluate(model, post, loader, known, proxy, reference):
             unknown = detections['labels'] == 91
             positions = detections['top_indices']
             queries = positions // (len(known) + 1)
-            if (queries[unknown].tolist() != ref['picks']['native']
-                    or positions[~unknown].tolist() != ref['known_positions']):
+            if ref is not None and (queries[unknown].tolist() != ref['picks']['native']
+                                    or positions[~unknown].tolist() != ref['known_positions']):
                 raise ValueError(f'Changed native Top-50 on {key}')
             hits = stage_coverage(out, i, truth)
+            final_best, emitted_best = [], []
             for group, ids, expected in [('known', known, 'known_gt'), ('proxy', proxy, 'hidden_gt')]:
                 indices = [j for j, label in enumerate(labels) if label in ids]
                 assigned = best_target(out['pred_boxes'][i], truth[indices]).tolist()
-                if assigned != ref[expected]:
+                if ref is not None and assigned != ref[expected]:
                     raise ValueError(f'Changed final query assignments on {key}')
                 chosen = queries[unknown if group == 'proxy' else ~unknown].tolist()
                 emitted_labels = detections['labels'][unknown if group == 'proxy' else ~unknown].tolist()
                 emitted = {assigned[q] for q, label in zip(chosen, emitted_labels) if assigned[q] >= 0
                            and (group == 'proxy' or label == labels[indices[assigned[q]]])}
                 best = set(assigned)
+                final_best.extend(anns[indices[j]]['id'] for j in sorted(best - {-1}))
+                emitted_best.extend(anns[indices[j]]['id'] for j in sorted(emitted))
                 for local, j in enumerate(indices):
                     area = anns[j]['area']
                     size = 'small' if area < 32**2 else 'medium' if area < 96**2 else 'large'
@@ -92,10 +95,13 @@ def evaluate(model, post, loader, known, proxy, reference):
                         else:
                             cause = 'selected_then_missing'
                         counts[cause] += 1
-            images[key] = dict(annotation_ids=[a['id'] for a in anns], stages=hits)
+            geo = out['geometry']
+            images[key] = dict(annotation_ids=[a['id'] for a in anns], stages=hits, final_best=final_best,
+                               emitted_best=emitted_best, unknown_quota=int(unknown.sum()),
+                               valid_cells=int(geo['valid'][i].sum()), selected_cells=int(geo['active'][i].sum()))
         if step == 1 or step % 64 == 0 or step == len(loader):
             print(f'Evaluated {step}/{len(loader)} batches', flush=True)
-    if images.keys() != reference.keys():
+    if set(images) != {str(im) for im in loader.dataset.ids} or (reference is not None and images.keys() != reference.keys()):
         raise ValueError('Stage trace did not cover the full paired slice')
     return images, totals
 

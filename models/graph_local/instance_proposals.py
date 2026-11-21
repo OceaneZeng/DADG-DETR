@@ -19,6 +19,7 @@ class InstanceProposals(nn.Module):
         super().__init__()
         self.rank_within_level = False
         self.match_encoder_counts = False
+        self.finest_anchor_size = 0.05
         self.offset = nn.Linear(dim, 4)
         nn.init.zeros_(self.offset.weight)
         nn.init.zeros_(self.offset.bias)
@@ -54,7 +55,8 @@ class InstanceProposals(nn.Module):
             )
             valid_wh = torch.stack(((~mask[:, 0]).sum(-1), (~mask[:, :, 0]).sum(-1)), -1)
             xy = (torch.stack((x, y), -1).flatten(0, 1) + 0.5) / valid_wh[:, None].clamp_min(1)
-            anchors.append(torch.cat((xy, torch.full_like(xy, min(0.8, 0.05 * 2**level))), -1))
+            side = self.finest_anchor_size if level == 0 else min(0.8, 0.05 * 2**level)
+            anchors.append(torch.cat((xy, torch.full_like(xy, side)), -1))
         anchors = torch.cat(anchors, 1)
         valid = ~torch.cat([mask.flatten(1) for mask in masks], 1)
         boxes = (torch.logit(anchors.clamp(0.001, 0.999)) + self.offset(memory)).sigmoid()
