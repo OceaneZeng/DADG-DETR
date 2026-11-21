@@ -81,7 +81,8 @@ def current_candidate_rank_rows(labels, overlap, index, score_tables):
     rows = [labels]
     for batch_scores, categories, top_indices in score_tables:
         scores = batch_scores[index]
-        columns = (categories[:, None] == labels).nonzero(as_tuple=True)[0]
+        # Preserve GT order when different classes are interleaved in an image.
+        columns = (labels[:, None] == categories).nonzero(as_tuple=True)[1]
         best = scores[:, columns].masked_fill(~covered, -torch.inf).amax(0)
         flat = scores.flatten()
         # Count scores strictly above the best match and measure the actual

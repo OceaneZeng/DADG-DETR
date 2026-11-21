@@ -116,6 +116,11 @@ def evaluate_author_benchmark(predictions, coco, known_ids, previous_ids, curren
             current_stats[label] = dict(ap50=ap[label], gt=npos,
                                         tp=int(tp[-1]) if len(tp) else 0,
                                         fp=int(fp[-1]) if len(fp) else 0)
+            if specification.get('diagnostic_current_precision'):
+                matched = np.flatnonzero(tp > 0)
+                ceiling = voc_ap(recall[-1:], np.ones(1), specification['ap_mode']) if len(matched) else 0.
+                current_stats[label].update(recall_ceiling_ap50=ceiling,
+                                            fp_before_first_tp=int(fp[matched[0]]) if len(matched) else None)
         if track_previous:
             # Hold the matched TP set fixed and rank every TP above the FPs.
             ceiling = voc_ap(recall[-1:], np.ones(1), specification['ap_mode']) if len(tp) and tp[-1] else 0.

@@ -66,12 +66,15 @@ def make_loader(image_root, annotation, batch, workers, shuffle=False, seed=42):
 
 def evaluate_views(model, loader, coco, variants, specification, old, current, device, protected_model=None,
                    *, include_current_stats=False, include_previous_stats=False, compare_current_ranks=False,
-                   exclude_unknown=(), postprocessors=None, print_freq=0, include_wi_sources=False):
+                   exclude_unknown=(), postprocessors=None, print_freq=0, include_wi_sources=False,
+                   rank_observer=None):
     import torch
     from models.graph_local.discovery import DiscoveryPostProcess
     from models.owod_benchmark_eval import evaluate_author_benchmark
     from util.box_ops import box_cxcywh_to_xyxy, box_iou
     processors = dict(postprocessors or {})
+    if rank_observer is not None and not compare_current_ranks:
+        raise ValueError('Recording target ranks requires paired scoring views')
     for key, (ids, scoring, limit) in variants.items():
         if key not in processors:
             processors[key] = DiscoveryPostProcess(known_ids=ids, max_detections=limit, scoring=scoring)
@@ -127,8 +130,9 @@ def evaluate_views(model, loader, coco, variants, specification, old, current, d
                     processed = isolated_predictions(outputs, reference, processor, old, current, sizes)
                 else:
                     view_outputs = known_outputs if key in exclude_unknown else outputs
-                    processed = processor(view_outputs, sizes, include_top_indices=bool(current_overlaps))
-                    if current_overlaps:
+                    capture_scores = bool(current_overlaps) or rank_observer is not None
+                    processed = processor(view_outputs, sizes, include_top_indices=capture_scores)
+                    if capture_scores:
                         candidates, categories, _ = processor.candidate_scores(view_outputs)
                         score_tables.append((candidates, categories, [result['top_indices'] for result in processed]))
                 for index, image_id in batch_images.items():
@@ -145,6 +149,8 @@ def evaluate_views(model, loader, coco, variants, specification, old, current, d
                     stats[key]['current_score_sum'] += sum(s for s, label in zip(scores, labels) if label in current_set)
             for index, (labels, overlap) in current_overlaps.items():
                 rank_rows.append(current_candidate_rank_rows(labels, overlap, index, score_tables))
+            if rank_observer is not None:
+                rank_observer(outputs, targets, batch_images, score_tables)
             if print_freq and (step % print_freq == 0 or step == len(loader)):
                 print(f'Inference {step}/{len(loader)} batches, {len(seen)} images', flush=True)
     report = {}
