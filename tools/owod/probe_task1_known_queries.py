@@ -25,6 +25,22 @@ OUTPUT = ROOT / 'output/m-instance-task1-known-queries'
 SOURCES = ('t1_train', 't2_train')
 
 
+def fresh_subset(manifest, excluded, seed):
+    blocked = set(excluded)
+    origins = {}
+    for source in SOURCES:
+        pool = set(manifest['splits'][source]) - blocked
+        chosen = sorted(pool, key=lambda s: hashlib.sha256(f'{seed}:{s}'.encode()).digest())[:512]
+        if len(chosen) != 512:
+            raise ValueError(f'Incomplete independent pool for {source}')
+        origins.update(dict.fromkeys(chosen, source))
+        blocked.update(chosen)
+    root = resolve_image_root(MANIFEST, manifest)
+    xml = {s: prepare_benchmarks.read_voc(root.parent, s) for s in origins}
+    data = prepare_benchmarks.subset(origins, manifest['stages'][1]['active_classes'], xml)
+    return data, {im['id']: origins[im['owod_source_id']] for im in data['images']}
+
+
 def prepare():
     parent = read_json(visible.OUTPUT / 'plan.json')
     end = read_json(visible.OUTPUT / 'comparison.json')
@@ -41,17 +57,7 @@ def prepare():
     if identities(blocked) != parent['excluded_names_sha256']:
         raise ValueError('Changed image exclusions')
     blocked.update(source_ids(read_json(prior)))
-    origins = {}
-    for source in SOURCES:
-        pool = set(manifest['splits'][source]) - blocked
-        chosen = sorted(pool, key=lambda s: hashlib.sha256(f'47:{s}'.encode()).digest())[:512]
-        if len(chosen) != 512:
-            raise ValueError(f'Incomplete independent pool for {source}')
-        origins.update(dict.fromkeys(chosen, source))
-        blocked.update(chosen)
-    root = resolve_image_root(MANIFEST, manifest)
-    xml = {s: prepare_benchmarks.read_voc(root.parent, s) for s in origins}
-    data = prepare_benchmarks.subset(origins, manifest['stages'][1]['active_classes'], xml)
+    data, sources = fresh_subset(manifest, blocked, 47)
     encoded = (json.dumps(data, indent=2, sort_keys=True) + '\n').encode()
     plan = {k: parent[k] for k in ('jobs', 'gpu', 'batch_size', 'torch_version', 'manifest_sha256', 'paper_comparable')}
     plan.update(commit=subprocess.check_output(['git', 'rev-parse', 'HEAD'], cwd=ROOT, text=True).strip(),
@@ -70,11 +76,11 @@ def prepare():
         write_json(path, data)
     if file_sha256(path) != plan['fresh_sha256']:
         raise ValueError('Changed independent evaluation data')
-    return plan, manifest, {im['id']: origins[im['owod_source_id']] for im in data['images']}
+    return plan, manifest, sources
 
 
 @torch.inference_mode()
-def evaluate(model, post, loader, known, proxy, sources):
+def evaluate(model, post, loader, known, proxy, sources, *, extra_selection=None):
     images, groups = {}, {s: Counter() for s in SOURCES}
     for step, (samples, targets) in enumerate(loader, 1):
         out = model(samples.to('cuda'))
@@ -96,6 +102,8 @@ def evaluate(model, post, loader, known, proxy, sources):
             emitted = torch.isin(ranked, queries[~is_unknown])
             distinct = torch.cat((ranked[~emitted], ranked[emitted]))[:quota]
             picks = dict(native=original, objectness=ranked[:quota], separate=distinct)
+            if extra_selection is not None:
+                picks.update(extra_selection(ranked, quota, known_positions, d['scores'][~is_unknown], len(known) + 1))
             if (len(positions) != 50 or len(distinct.unique()) != quota or im in images
                     or not torch.equal(d['scores'][is_unknown], product[i, original])):
                 raise ValueError('Changed native scores or output budget')
@@ -122,15 +130,14 @@ def evaluate(model, post, loader, known, proxy, sources):
     return dict(images=images, sources=groups)
 
 
-def main():
-    plan, manifest, sources = prepare()
-    digest = file_sha256(OUTPUT / 'plan.json')
+def run_endpoints(output, plan, manifest, sources, *, extra_selection=None):
+    digest = file_sha256(output / 'plan.json')
     root = resolve_image_root(MANIFEST, manifest)
     known = torch.tensor(manifest['stages'][0]['classes'], device='cuda')
     proxy = torch.tensor(manifest['stages'][1]['classes'], device='cuda')
-    results, passed = {}, {}
+    results = {}
     for seed, job in plan['jobs'].items():
-        path = OUTPUT / f'seed{seed}-fresh1024.json'
+        path = output / f'seed{seed}-fresh1024.json'
         if not path.exists():
             checkpoint = Path(job['parent'])
             args = load_checkpoint_metadata(checkpoint)['args']
@@ -141,9 +148,9 @@ def main():
             model.eval()
             post = DiscoveryPostProcess(known_ids=args.owod_known_class_ids, max_detections=50, scoring='focal',
                                         unknown_threshold=args.unknown_threshold)
-            _, loader = make_loader(root, OUTPUT / 'fresh1024.json', plan['batch_size'], 2)
-            print(f'Seed {seed}: confirming known-query exclusion on fresh1024', flush=True)
-            result = evaluate(model, post, loader, known, proxy, sources)
+            _, loader = make_loader(root, output / 'fresh1024.json', plan['batch_size'], 2)
+            print(f'Seed {seed}: evaluating {output.name} on fresh1024', flush=True)
+            result = evaluate(model, post, loader, known, proxy, sources, extra_selection=extra_selection)
             write_json(path, dict(plan_sha256=digest, **result))
             del model, result
         saved = read_json(path)
@@ -153,11 +160,21 @@ def main():
         pooled = Counter()
         for counts in saved['sources'].values():
             pooled.update(counts)
+        results[seed] = dict(sources=saved['sources'], pooled=pooled)
+    return results
+
+
+def main():
+    plan, manifest, sources = prepare()
+    results = run_endpoints(OUTPUT, plan, manifest, sources)
+    digest = file_sha256(OUTPUT / 'plan.json')
+    passed = {}
+    for seed, row in results.items():
+        pooled = row['pooled']
         gain = pooled['objectness_hits'] - pooled['native_hits']
         cost = pooled['objectness_known_only'] - pooled['native_known_only']
         passed[seed] = (gain > 0 and cost > 0 and 2 * (pooled['separate_hits'] - pooled['native_hits']) >= gain
                         and 2 * (pooled['objectness_known_only'] - pooled['separate_known_only']) >= cost)
-        results[seed] = dict(sources=saved['sources'], pooled=pooled)
     write_json(OUTPUT / 'comparison.json', dict(status='complete', plan_sha256=digest, rows=results,
                                                 passed_by_seed=passed, passes_screen=all(passed.values())))
     print('Comparison saved:', OUTPUT / 'comparison.json', flush=True)
