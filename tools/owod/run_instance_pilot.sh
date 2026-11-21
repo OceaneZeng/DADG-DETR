@@ -18,6 +18,9 @@ if [[ ${1:-} == --s-task1-known-fraction || ${1:-} == --s-task1-input-scale || $
   study="${1#--s-}"
   shift
   dir="output/s-instance-$study"
+  if [[ $study == task2-score-competition ]]; then
+    dir+="-replay"
+  fi
   export TMPDIR="$PWD/output/.tmp-owod"
   mkdir -p "$dir"
   mkdir -p -m 700 "$TMPDIR"

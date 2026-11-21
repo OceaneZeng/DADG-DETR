@@ -1,4 +1,5 @@
 """Measure how unknown candidates and objectness affect the S Task 2 duration gap."""
+from hashlib import sha256
 from math import isclose
 import os
 import subprocess
@@ -15,7 +16,7 @@ from tools.owod.screening_data import source_ids, write_json
 from tools.owod.validate_discovery import load_checkpoint_metadata
 
 
-OUTPUT = SOURCE.with_name('s-instance-task2-score-competition')
+OUTPUT = SOURCE.with_name('s-instance-task2-score-competition-replay')
 ARMS = ('3epochs', '6epochs')
 VIEWS = {'native': 'focal', 'known_only': 'focal', 'known_class_only': 'focal_class_only'}
 EXCLUDE_UNKNOWN = ('known_only', 'known_class_only')
@@ -42,6 +43,9 @@ def main():
     stage = manifest['stages'][1]
     known, previous, current = stage['active_classes'], manifest['stages'][0]['active_classes'], stage['classes']
     variants = {name: (known, scoring, 50) for name, scoring in VIEWS.items()}
+    # The holdout arrays retain the original draw order. The plan's origins map
+    # is sorted on disk, which changes the ordering of quantized VOC score ties.
+    eval_ids = [image['owod_source_id'] for image in data['images']]
     inputs = {}
     args_by_arm = {}
     for arm in ARMS:
@@ -63,6 +67,7 @@ def main():
     plan = dict(commit=subprocess.check_output(['git', 'rev-parse', 'HEAD'], cwd=ROOT, text=True).strip(),
                 protocol='s-owodb', seed=source_plan['seed'], paper_comparable=False, images=1024,
                 annotation=str(annotation), annotation_sha256=source_plan['annotation_sha256'],
+                eval_order_sha256=sha256('\n'.join(eval_ids).encode()).hexdigest(),
                 manifest_sha256=manifest_hash, source_plan_sha256=source_result['plan_sha256'],
                 source_result_sha256=file_sha256(source_result_path), checkpoints=inputs,
                 device=os.environ.get('CUDA_VISIBLE_DEVICES'), gpu=torch.cuda.get_device_name(),
@@ -74,7 +79,7 @@ def main():
     plan_hash = file_sha256(plan_path)
 
     dataset, loader = make_loader(resolve_image_root(MANIFEST, manifest), annotation, 2, 2)
-    spec = dict(manifest['evaluation'], image_source_ids=list(source_plan['origins']), known_only_screening=True)
+    spec = dict(manifest['evaluation'], image_source_ids=eval_ids, known_only_screening=True)
     rows = {}
     for arm, entry in inputs.items():
         path = OUTPUT / f'{arm}.json'
@@ -87,12 +92,14 @@ def main():
             del model
         report = read_json(path)
         view = report['view']
-        if (report['plan_sha256'] != plan_hash or report['checkpoint_sha256'] != entry['sha256'] or
-                any(not isclose(view['native']['metrics'][key], value, abs_tol=1e-5)
-                    for key, value in entry['baseline'].items()) or
-                any(view[key]['composition']['unknown'] or view[key]['composition']['detections'] != 50*len(dataset)
-                    for key in EXCLUDE_UNKNOWN)):
-            raise ValueError(f'Scoring control differs from the registered plan: {path}')
+        if report['plan_sha256'] != plan_hash or report['checkpoint_sha256'] != entry['sha256']:
+            raise ValueError(f'Scoring report identity differs from the registered plan: {path}')
+        native = view['native']['metrics']
+        if any(not isclose(native[key], value, abs_tol=1e-5) for key, value in entry['baseline'].items()):
+            raise ValueError(f'{arm} native scores {native} differ from the original endpoint {entry["baseline"]}')
+        if any(view[key]['composition']['unknown'] or view[key]['composition']['detections'] != 50*len(dataset)
+               for key in EXCLUDE_UNKNOWN):
+            raise ValueError(f'{arm} known-only view did not keep exactly 50 known detections per image')
         rows[arm] = {key: view[key]['metrics'] for key in VIEWS}
     deltas = {view: {key: 100*(rows['6epochs'][view][key]-value) for key, value in rows['3epochs'][view].items()}
               for view in VIEWS}
