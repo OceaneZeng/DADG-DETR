@@ -23,16 +23,21 @@ OUTPUT = PARENT.with_name('s-instance-task1-input-scale')
 SIZES = {'standard': (800, 1333), 'larger': (1000, 1666)}
 
 
+def valid_annotations(dataset, image_id):
+    image = dataset.coco.imgs[image_id]
+    annotations = []
+    for ann in dataset.coco.imgToAnns[image_id]:
+        x, y, w, h = ann['bbox']
+        if (not ann.get('iscrowd') and min(x + w, image['width']) > max(x, 0)
+                and min(y + h, image['height']) > max(y, 0)):
+            annotations.append(ann)
+    return annotations
+
+
 def summarize(dataset, rows, known_ids, proxy_ids):
     totals = Counter()
     for key, row in rows.items():
-        image = dataset.coco.imgs[int(key)]
-        annotations = []
-        for ann in dataset.coco.imgToAnns[int(key)]:
-            x, y, w, h = ann['bbox']
-            if (not ann.get('iscrowd') and min(x + w, image['width']) > max(x, 0)
-                    and min(y + h, image['height']) > max(y, 0)):
-                annotations.append(ann)
+        annotations = valid_annotations(dataset, int(key))
         hidden = [a for a in annotations if a['category_id'] in proxy_ids]
         known = [a['category_id'] for a in annotations if a['category_id'] in known_ids]
         assert len(hidden) == row['counts']['gt']

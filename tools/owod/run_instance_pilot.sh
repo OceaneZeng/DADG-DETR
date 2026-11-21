@@ -14,7 +14,7 @@ export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1}"
 export OMP_NUM_THREADS=2
 export PYTHONUNBUFFERED=1
 export PYTHONPATH="$PWD/models/ops:$PWD${PYTHONPATH:+:$PYTHONPATH}"
-if [[ ${1:-} == --s-task1-known-fraction || ${1:-} == --s-task1-input-scale ]]; then
+if [[ ${1:-} == --s-task1-known-fraction || ${1:-} == --s-task1-input-scale || ${1:-} == --s-task1-proposal-stages ]]; then
   study="${1#--s-task1-}"
   dir="output/s-instance-task1-$study"
   export TMPDIR="$PWD/output/.tmp-owod"
