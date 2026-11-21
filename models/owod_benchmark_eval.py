@@ -33,6 +33,31 @@ def overlaps(box, boxes):
     return intersection / np.maximum(union, np.finfo(float).eps)
 
 
+def absent_unresolved_ranking(label, items, order, gt, unresolved_ranks, tp, fp, recall, specification):
+    """Remove one unresolved FP per class-absent image, holding native TP and VOC order fixed."""
+    by_image = defaultdict(list)
+    for rank in unresolved_ranks:
+        image_id = items[order[rank]][1]
+        if not gt[image_id][label]:
+            by_image[image_id].append(rank)
+
+    def ap_without(ranks):
+        removed = np.zeros(len(fp), dtype=np.int32)
+        removed[ranks] = 1
+        precision = tp / np.maximum(tp + fp - np.cumsum(removed), np.finfo(float).eps)
+        return voc_ap(recall, precision, specification['ap_mode'])
+
+    first = [ranks[0] for ranks in by_image.values()]
+    draws = specification['absent_random_draws']
+    random_ranks = np.empty((draws, len(by_image)), dtype=np.int64)
+    for column, (image_id, ranks) in enumerate(by_image.items()):
+        rng = np.random.default_rng([specification['absent_random_seed'], label, image_id])
+        random_ranks[:, column] = rng.choice(ranks, size=draws)
+    return dict(eligible_fp=sum(len(ranks) for ranks in by_image.values()),
+                images=len(first), highest_ap50=ap_without(first),
+                random_ap50_mean=float(np.mean([ap_without(sample) for sample in random_ranks])))
+
+
 def current_fp_sources(label, items, order, gt, tp, fp, recall, specification):
     """Keep VOC TP assignments fixed and remove one FP family at a time."""
     families = ('duplicate', 'other_released_class', 'partial_same_class', 'unresolved')
@@ -67,7 +92,11 @@ def current_fp_sources(label, items, order, gt, tp, fp, recall, specification):
         precision = tp / np.maximum(tp + remaining_fp, np.finfo(float).eps)
         result[name] = dict(fp=int(remove.sum()), ap50_without=voc_ap(
             recall, precision, specification['ap_mode']))
-    return dict(families=result, confused_with=dict(confused_with))
+    report = dict(families=result, confused_with=dict(confused_with))
+    if specification.get('diagnostic_absent_unresolved'):
+        report['absent_unresolved'] = absent_unresolved_ranking(
+            label, items, order, gt, np.flatnonzero(source == 4), tp, fp, recall, specification)
+    return report
 
 
 def voc_prediction_box(box):
