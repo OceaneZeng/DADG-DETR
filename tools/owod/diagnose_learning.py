@@ -73,8 +73,8 @@ def evaluate_views(model, loader, coco, variants, specification, old, current, d
     from models.owod_benchmark_eval import evaluate_author_benchmark
     from util.box_ops import box_cxcywh_to_xyxy, box_iou
     processors = dict(postprocessors or {})
-    if rank_observer is not None and not compare_current_ranks:
-        raise ValueError('Recording target ranks requires paired scoring views')
+    if rank_observer is not None and protected_model is not None:
+        raise ValueError('Recording per-query scores requires a single model')
     for key, (ids, scoring, limit) in variants.items():
         if key not in processors:
             processors[key] = DiscoveryPostProcess(known_ids=ids, max_detections=limit, scoring=scoring)
