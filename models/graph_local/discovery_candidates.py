@@ -108,7 +108,7 @@ def view_matches(outputs, teacher):
 
 @torch.no_grad()
 def mine_candidates(outputs, targets, indices, known_ids, teacher=None, top_k=5,
-                    saliency_threshold=.65, consistency_threshold=.5):
+                    saliency_threshold=.65, consistency_threshold=.5, *, gate_trace=None):
     saliency = saliency_in_boxes(outputs['attention_feature'], outputs['pred_boxes'],
                                 outputs['image_sizes'], outputs['padded_size'])
     known = outputs['pred_logits'][..., known_ids].sigmoid().amax(-1)
@@ -133,11 +133,17 @@ def mine_candidates(outputs, targets, indices, known_ids, teacher=None, top_k=5,
                               box_cxcywh_to_xyxy(targets[batch]['boxes']))[0]
             exclude |= overlap.amax(-1) > .3
         eligible = valid & ~exclude
-        confident = eligible & (saliency[batch] >= saliency_threshold)
-        confident &= consistency[batch] >= consistency_threshold
+        salient = saliency[batch] >= saliency_threshold
+        consistent = consistency[batch] >= consistency_threshold
+        confident = eligible & salient & consistent
         if teacher_saliency is not None:
-            confident &= maps[batch] >= 0
-            confident &= teacher_saliency[batch, maps[batch].clamp_min(0)] >= saliency_threshold
+            other_salient = ((maps[batch] >= 0)
+                             & (teacher_saliency[batch, maps[batch].clamp_min(0)] >= saliency_threshold))
+            confident &= other_salient
+        if gate_trace is not None:
+            gate_trace.append(dict(valid=valid, eligible=eligible, salient=salient, consistent=consistent,
+                                   other_salient=other_salient if teacher_saliency is not None else torch.ones_like(valid),
+                                   confident=confident))
         ranked = torch.where(confident)[0]
         quality = saliency[batch] * consistency[batch] * semantic[batch]
         if 'geometry_quality' in outputs:
