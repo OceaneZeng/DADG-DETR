@@ -1,6 +1,8 @@
 """Test a single increment-stage training change on the S three-epoch duration control."""
 import argparse
 from hashlib import sha256
+import json
+from math import isclose
 import os
 from pathlib import Path
 from statistics import mean
@@ -25,6 +27,16 @@ from tools.owod.validate_discovery import load_checkpoint_metadata, validate_pla
 
 OUTPUT = DURATION.with_name('s-instance-task2-increment-giou')
 PHASES = ('increment', 'finetune')
+
+
+def epoch_positive_counts(path, rank_batches):
+    rows = [json.loads(line) for line in path.read_text().splitlines() if line.strip()]
+    if [r['epoch'] for r in rows] != [0, 1, 2]:
+        raise ValueError('Expected the original three increment epochs')
+    totals = [r['train_discovery_known_count_unscaled'] * rank_batches for r in rows]
+    if any(not isclose(total, round(total), abs_tol=1e-6) for total in totals):
+        raise ValueError('Epoch averages do not reconstruct whole matched targets')
+    return [round(total) for total in totals]
 
 
 def prepare(output=OUTPUT, *, variant='giou'):
@@ -65,7 +77,9 @@ def prepare(output=OUTPUT, *, variant='giou'):
         if variant == 'proposal-quality':
             cmd[cmd.index('--graph-localization') + 1] = 'decoder-bbox-increment-quality'
         elif phase == 'increment':
-            cmd.extend(['--class_embed_lr_mult', '2'] if variant == 'classifier-lr' else ['--giou_loss_coef', '4'])
+            increment_flags = {'classifier-lr': ['--class_embed_lr_mult', '2'], 'giou': ['--giou_loss_coef', '4'],
+                               'no-random-crop': ['--no-random-crop']}
+            cmd.extend(increment_flags[variant])
         if phase == 'finetune':
             cmd[cmd.index('--pretrained')+1] = str(output/'increment/checkpoint.pth')
         jobs[phase], controls[phase] = cmd, ref
@@ -83,6 +97,28 @@ def prepare(output=OUTPUT, *, variant='giou'):
     if variant == 'proposal-quality':
         from tools.owod.s_task2_proposal_quality import add_evidence
         add_evidence(plan, CHECKPOINT)
+    if variant == 'no-random-crop':
+        coverage = DURATION.with_name('s-instance-task2-increment-match-coverage')
+        result = read_json(coverage/'comparison.json')
+        coverage_plan = read_json(coverage/'plan.json')
+        ref = Path(controls['increment']['path']).parent
+        config = read_json(ref/'run_config.json')
+        rank_batches = coverage_plan['train_images'] // config['batch_size']
+        counts = epoch_positive_counts(ref/'metrics.jsonl', rank_batches)
+        if (file_sha256(coverage/'comparison.json') != 'fc28a6a71ca8e1ca7effbe3fc1f5e49da82fa3eeec1ca0d5b1d787556962977d'
+                or result['supported'] or result['plan_sha256'] != file_sha256(coverage/'plan.json')
+                or coverage_plan['checkpoints']['3epochs']['sha256'] != controls['increment']['sha256']
+                or coverage_plan['screening_sha256'] != identity['screening_sha256']
+                or config['lightweight'] or config['no_random_crop'] or config['no_augmentation']
+                or config['world_size'] != 2 or rank_batches != 768 or counts != [4240, 4232, 4276]):
+            raise ValueError('Changed frozen coverage, training augmentation or matched-target exposure')
+        plan.update(source_coverage_sha256=file_sha256(coverage/'comparison.json'),
+                    reference_epoch_metrics_sha256=file_sha256(ref/'metrics.jsonl'), reference_positive_counts=counts,
+                    eligible_targets=result['arms']['3epochs']['gt'], rank_batches_per_epoch=rank_batches,
+                    intervention='Disable the random crop branch only in increment. Retain flip and multi-scale resize, '
+                                 'original balanced finetuning transforms, author data, batch, optimizer steps and inference.')
+        plan['criterion'] += (' Additionally require each no-crop epoch to retain all eligible matched targets and '
+                              'the increment endpoint to cover more held-out new-class boxes than the control.')
     if variant == 'classifier-lr':
         matched = DURATION.with_name('s-instance-task2-matched-exposure')
         reports = {matched:'b0500f0ed19822b5dd4b5de2f3ed42372b38069fdf495aa119a44cc02dc97bb4',
@@ -131,6 +167,8 @@ def main():
                          help='Double only the increment classifier LR')
     options.add_argument('--proposal-quality', dest='variant', action='store_const', const='proposal-quality',
                          help='Train the existing proposal quality head during increment')
+    options.add_argument('--no-random-crop', dest='variant', action='store_const', const='no-random-crop',
+                         help='Keep whole-image multi-scale training in increment, restore the original crop in finetuning')
     parser.set_defaults(variant='giou')
     variant = parser.parse_args().variant
     output = OUTPUT.with_name('s-instance-task2-increment-' + variant)
@@ -161,6 +199,13 @@ def main():
         report['phases'][phase] = dict(checkpoint_sha256=file_sha256(path), heldout=stats, raw_current=raw,
             delta_raw_hits=raw['hits']-(reference['gt']-reference['no_box']), author=endpoint(path.parent, phase, epoch=args.epochs-1),
             delta={k:stats[k]-reference[k] for k in ('current_ap50','previous_ap50','known_ap50')})
+        if variant == 'no-random-crop':
+            if args.no_random_crop != (phase == 'increment') or args.no_augmentation or args.lightweight:
+                raise ValueError('Trained endpoint used a different augmentation setting')
+            if phase == 'increment':
+                counts = epoch_positive_counts(path.parent/'metrics.jsonl', plan['rank_batches_per_epoch'])
+                report['positive_counts'] = counts
+                report['exposure_pass'] = all(n == plan['eligible_targets'] for n in counts)
         if variant == 'proposal-quality':
             from tools.owod.s_task2_proposal_quality import compare_shortlist, quality_digest
             head_digest = quality_digest(path)
@@ -187,6 +232,9 @@ def main():
     open_pass = (mean(f['u_recall'] for f in folds.values()) >= 0 and sum(f['a_ose'] for f in folds.values()) <= 0
                  and mean(f['wi'] for f in folds.values()) <= 0)
     report.update(status='complete', proxy_deltas=folds, known_pass=known_pass, open_pass=open_pass, follow_up=known_pass and open_pass)
+    if variant == 'no-random-crop':
+        report['coverage_pass'] = report['phases']['increment']['delta_raw_hits'] > 0
+        report['follow_up'] = report['follow_up'] and report['exposure_pass'] and report['coverage_pass']
     if variant == 'proposal-quality':
         shortlist = report['proposal_coverage']['shortlist']
         report['shortlist_pass'] = shortlist['candidate'] > shortlist['control']
