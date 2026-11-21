@@ -44,6 +44,9 @@ class InstanceProposals(nn.Module):
     def logits(self, features, boxes):
         return self.quality(torch.cat((features, boxes.detach()), -1)).squeeze(-1)
 
+    def finest_anchor_sides(self, features, mask, xy):
+        return torch.full_like(xy, self.finest_anchor_size)
+
     def forward(self, memory, masks, query, content, references):
         anchors = []
         for level, mask in enumerate(masks):
@@ -55,8 +58,11 @@ class InstanceProposals(nn.Module):
             )
             valid_wh = torch.stack(((~mask[:, 0]).sum(-1), (~mask[:, :, 0]).sum(-1)), -1)
             xy = (torch.stack((x, y), -1).flatten(0, 1) + 0.5) / valid_wh[:, None].clamp_min(1)
-            side = self.finest_anchor_size if level == 0 else min(0.8, 0.05 * 2**level)
-            anchors.append(torch.cat((xy, torch.full_like(xy, side)), -1))
+            if level == 0:
+                sides = self.finest_anchor_sides(memory[:, :height * width], mask, xy)
+            else:
+                sides = torch.full_like(xy, min(0.8, 0.05 * 2**level))
+            anchors.append(torch.cat((xy, sides), -1))
         anchors = torch.cat(anchors, 1)
         valid = ~torch.cat([mask.flatten(1) for mask in masks], 1)
         boxes = (torch.logit(anchors.clamp(0.001, 0.999)) + self.offset(memory)).sigmoid()
