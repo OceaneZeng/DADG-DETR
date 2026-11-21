@@ -152,6 +152,8 @@ def get_args_parser():
     parser.add_argument('--distill-max-queries', default=20, type=int)
     parser.add_argument('--screen-double-old-box-loss', action='store_true',
                         help='double L1 and GIoU on matched released old boxes during diagnostic balanced finetuning')
+    parser.add_argument('--screen-double-current-positives', action='store_true',
+                        help='double only the matched new-class positive focal terms during diagnostic balanced finetuning')
     parser.add_argument('--screen-annotated-distill', action='store_true',
                         help='Add one label-matched old teacher query on empty balanced finetuning images')
     parser.add_argument('--neighbor-scoped-lora', action='store_true',

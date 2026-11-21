@@ -32,7 +32,7 @@ REFERENCES = {
 }
 
 
-def prepare(output=OUTPUT, *, restore_offsets=False, double_old_boxes=False):
+def prepare(output=OUTPUT, *, restore_offsets=False, double_old_boxes=False, double_current_positives=False):
     source = read_json(SOURCE/'plan.json')
     fitted = read_json(SOURCE/'comparison.json')
     timing = read_json(TIMING/'comparison.json')
@@ -134,6 +134,31 @@ def prepare(output=OUTPUT, *, restore_offsets=False, double_old_boxes=False):
                         'normalization and the half-rate optimizer, matching costs, classification and discovery terms.')
         plan['criterion'] += (' Separately test whether at least 81 of the 162 lost old raw box hits return '
                               'versus the half-rate endpoint. Report Current and FP-family differences against that endpoint.')
+    if double_current_positives:
+        ranking = OUTPUT.with_name('s-instance-task2-fixed-score-ranking')
+        rank = read_json(ranking/'comparison.json')
+        rank_plan = read_json(ranking/'plan.json')
+        half = read_json(OUTPUT/'comparison.json')
+        half_plan = read_json(OUTPUT/'plan.json')
+        ref_path = OUTPUT.with_name('s-instance-task2-step-classifier')/'half-half.json'
+        ref = read_json(ref_path)
+        expected = half_plan['command'].copy()
+        expected[expected.index('--output_dir') + 1] = str(output/'finetune')
+        if (file_sha256(ranking/'comparison.json') != 'e240842e19cb96bbc5872a20d0f1a3e3365b110fa8d9e2298e06aef7af7fbbd8'
+                or rank['plan_sha256'] != file_sha256(ranking/'plan.json') or rank['supported']
+                or file_sha256(ref_path) != 'ef52e7ac8c349de2a020742109374d63caf0919bce4a6e6fb8c42d5153f5f979'
+                or ref['body_checkpoint'] != ref['classifier_checkpoint'] or ref['body_checkpoint'] != half['checkpoint_sha256']
+                or ref['views']['released']['metrics'] != half['heldout'] or half['plan_sha256'] != file_sha256(OUTPUT/'plan.json')
+                or rank_plan['endpoints']['half']['sha256'] != half['checkpoint_sha256']
+                or half_plan['identity'] != identity or half_plan['increment_sha256'] != plan['increment_sha256']
+                or command != expected):
+            raise ValueError('Changed ranking evidence, half-rate command or reference endpoint')
+        command.append('--screen-double-current-positives')
+        refs['half'] = ref['views']
+        plan.update(source_ranking_sha256=file_sha256(ranking/'comparison.json'), half_reference_sha256=file_sha256(ref_path),
+                    intervention='Double only the focal loss for matched GT positive current-class entries in balanced '
+                                 'finetuning, including auxiliary layers. Keep negative class terms and original normalization.')
+        plan['criterion'] += ' Require the same gates against the half-rate reference as well. Report changes by FP family.'
     pin(output/'plan.json', plan)
     return plan, manifest, order, refs
 
@@ -158,14 +183,18 @@ def main():
     variants = parser.add_mutually_exclusive_group()
     variants.add_argument('--restore-offsets', action='store_true', help='Restore only the decoder sampling-offset rate')
     variants.add_argument('--double-old-boxes', action='store_true', help='Double only the released old-GT localization terms')
+    variants.add_argument('--double-current-positives', action='store_true', help='Double matched new-class focal positives')
     options = parser.parse_args()
     output = OUTPUT
     if options.restore_offsets:
         output = OUTPUT.with_name('s-instance-task2-finetune-offset-rate')
     elif options.double_old_boxes:
         output = OUTPUT.with_name('s-instance-task2-finetune-old-box-loss')
+    elif options.double_current_positives:
+        output = OUTPUT.with_name('s-instance-task2-finetune-current-positive')
     print('Verifying S timing evidence and matched finetune inputs', flush=True)
-    plan, manifest, order, refs = prepare(output, restore_offsets=options.restore_offsets, double_old_boxes=options.double_old_boxes)
+    plan, manifest, order, refs = prepare(output, restore_offsets=options.restore_offsets, double_old_boxes=options.double_old_boxes,
+                                         double_current_positives=options.double_current_positives)
     pilot.run([sys.executable, str(pilot.ROOT/'tools/owod/manage_data.py'), 'verify',
                '--benchmark', 's-owodb', '--output-root', str(MANIFEST.parent.parent)])
     checkpoint, args = run_job(plan['command'], plan['identity']['screening_sha256'])
@@ -184,7 +213,8 @@ def main():
         status='complete', paper_comparable=False, plan_sha256=file_sha256(output/'plan.json'),
         checkpoint_sha256=file_sha256(checkpoint), author=endpoint(checkpoint.parent, 'finetune', epoch=0),
         heldout=views['released']['metrics'], comparisons=comparisons,
-        follow_up=all(comparisons[arm]['known_pass'] and comparisons[arm]['open_pass'] for arm in REFERENCES))
+        follow_up=all(comparisons[arm]['known_pass'] and comparisons[arm]['open_pass']
+                      for arm in (refs if options.double_current_positives else REFERENCES)))
     if 'half' in refs:
         from tools.owod.probe_s_task2_current_fp_sources import summarize
 
@@ -198,19 +228,23 @@ def main():
         else:
             import json
             epoch = json.loads((output/'finetune/metrics.jsonl').read_text().splitlines()[-1])
-            counts = {k: v for k, v in epoch.items() if k.startswith('train_old_box_matches') and k.endswith('_unscaled')}
-            if (after != before or not args.screen_double_old_box_loss or len(counts) != args.dec_layers
+            metric = 'current_positive_matches' if options.double_current_positives else 'old_box_matches'
+            enabled = args.screen_double_current_positives if options.double_current_positives else args.screen_double_old_box_loss
+            counts = {k: v for k, v in epoch.items() if k.startswith('train_'+metric) and k.endswith('_unscaled')}
+            if (after != before or not enabled or len(counts) != args.dec_layers
                     or min(counts.values()) <= 0 or epoch['epoch'] != 0):
-                raise ValueError('Expected nonempty weighted old matches at every layer and the unchanged half-rate optimizer')
-            report['old_matches_per_rank_batch'] = counts
+                raise ValueError('Expected nonempty weighted matches at every layer and the unchanged half-rate optimizer')
+            report['current_positive_matches_per_rank_batch' if options.double_current_positives else 'old_matches_per_rank_batch'] = counts
         old = views['raw_old_box_recall_iou50']
         base = refs['half']['raw_old_box_recall_iou50']
         if old['gt'] != base['gt']:
             raise ValueError('Old coverage uses a different object population')
         fp = summarize(views['released'], views['released'])
         ref_fp = summarize(refs['half']['released'], refs['half']['released'])
-        report.update(old_hits_gained=old['hits']-base['hits'], old_coverage_pass=old['hits']-base['hits'] >= plan['old_hits_to_recover'],
-                      optimizer_groups=after, fp_deltas_vs_half={k: row['fp']-ref_fp[k]['fp'] for k, row in fp.items()})
+        report.update(old_hits_gained=old['hits']-base['hits'], optimizer_groups=after,
+                      fp_deltas_vs_half={k: row['fp']-ref_fp[k]['fp'] for k, row in fp.items()})
+        if 'old_hits_to_recover' in plan:
+            report['old_coverage_pass'] = report['old_hits_gained'] >= plan['old_hits_to_recover']
     write_json(output/'comparison.json', report)
     print('Finetune learning-rate comparison saved', flush=True)
 

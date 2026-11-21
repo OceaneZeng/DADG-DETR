@@ -252,6 +252,7 @@ class SetCriterion(nn.Module):
         self.focal_alpha = focal_alpha
         self.active_class_ids = None
         self.register_buffer('double_weight_box_ids', None, persistent=False)
+        self.register_buffer('double_positive_columns', None, persistent=False)
 
     def loss_labels(self, outputs, targets, indices, num_boxes, log=True):
         """Classification loss (NLL)
@@ -279,9 +280,13 @@ class SetCriterion(nn.Module):
         if query_weights is not None:
             query_weights = query_weights.clone()
             query_weights[idx] = 1  # Auxiliary matching may differ; GT is never ignored.
+        positive_columns = self.double_positive_columns if self.training else None
         loss_ce = sigmoid_focal_loss(supervised_logits, target_classes_onehot, num_boxes,
-                                    alpha=self.focal_alpha, gamma=2, query_weights=query_weights) * src_logits.shape[1]
+                                    alpha=self.focal_alpha, gamma=2, query_weights=query_weights,
+                                    double_positive_columns=positive_columns) * src_logits.shape[1]
         losses = {'loss_ce': loss_ce}
+        if positive_columns is not None:
+            losses['current_positive_matches'] = target_classes_onehot[..., positive_columns].sum()
 
         if log:
             # TODO this should probably be a separate loss, not hacked in this one here
@@ -576,6 +581,9 @@ def build(args):
     criterion.active_class_ids = getattr(args, 'owod_known_class_ids', None)
     if getattr(args, 'screen_double_old_box_loss', False):
         criterion.double_weight_box_ids = torch.tensor(args.owod_previous_class_ids, dtype=torch.long)
+    if getattr(args, 'screen_double_current_positives', False):
+        criterion.double_positive_columns = torch.isin(torch.tensor(criterion.active_class_ids),
+                                                      torch.tensor(args.owod_current_class_ids))
     criterion.to(device)
     postprocessors = {'bbox': PostProcess(
         unknown_threshold=getattr(args, 'unknown_threshold', 0.5),

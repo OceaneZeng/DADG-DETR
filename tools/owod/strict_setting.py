@@ -7,10 +7,10 @@ from tools.owod.protocol import (file_sha256, resolve_image_root, stage_files,
 
 
 def configure_run(args):
-    if getattr(args, 'screen_double_old_box_loss', False) and not (
+    if (getattr(args, 'screen_double_old_box_loss', False) or getattr(args, 'screen_double_current_positives', False)) and not (
             args.owod_screening and args.screen_branch_checkpoint and args.owod_discovery
             and args.owod_stage == 1 and args.owod_phase == 'finetune' and not args.teacher_completion):
-        raise ValueError('Old-box weighting requires shared-parent Task 2 discovery screening finetuning on released GT')
+        raise ValueError('Matched GT weighting requires shared-parent Task 2 discovery screening finetuning on released GT')
     if getattr(args, 'screen_annotated_distill', False) and not (
             args.owod_screening and args.screen_branch_checkpoint and args.owod_discovery
             and args.owod_stage == 1 and args.owod_phase == 'finetune'
@@ -222,6 +222,8 @@ def validate_checkpoint(args, checkpoint, resume=False):
     offset = getattr(args, 'discovery_pseudo_epoch_offset', 0)
     saved_offset = getattr(saved, 'discovery_pseudo_epoch_offset', 0)
     if resume:
+        if getattr(saved, 'screen_double_current_positives', False) != getattr(args, 'screen_double_current_positives', False):
+            raise ValueError('Cannot change matched new-class focal weighting on resume')
         if getattr(saved, 'screen_double_old_box_loss', False) != getattr(args, 'screen_double_old_box_loss', False):
             raise ValueError('Cannot change matched old-box weighting on resume')
         if getattr(saved, 'screen_annotated_distill', False) != getattr(args, 'screen_annotated_distill', False):
