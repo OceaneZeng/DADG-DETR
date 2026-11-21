@@ -1,4 +1,6 @@
-"""Test half the balanced-finetune learning rate from the same S Task 2 increment checkpoint."""
+"""Compare finetune step sizes from the same S Task 2 increment checkpoint."""
+import argparse
+from ast import literal_eval
 from hashlib import sha256
 from math import isclose
 import os
@@ -30,7 +32,7 @@ REFERENCES = {
 }
 
 
-def prepare():
+def prepare(output=OUTPUT, *, restore_offsets=False):
     source = read_json(SOURCE/'plan.json')
     fitted = read_json(SOURCE/'comparison.json')
     timing = read_json(TIMING/'comparison.json')
@@ -76,7 +78,7 @@ def prepare():
                 or row['checkpoint_sha256'] != expected):
             raise ValueError(f'Changed reference evaluation: {arm}')
         refs[arm] = row['views']
-    command[command.index('--output_dir') + 1] = str(OUTPUT/'finetune')
+    command[command.index('--output_dir') + 1] = str(output/'finetune')
     for flag in ('--lr', '--lr_backbone'):
         command[command.index(flag) + 1] = str(float(value(flag)) * .5)
     plan = {k: source[k] for k in ('identity', 'cache_sha256', 'annotation', 'annotation_sha256', 'eval_order_sha256',
@@ -89,7 +91,33 @@ def prepare():
                 criterion='Against both the same-parent full-rate finetune and the original duration control: '
                           'Current +1.00 pp or more, Previous no worse than -1.00 pp, Known improves; mean proxy '
                           'U-Recall does not drop, mean WI and summed A-OSE do not rise. Use only release-source holdout.')
-    pin(OUTPUT/'plan.json', plan)
+    if restore_offsets:
+        swap = OUTPUT.with_name('s-instance-task2-step-classifier')
+        trace = read_json(swap/'comparison.json')
+        swap_plan = read_json(swap/'plan.json')
+        half = read_json(OUTPUT/'comparison.json')
+        ref = read_json(swap/'half-half.json')
+        base_config = read_json(OUTPUT/'finetune/run_config.json')
+        if (file_sha256(swap/'comparison.json') != '42d7ddb06f0fb64db34e0049f8487ca569ece4991fdcf9c96375a58ea1248352'
+                or trace['plan_sha256'] != file_sha256(swap/'plan.json') or trace['current_effects']['supported'] != ['rest']
+                or swap_plan['source_sha256'] != file_sha256(OUTPUT/'comparison.json') or half['follow_up']
+                or half['plan_sha256'] != file_sha256(OUTPUT/'plan.json') or swap_plan['increment_sha256'] != inc['checkpoint_sha256']
+                or ref['plan_sha256'] != trace['plan_sha256'] or ref['body_checkpoint'] != half['checkpoint_sha256']
+                or ref['classifier_checkpoint'] != half['checkpoint_sha256'] or ref['views']['released']['metrics'] != half['heldout']
+                or base_config['lr_linear_proj_names'] != ['reference_points', 'sampling_offsets']
+                or base_config['lr_linear_proj_mult'] != .1 or base_config['decoder_bbox_lr_mult'] != .75):
+            raise ValueError('Changed classifier study, half-rate reference or optimizer groups')
+        refs['half'] = ref['views']
+        old_loss = refs['candidate']['raw_old_box_recall_iou50']['hits'] - refs['half']['raw_old_box_recall_iou50']['hits']
+        if old_loss != 162 or '--lr_linear_proj_mult' in command:
+            raise ValueError('Changed old coverage deficit or projection-rate control')
+        command.extend(['--lr_linear_proj_mult', '0.2'])
+        plan.update(source_classifier_sha256=file_sha256(swap/'comparison.json'), half_reference_sha256=file_sha256(swap/'half-half.json'),
+                    old_hits_to_recover=old_loss//2, intervention='Restore the decoder sampling-offset group to full rate; '
+                    'all other groups keep their half rate. Compare all groups against the recorded optimizer.')
+        plan['criterion'] += (' Separately test whether at least 81 of the 162 lost old raw box hits return '
+                              'versus the half-rate endpoint. Report Current and FP-family differences against that endpoint.')
+    pin(output/'plan.json', plan)
     return plan, manifest, order, refs
 
 
@@ -109,8 +137,12 @@ def compare(views, ref):
 
 
 def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--restore-offsets', action='store_true', help='Restore only the decoder sampling-offset rate')
+    restore_offsets = parser.parse_args().restore_offsets
+    output = OUTPUT.with_name('s-instance-task2-finetune-offset-rate') if restore_offsets else OUTPUT
     print('Verifying S timing evidence and matched finetune inputs', flush=True)
-    plan, manifest, order, refs = prepare()
+    plan, manifest, order, refs = prepare(output, restore_offsets=restore_offsets)
     pilot.run([sys.executable, str(pilot.ROOT/'tools/owod/manage_data.py'), 'verify',
                '--benchmark', 's-owodb', '--output-root', str(MANIFEST.parent.parent)])
     checkpoint, args = run_job(plan['command'], plan['identity']['screening_sha256'])
@@ -122,14 +154,39 @@ def main():
             or quality_digest(checkpoint) != plan['frozen_quality_sha256']):
         raise ValueError('Unexpected effective rates, adapter inputs or frozen quality head')
     ds, loader = make_loader(resolve_image_root(MANIFEST, manifest), Path(plan['annotation']), 2, 2)
-    views = evaluate('candidate-finetune', checkpoint, plan, ds, loader, manifest, order, proxies=True, output=OUTPUT)
+    views = evaluate('candidate-finetune', checkpoint, plan, ds, loader, manifest, order, proxies=True,
+                     output=output, fp_sources=restore_offsets)
     comparisons = {arm: compare(views, ref) for arm, ref in refs.items()}
-    write_json(OUTPUT/'comparison.json', dict(
-        status='complete', paper_comparable=False, plan_sha256=file_sha256(OUTPUT/'plan.json'),
+    report = dict(
+        status='complete', paper_comparable=False, plan_sha256=file_sha256(output/'plan.json'),
         checkpoint_sha256=file_sha256(checkpoint), author=endpoint(checkpoint.parent, 'finetune', epoch=0),
         heldout=views['released']['metrics'], comparisons=comparisons,
-        follow_up=all(c['known_pass'] and c['open_pass'] for c in comparisons.values())))
+        follow_up=all(comparisons[arm]['known_pass'] and comparisons[arm]['open_pass'] for arm in REFERENCES))
+    if restore_offsets:
+        from tools.owod.probe_s_task2_current_fp_sources import summarize
+
+        before = optimizer_groups(OUTPUT/'finetune/train.log')
+        after = optimizer_groups(output/'finetune/train.log')
+        expected = [(rate * 2 if size == 394752 else rate, size) for rate, size in before]
+        if (after != expected or sum(size == 394752 for _, size in before) != 1
+                or not any(size == 394752 and isclose(rate, 3.75e-7) for rate, size in after)):
+            raise ValueError('Expected only the nonempty sampling-offset group to regain full rate')
+        old = views['raw_old_box_recall_iou50']
+        base = refs['half']['raw_old_box_recall_iou50']
+        if old['gt'] != base['gt']:
+            raise ValueError('Old coverage uses a different object population')
+        fp = summarize(views['released'], views['released'])
+        ref_fp = summarize(refs['half']['released'], refs['half']['released'])
+        report.update(old_hits_gained=old['hits']-base['hits'], old_coverage_pass=old['hits']-base['hits'] >= plan['old_hits_to_recover'],
+                      optimizer_groups=after, fp_deltas_vs_half={k: row['fp']-ref_fp[k]['fp'] for k, row in fp.items()})
+    write_json(output/'comparison.json', report)
     print('Finetune learning-rate comparison saved', flush=True)
+
+
+def optimizer_groups(path):
+    prefix = 'Optimizer groups (learning rate, parameter count):'
+    lines = [line for line in path.read_text().splitlines() if line.startswith(prefix)]
+    return [(rate, size) for rate, size in literal_eval(lines[-1][len(prefix):]) if size]
 
 
 if __name__ == '__main__':

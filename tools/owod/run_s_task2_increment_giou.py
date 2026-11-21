@@ -109,14 +109,14 @@ def evaluate_heldout(model, dataset, loader, manifest, order, *, proxies, fp_sou
                           include_current_stats=True, print_freq=64)
 
 
-def evaluate(name, checkpoint, plan, dataset, loader, manifest, order, *, proxies, output=OUTPUT):
+def evaluate(name, checkpoint, plan, dataset, loader, manifest, order, *, proxies, output=OUTPUT, fp_sources=False):
     path = output/f'{name}-heldout.json'
     digest = file_sha256(checkpoint)
     plan_hash = file_sha256(output/'plan.json')
     if not path.exists():
         print(f'Evaluating {name} on 1024 held-out images', flush=True)
         model, _ = load_detector(None, checkpoint, torch.device('cuda'))
-        views = evaluate_heldout(model, dataset, loader, manifest, order, proxies=proxies)
+        views = evaluate_heldout(model, dataset, loader, manifest, order, proxies=proxies, fp_sources=fp_sources)
         write_json(path, dict(checkpoint_sha256=digest, plan_sha256=plan_hash, views=views))
     result = read_json(path)
     if result['checkpoint_sha256'] != digest or result['plan_sha256'] != plan_hash:
