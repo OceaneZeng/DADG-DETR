@@ -70,12 +70,18 @@ def current_fp_sources(label, items, order, gt, tp, fp, recall, specification):
     return dict(families=result, confused_with=dict(confused_with))
 
 
+def voc_prediction_box(box):
+    return [float(f'{float(value) + (1. if i < 2 else 0.):.1f}') for i, value in enumerate(box)]
+
+
 def evaluate_author_benchmark(predictions, coco, known_ids, previous_ids, current_ids,
                               specification, *, include_current_stats=False, include_previous_stats=False,
-                              include_wi_sources=False):
+                              include_wi_sources=False, include_matched_ids=False):
     known = set(known_ids)
     gt, source_to_id = {}, {}
     hidden_classes = defaultdict(list)
+    annotation_ids = defaultdict(list)
+    matched_ids = {}
     for image_id, image in coco.imgs.items():
         source_to_id[image['owod_source_id']] = image_id
         objects = defaultdict(list)
@@ -84,6 +90,8 @@ def evaluate_author_benchmark(predictions, coco, known_ids, previous_ids, curren
             if 'voc_bbox' not in ann:
                 raise ValueError('Author evaluation requires preserved raw voc_bbox annotations')
             objects[label].append((ann['voc_bbox'], bool(ann.get('difficult', 0))))
+            if include_matched_ids:
+                annotation_ids[image_id, label].append(ann['id'])
             if include_wi_sources and label == -1:
                 hidden_classes[image_id].append(ann['category_id'])
         gt[image_id] = objects
@@ -102,8 +110,7 @@ def evaluate_author_benchmark(predictions, coco, known_ids, previous_ids, curren
                 label = -1
             elif label not in known:
                 raise ValueError(f'Prediction uses an unseen or invalid category: {label}')
-            box = [float(f'{float(value) + (1. if i < 2 else 0.):.1f}')
-                   for i, value in enumerate(box)]
+            box = voc_prediction_box(box)
             detections[label].append((float(f'{score:.3f}'), image_id, box))
     ap, curves = {}, {}
     a_ose, fp_at_recall, total_at_recall = 0, [], []
@@ -170,6 +177,9 @@ def evaluate_author_benchmark(predictions, coco, known_ids, previous_ids, curren
                                          ap50_without_duplicate_fp=voc_ap(recall, filtered_precision, specification['ap_mode']),
                                          tp=int(tp[-1]) if len(tp) else 0, fp=int(fp[-1]) if len(fp) else 0,
                                          fp_duplicates=int(duplicate_fp.sum()))
+        if include_matched_ids:
+            matched_ids[label] = sorted(annotation_ids[i, label][j]
+                                        for i, record in records.items() for j in record['matched'])
         if label == -1:
             unknown_tp = int(tp[-1]) if len(tp) else 0
             unknown_count = len(items)
@@ -193,6 +203,8 @@ def evaluate_author_benchmark(predictions, coco, known_ids, previous_ids, curren
         if ids:
             group_ap[name] = float(np.mean([ap[c] for c in ids]))
     result = {f'{name.lower()}_ap50': value for name, value in group_ap.items()}
+    if include_matched_ids:
+        result['matched_annotation_ids'] = matched_ids
     if include_wi_sources:
         result['wi_sources'] = wi_sources
     if include_current_stats:
