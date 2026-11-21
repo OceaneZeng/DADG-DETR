@@ -13,6 +13,7 @@ from tools.owod import probe_task1_empty_allocation as allocation
 from tools.owod import probe_task1_discovery_gates as gates
 from tools.owod import probe_task1_soft_discovery as soft
 from tools.owod import probe_task2_duration_holdout as holdout
+from tools.owod import probe_task2_slot_features as features
 from tools.owod.diagnose_learning import make_loader
 from tools.owod.protocol import file_sha256, read_json, resolve_image_root
 from tools.owod.run_cross_attention_study import pin
@@ -149,12 +150,14 @@ def main():
         raise ValueError('Original inputs and completed allocation comparison are required')
     known = manifest['stages'][0]['classes']
     jobs = source['jobs']
+    screens = read_json(features.OUTPUT / 'plan.json')['entries']
     train_hashes = set()
     for seed, job in jobs.items():
-        screen = Path(job['small']).parents[1] / 'screening.json'
-        if (file_sha256(screen) != job['screen_sha256'] or file_sha256(Path(job['parent'])) != job['parent_sha256']
-                or file_sha256(Path(job['small'])) != job['small_sha256']):
-            raise ValueError(f'Changed seed {seed} inputs')
+        job['screen'] = screens[seed]['screen']
+        screen = Path(job['screen'])
+        for key in ('screen', 'parent', 'small'):
+            if file_sha256(Path(job[key])) != job[f'{key}_sha256']:
+                raise ValueError(f'Changed seed {seed} {key}: {job[key]}')
         _, files = screening_files(MANIFEST, screen, 0)
         train_path = files['increment_train']
         train_hashes.add(file_sha256(train_path))
