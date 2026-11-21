@@ -57,13 +57,17 @@ def crop_predictions(model, post, dataset, keys, sizes):
     return [tuple(torch.cat(parts) for parts in zip(*group)) for group in groups]
 
 
-def refill(candidates, native_boxes, native_labels, size, truth, designated):
-    boxes, scores, labels, identities = candidates
+def eligible_cells(boxes, native_boxes, size):
     area = boxes[:, 2:].prod(-1) * size.prod()
     valid = (area > 0) & (area <= 2048)
     if len(boxes):
         valid &= overlap(boxes, native_boxes[:-1]).amax(1) < .5
-    ids = torch.where(valid)[0]
+    return torch.where(valid)[0]
+
+
+def refill(candidates, native_boxes, native_labels, size, truth=None, designated=None):
+    boxes, scores, labels, identities = candidates
+    ids = eligible_cells(boxes, native_boxes, size)
     record = dict(pool=len(ids), candidate=None, pool_covers=False, winner_covers=False)
     if not len(ids):
         return native_boxes, native_labels, record
@@ -83,6 +87,23 @@ def score(boxes, labels, truth, anns):
                    if j >= 0 and label == anns[j]['category_id']})
 
 
+def image_views(model, post, dataset, samples, keys, sizes):
+    native = model(samples.to('cuda'))
+    dets = post(native, sizes, include_top_indices=True)
+    probabilities, categories, _ = post.candidate_scores(native)
+    scores, best = probabilities.max(-1)
+    cropped = crop_predictions(model, post, dataset, keys, sizes)
+    for i, det in enumerate(dets):
+        queries = det['top_indices'] // len(categories)
+        if len(queries) != 50:
+            raise ValueError('Expected the native joint Top-50')
+        boxes = native['pred_boxes'][i]
+        ids = torch.arange(len(boxes), device=boxes.device)
+        ids = ids[~torch.isin(ids, queries)]
+        full = (boxes[ids], scores[i, ids], categories[best[i, ids]], ids)
+        yield boxes[queries], det['labels'], full, cropped[i]
+
+
 @torch.inference_mode()
 def evaluate(model, post, loader, ref):
     images = {}
@@ -90,12 +111,8 @@ def evaluate(model, post, loader, ref):
     for step, (samples, targets) in enumerate(loader, 1):
         sizes = torch.stack([t['orig_size'] for t in targets]).cuda()
         keys = [int(t['image_id'].item()) for t in targets]
-        native = model(samples.to('cuda'))
-        dets = post(native, sizes, include_top_indices=True)
-        probabilities, categories, _ = post.candidate_scores(native)
-        scores, best = probabilities.max(-1)
-        cropped = crop_predictions(model, post, loader.dataset, keys, sizes)
-        for i, (key, target, det) in enumerate(zip(keys, targets, dets)):
+        views = image_views(model, post, loader.dataset, samples, keys, sizes)
+        for i, (key, target, (selected, labels, full, crops)) in enumerate(zip(keys, targets, views)):
             prior = ref[str(key)]
             anns = valid_annotations(loader.dataset, key)
             if target['labels'].tolist() != [a['category_id'] for a in anns]:
@@ -105,16 +122,8 @@ def evaluate(model, post, loader, ref):
             by_id = {a['id']: j for j, a in enumerate(anns)}
             designated = by_id[eligible] if eligible is not None else None
             small = {a['id'] for a in anns if a['area'] < 32**2}
-            queries = det['top_indices'] // len(categories)
-            boxes = native['pred_boxes'][i]
-            selected, labels = boxes[queries], det['labels']
-            if len(queries) != 50:
-                raise ValueError('Expected the native joint Top-50')
-            ids = torch.arange(len(boxes), device=boxes.device)
-            ids = ids[~torch.isin(ids, queries)]
-            full = (boxes[ids], scores[i, ids], categories[best[i, ids]], ids)
             outcomes = {}
-            for name, pool in [('native', None), ('full', full), ('crops', cropped[i])]:
+            for name, pool in [('native', None), ('full', full), ('crops', crops)]:
                 if pool is None:
                     final, predictions, record = selected, labels, {}
                 else:
