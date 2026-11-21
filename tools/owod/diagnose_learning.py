@@ -65,13 +65,16 @@ def make_loader(image_root, annotation, batch, workers, shuffle=False, seed=42):
 
 
 def evaluate_views(model, loader, coco, variants, specification, old, current, device, protected_model=None,
-                   *, include_current_stats=False, compare_current_ranks=False, print_freq=0):
+                   *, include_current_stats=False, compare_current_ranks=False, exclude_unknown=(), print_freq=0):
     import torch
     from models.graph_local.discovery import DiscoveryPostProcess
     from models.owod_benchmark_eval import evaluate_author_benchmark
     from util.box_ops import box_cxcywh_to_xyxy, box_iou
     processors = {key: DiscoveryPostProcess(known_ids=ids, max_detections=limit, scoring=scoring)
                   for key, (ids, scoring, limit) in variants.items()}
+    if exclude_unknown and (protected_model is not None or
+                            any(variants[key][1] == 'hierarchical' for key in exclude_unknown)):
+        raise ValueError('Unknown suppression requires focal views of a single model')
     if compare_current_ranks:
         if (protected_model is not None or len(variants) != 2
                 or any(limit != 50 or not set(current).issubset(ids) for ids, _, limit in variants.values())):
@@ -90,6 +93,10 @@ def evaluate_views(model, loader, coco, variants, specification, old, current, d
     with torch.no_grad():
         for step, (samples, targets) in enumerate(loader, 1):
             outputs = model(samples.to(device))
+            known_outputs = outputs
+            if exclude_unknown:
+                # Zero novelty removes unknown scores without changing focal known scores.
+                known_outputs = dict(outputs, pred_novelty=torch.full_like(outputs['pred_novelty'], -torch.inf))
             reference = protected_model(samples.to(device)) if protected_model is not None else None
             sizes = torch.stack([t['orig_size'] for t in targets]).to(device)
             current_overlaps = {}
@@ -116,9 +123,10 @@ def evaluate_views(model, loader, coco, variants, specification, old, current, d
                     from tools.owod.capacity_probe import isolated_predictions
                     processed = isolated_predictions(outputs, reference, processor, old, current, sizes)
                 else:
-                    processed = processor(outputs, sizes, include_top_indices=bool(current_overlaps))
+                    view_outputs = known_outputs if key in exclude_unknown else outputs
+                    processed = processor(view_outputs, sizes, include_top_indices=bool(current_overlaps))
                     if current_overlaps:
-                        candidates, categories, _ = processor.candidate_scores(outputs)
+                        candidates, categories, _ = processor.candidate_scores(view_outputs)
                         score_tables.append((candidates, categories, [result['top_indices'] for result in processed]))
                 for index, image_id in batch_images.items():
                     result = {k: processed[index][k].cpu() for k in ('boxes', 'labels', 'scores')}
