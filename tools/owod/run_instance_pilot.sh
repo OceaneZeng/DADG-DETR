@@ -14,6 +14,14 @@ export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1}"
 export OMP_NUM_THREADS=2
 export PYTHONUNBUFFERED=1
 export PYTHONPATH="$PWD/models/ops:$PWD${PYTHONPATH:+:$PYTHONPATH}"
+if [[ ${1:-} == --task2-dedup-open-set ]]; then
+  dir=output/instance-task2-old-dedup-open-set
+  export TMPDIR="$PWD/output/.tmp-owod"
+  mkdir -p "$dir"
+  mkdir -p -m 700 "$TMPDIR"
+  flock -n "$dir/run.lock" "$python_bin" -u -m tools.owod.probe_task2_dedup_open_set 2>&1 | tee -a "$dir/console.log"
+  exit
+fi
 if [[ ${1:-} == --s-task1-known-fraction || ${1:-} == --s-task1-input-scale || ${1:-} == --s-task1-proposal-stages || ${1:-} == --s-task1-finest-anchor || ${1:-} == --s-task1-anchor-choice || ${1:-} == --s-task1-released-seed || ${1:-} == --s-task1-small-slot || ${1:-} == --s-task1-crop-refill || ${1:-} == --s-task1-crop-proxy || ${1:-} == --s-task1-crop-timeline || ${1:-} == --s-task1-region-geometry || ${1:-} == --s-task1-region-ranking || ${1:-} == --s-task2-duration || ${1:-} == --s-task2-score-competition || ${1:-} == --s-task2-paired-targets || ${1:-} == --s-task2-voc-precision || ${1:-} == --s-task2-old-dedup || ${1:-} == --s-task2-old-dedup-holdout ]]; then
   study="${1#--s-}"
   shift
