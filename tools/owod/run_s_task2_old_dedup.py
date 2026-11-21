@@ -100,16 +100,30 @@ def main():
 
 
 def evaluate_pair(output, plan, manifest, annotation, eval_order, source_arms=None):
+    native_reference = {arm: source_arms[arm]['native'] for arm in ARMS} if source_arms is not None else None
+    rows, deltas = evaluate_endpoints(output, plan, MANIFEST, manifest, annotation, eval_order,
+                                      native_reference=native_reference)
+    follow_up = passes_refill_gate(deltas['6epochs'])
+    write_json(output / 'comparison.json', dict(status='complete', plan_sha256=file_sha256(output / 'plan.json'),
+               paper_comparable=False, arms=rows, dedup_minus_native=deltas, follow_up=follow_up))
+    print('Comparison saved:', output / 'comparison.json', flush=True)
+
+
+def passes_refill_gate(delta):
+    return (delta['previous_ap50'] >= .75 and delta['current_ap50'] >= -.25 and
+            delta['known_ap50'] > 0 and delta['duplicate_fp'] < 0)
+
+
+def evaluate_endpoints(output, plan, manifest_path, manifest, annotation, eval_order, *, native_reference=None):
     plan_hash = file_sha256(output / 'plan.json')
     stage = manifest['stages'][1]
     known, previous, current = stage['active_classes'], manifest['stages'][0]['active_classes'], stage['classes']
     variants = {name: (known, 'focal', LIMIT) for name in ('native', 'dedup')}
     detector = OldClassRefill(known, previous)
     spec = dict(manifest['evaluation'], image_source_ids=eval_order, known_only_screening=True)
-    dataset, loader = make_loader(resolve_image_root(MANIFEST, manifest), annotation, 2, 2)
+    dataset, loader = make_loader(resolve_image_root(manifest_path, manifest), annotation, plan['batch_size'], 2)
     rows, deltas = {}, {}
-    for arm in ARMS:
-        entry = plan['checkpoints'][arm]
+    for arm, entry in plan['checkpoints'].items():
         path = output / f'{arm}.json'
         if not path.is_file():
             print(f'Evaluating native and duplicate-suppressed {arm}', flush=True)
@@ -122,18 +136,13 @@ def evaluate_pair(output, plan, manifest, annotation, eval_order, source_arms=No
         rows[arm] = {name: endpoint(report['views'][name]) for name in variants}
         native, dedup = rows[arm]['native'], rows[arm]['dedup']
         if (report['plan_sha256'] != plan_hash or report['checkpoint_sha256'] != entry['sha256'] or
-                (source_arms is not None and native['metrics'] != source_arms[arm]['native']) or
+                (native_reference is not None and native['metrics'] != native_reference[arm]) or
                 any(row['composition']['detections'] != LIMIT * plan['images'] for row in (native, dedup)) or
                 native['composition']['unknown'] != dedup['composition']['unknown']):
             raise ValueError(f'Native baseline or fixed quota mismatch for {arm}')
         deltas[arm] = {key: 100*(dedup['metrics'][key]-value) for key, value in native['metrics'].items()}
         deltas[arm]['duplicate_fp'] = dedup['duplicate_fp'] - native['duplicate_fp']
-    result = deltas['6epochs']
-    follow_up = (result['previous_ap50'] >= .75 and result['current_ap50'] >= -.25 and
-                 result['known_ap50'] > 0 and result['duplicate_fp'] < 0)
-    write_json(output / 'comparison.json', dict(status='complete', plan_sha256=plan_hash, paper_comparable=False,
-               arms=rows, dedup_minus_native=deltas, follow_up=follow_up))
-    print('Comparison saved:', output / 'comparison.json', flush=True)
+    return rows, deltas
 
 
 if __name__ == '__main__':
