@@ -39,7 +39,7 @@ def restore_bank(entry, heldout_ids, current):
 
 
 @torch.inference_mode()
-def measure(model, loader, current, bank, labels, image_ids):
+def measure(model, loader, current, bank, labels, image_ids, *, slot_hits=None):
     seen = set()
     current_ids = torch.tensor(current)
     by_class = {c: Counter(gt=0, localized=0, retrieved=0, named=0, correct=0) for c in current}
@@ -72,6 +72,8 @@ def measure(model, loader, current, bank, labels, image_ids):
                 if hit is None:
                     continue
                 counts['retrieved'] += 1
+                if slot_hits is not None:
+                    slot_hits.append((image, hit[1], c))
                 predicted = labels.get(hit[1])
                 if predicted is not None:
                     counts['named'] += 1
