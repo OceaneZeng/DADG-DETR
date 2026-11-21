@@ -11,11 +11,29 @@ from util.box_ops import box_cxcywh_to_xyxy
 class InstanceProposals(nn.Module):
     def __init__(self, dim):
         super().__init__()
+        self.rank_within_level = False
         self.offset = nn.Linear(dim, 4)
         nn.init.zeros_(self.offset.weight)
         nn.init.zeros_(self.offset.bias)
         self.quality = nn.Sequential(nn.Linear(dim + 4, 32), nn.ReLU(), nn.Linear(32, 1))
         self.position = nn.Linear(4, dim)
+
+    def selection_scores(self, quality, masks, row):
+        if not self.rank_within_level:
+            return quality
+        # Compare valid cells by within-level rank; ties use the original quality.
+        rank = torch.full_like(quality, len(quality), dtype=torch.long)
+        offset = 0
+        for mask in masks:
+            ids = torch.where(~mask[row].flatten())[0] + offset
+            order = ids[torch.argsort(quality[ids], descending=True, stable=True)]
+            rank[order] = torch.arange(len(order), device=quality.device)
+            offset += mask[row].numel()
+        by_quality = torch.argsort(quality, descending=True, stable=True)
+        ordered = by_quality[torch.argsort(rank[by_quality], stable=True)]
+        priority = torch.empty_like(quality, dtype=torch.float32)
+        priority[ordered] = torch.arange(len(ordered), 0, -1, device=quality.device, dtype=priority.dtype)
+        return priority
 
     def logits(self, features, boxes):
         return self.quality(torch.cat((features, boxes.detach()), -1)).squeeze(-1)
@@ -43,8 +61,9 @@ class InstanceProposals(nn.Module):
         for row in range(len(boxes)):
             with torch.no_grad():
                 ids = torch.where(valid[row])[0]
-                pool = ids[logits[row, ids].topk(min(len(ids), quota * 12)).indices]
-                keep = nms(box_cxcywh_to_xyxy(boxes[row, pool]).float(), logits[row, pool].float(), 0.6)[
+                priority = self.selection_scores(logits[row], masks, row)
+                pool = ids[priority[ids].topk(min(len(ids), quota * 12)).indices]
+                keep = nms(box_cxcywh_to_xyxy(boxes[row, pool]).float(), priority[pool].float(), 0.6)[
                     :quota
                 ]
                 chosen = pool[keep]
