@@ -1,4 +1,5 @@
 """Test the Task 2 increment-duration tradeoff on an independent S training-source holdout."""
+import argparse
 from collections import Counter
 from hashlib import sha256
 import json
@@ -27,6 +28,11 @@ OUTPUT = PARENT.with_name('s-instance-task2-duration')
 SCREEN = PARENT / 'data/screening.json'
 CHECKPOINT = PARENT / 'off/task1/checkpoint.pth'
 PHASES = ('increment', 'finetune')
+CACHE_RECOVERY_FILES = {
+    'models/graph_local/instance_transfer.py',
+    'tools/owod/run_instance_pilot.sh',
+    'tools/owod/run_s_task2_duration.py',
+}
 
 
 def commands():
@@ -48,7 +54,7 @@ def commands():
     return jobs
 
 
-def prepare():
+def prepare(recover_cache_timeout=False):
     parent_plan = read_json(PARENT / 'plan.json')
     parent = read_json(PARENT / 'comparison.json')
     ranking = read_json(RANKING / 'comparison.json')
@@ -99,18 +105,42 @@ def prepare():
                         'Author-list scores for each stage are descriptive only.',
                 criterion='Recheck a second seed only if 6 minus 3 epochs yields Current >=1 pp, Known >0 pp '
                           'and Previous >=-1 pp at the heldout finetune endpoint.')
+    if recover_cache_timeout:
+        original = read_json(OUTPUT / 'plan.json')
+        runtime_commit = plan['commit']
+        plan['commit'] = original['commit']
+
+        def git(*args):
+            return subprocess.check_output(['git', *args], cwd=pilot.ROOT, text=True).strip()
+
+        if (git('rev-parse', f'{runtime_commit}^') != original['commit'] or
+                set(git('diff', '--name-only', original['commit'], runtime_commit).splitlines()) != CACHE_RECOVERY_FILES or
+                git('diff', '--name-only', runtime_commit)):
+            raise ValueError('Cache recovery requires the transport-only change on top of the pinned commit')
     pin(OUTPUT / 'plan.json', plan)
     annotation = OUTPUT / 'heldout.json'
     if not annotation.exists():
         write_json(annotation, data)
     if file_sha256(annotation) != annotation_hash:
         raise ValueError('Changed heldout annotations')
+    if recover_cache_timeout:
+        recovery_path = OUTPUT / 'cache_recovery.json'
+        recovery = dict(planned_commit=plan['commit'], runtime_commit=runtime_commit,
+                        plan_sha256=file_sha256(OUTPUT / 'plan.json'),
+                        change='CPU Gloo transport for frozen instance evidence; training settings unchanged')
+        if recovery_path.exists() and read_json(recovery_path) != recovery:
+            raise ValueError(f'Changed cache recovery identity: {recovery_path}')
+        write_json(recovery_path, recovery)
     return plan, manifest, annotation
 
 
 def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--recover-cache-timeout', action='store_true',
+                        help='resume the pinned duration study after the frozen instance-cache timeout')
+    launcher_args = parser.parse_args()
     print('Checking S Task 1 endpoint and Task 2 train/holdout identities', flush=True)
-    plan, manifest, annotation = prepare()
+    plan, manifest, annotation = prepare(launcher_args.recover_cache_timeout)
     digest = file_sha256(OUTPUT / 'plan.json')
     pilot.run([sys.executable, str(pilot.ROOT / 'tools/owod/manage_data.py'), 'verify',
                '--benchmark', 's-owodb', '--output-root', str(MANIFEST.parent.parent)])

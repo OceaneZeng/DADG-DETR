@@ -1,6 +1,7 @@
 """Frozen stage-boundary instance retrieval for discovery v10."""
 
 from collections import Counter, defaultdict
+from datetime import timedelta
 from pathlib import Path
 import random
 
@@ -241,6 +242,11 @@ def stage_evidence(parent, criterion, args, payload, spec):
         stage=args.owod_stage,
         train=spec["training_annotation_sha256"],
     )
+    group = None
+    if utils.is_dist_avail_and_initialized():
+        # Rank zero can spend longer than the NCCL timeout building a cold cache.
+        # Transfer the CPU object separately from the training collectives.
+        group = torch.distributed.new_group(backend="gloo", timeout=timedelta(minutes=30))
     result = [None]
     if utils.is_main_process():
         folder = Path(args.instance_cache or args.output_dir)
@@ -250,12 +256,14 @@ def stage_evidence(parent, criterion, args, payload, spec):
             if cached["identity"] != identity:
                 raise ValueError(f"Instance calibration cache identity mismatch: {path}")
         else:
+            print(f"Building frozen instance cache: {path}", flush=True)
             with torch.random.fork_rng(devices=[]):
                 data = calibration(parent.eval(), criterion, args, payload)
             write_json(path, dict(identity=identity, data=data))
         result[0] = {**read_json(path)["data"], "cache_sha256": file_sha256(path)}
-    if utils.is_dist_avail_and_initialized():
-        torch.distributed.broadcast_object_list(result, src=0)
+    if group is not None:
+        torch.distributed.broadcast_object_list(result, src=0, group=group)
+        torch.distributed.destroy_process_group(group)
     return result[0]
 
 
