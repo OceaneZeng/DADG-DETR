@@ -66,7 +66,7 @@ def make_loader(image_root, annotation, batch, workers, shuffle=False, seed=42):
 
 def evaluate_views(model, loader, coco, variants, specification, old, current, device, protected_model=None,
                    *, include_current_stats=False, include_previous_stats=False, compare_current_ranks=False,
-                   exclude_unknown=(), postprocessors=None, print_freq=0):
+                   exclude_unknown=(), postprocessors=None, print_freq=0, include_wi_sources=False):
     import torch
     from models.graph_local.discovery import DiscoveryPostProcess
     from models.owod_benchmark_eval import evaluate_author_benchmark
@@ -155,7 +155,9 @@ def evaluate_views(model, loader, coco, variants, specification, old, current, d
             print(f'Computing author metrics for {key}', flush=True)
         metrics = evaluate_author_benchmark(predictions.pop(key), coco, ids,
                            [c for c in old if c in ids], [c for c in current if c in ids], specification,
-                           include_current_stats=include_current_stats, include_previous_stats=include_previous_stats)
+                           include_current_stats=include_current_stats, include_previous_stats=include_previous_stats,
+                           include_wi_sources=include_wi_sources)
+        wi_sources = metrics.pop('wi_sources', None)
         current_stats = metrics.pop('current_class_stats', None)
         previous_stats = metrics.pop('previous_class_stats', None)
         if specification.get('diagnostic_current_only'):
@@ -171,6 +173,8 @@ def evaluate_views(model, loader, coco, variants, specification, old, current, d
             report[key]['current_class_stats'] = current_stats
         if previous_stats is not None:
             report[key]['previous_class_stats'] = previous_stats
+        if wi_sources is not None:
+            report[key]['wi_sources'] = wi_sources
     for group, values in coverage.items():
         report[f'raw_{group}_box_recall_iou50'] = {**values,
             'recall': values['hits'] / values['gt'] if values['gt'] else None,

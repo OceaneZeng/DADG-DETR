@@ -34,9 +34,11 @@ def overlaps(box, boxes):
 
 
 def evaluate_author_benchmark(predictions, coco, known_ids, previous_ids, current_ids,
-                              specification, *, include_current_stats=False, include_previous_stats=False):
+                              specification, *, include_current_stats=False, include_previous_stats=False,
+                              include_wi_sources=False):
     known = set(known_ids)
     gt, source_to_id = {}, {}
+    hidden_classes = defaultdict(list)
     for image_id, image in coco.imgs.items():
         source_to_id[image['owod_source_id']] = image_id
         objects = defaultdict(list)
@@ -45,6 +47,8 @@ def evaluate_author_benchmark(predictions, coco, known_ids, previous_ids, curren
             if 'voc_bbox' not in ann:
                 raise ValueError('Author evaluation requires preserved raw voc_bbox annotations')
             objects[label].append((ann['voc_bbox'], bool(ann.get('difficult', 0))))
+            if include_wi_sources and label == -1:
+                hidden_classes[image_id].append(ann['category_id'])
         gt[image_id] = objects
     sequence = [source_to_id[stem] for stem in specification['image_source_ids']]
     if set(predictions) != set(sequence):
@@ -67,6 +71,7 @@ def evaluate_author_benchmark(predictions, coco, known_ids, previous_ids, curren
     ap, curves = {}, {}
     a_ose, fp_at_recall, total_at_recall = 0, [], []
     current_stats, previous_stats = {}, {}
+    wi_sources = {}
     unknown_gt = sum(sum(not difficult for _, difficult in gt[i][-1]) for i in sequence)
     unknown_tp = unknown_count = 0
     for label in [*known_ids, -1]:
@@ -79,6 +84,7 @@ def evaluate_author_benchmark(predictions, coco, known_ids, previous_ids, curren
         order = np.argsort(-np.asarray([item[0] for item in items]))
         tp, fp, fp_open = np.zeros(len(items)), np.zeros(len(items)), np.zeros(len(items))
         duplicate_fp = np.zeros(len(items)) if track_previous else None
+        proxy_hits = []
         for rank, index in enumerate(order):
             _, image_id, box = items[index]
             record = records[image_id]
@@ -99,6 +105,8 @@ def evaluate_author_benchmark(predictions, coco, known_ids, previous_ids, curren
                 unknown_iou = overlaps(np.asarray(box), [b for b, _ in gt[image_id][-1]])
                 if len(unknown_iou) and unknown_iou.max() > specification['iou_threshold']:
                     fp_open[rank] = 1.
+                    if include_wi_sources:
+                        proxy_hits.append((rank, hidden_classes[image_id][int(unknown_iou.argmax())]))
         tp, fp, fp_open = np.cumsum(tp), np.cumsum(fp), np.cumsum(fp_open)
         recall = tp / max(1, npos)
         precision = tp / np.maximum(tp + fp, np.finfo(float).eps)
@@ -126,11 +134,22 @@ def evaluate_author_benchmark(predictions, coco, known_ids, previous_ids, curren
                 index = int(np.argmin(np.abs(recall - specification['wi_recall'])))
                 fp_at_recall.append(fp_open[index])
                 total_at_recall.append(tp[index] + fp[index])
+                if include_wi_sources:
+                    by_proxy = defaultdict(int)
+                    for rank, proxy_class in proxy_hits:
+                        if rank <= index:
+                            by_proxy[proxy_class] += 1
+                    wi_sources[label] = dict(rank=index + 1, recall=float(recall[index]),
+                                             max_recall=float(recall[-1]), open=int(fp_open[index]),
+                                             total=int(tp[index] + fp[index]), by_proxy=dict(by_proxy),
+                                             full_open=int(fp_open[-1]))
     group_ap = {}
     for name, ids in [('Previous', previous_ids), ('Current', current_ids), ('Known', known_ids)]:
         if ids:
             group_ap[name] = float(np.mean([ap[c] for c in ids]))
     result = {f'{name.lower()}_ap50': value for name, value in group_ap.items()}
+    if include_wi_sources:
+        result['wi_sources'] = wi_sources
     if include_current_stats:
         result['current_class_stats'] = current_stats
     if include_previous_stats:
