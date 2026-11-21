@@ -117,7 +117,19 @@ def main():
     entries = endpoints(source, result)
     plan = {k: source[k] for k in ('annotation', 'annotation_sha256', 'eval_order_sha256', 'protocol',
                                     'seed', 'paper_comparable', 'torch_version')}
-    plan.update(commit=subprocess.check_output(['git','rev-parse','HEAD'],cwd=ROOT,text=True).strip(),
+    code_commit = subprocess.check_output(['git', 'rev-parse', 'HEAD'], cwd=ROOT, text=True).strip()
+    plan_file = OUTPUT/'plan.json'
+    plan_commit = code_commit
+    # Keep the existing inference result attached to its original immutable plan.
+    if plan_file.exists() and file_sha256(plan_file) == 'acbfba229cc304ade5c25624eac5fda9817323e05cca3b401ea08dad6e88878a':
+        plan_commit = read_json(plan_file)['commit']
+        if code_commit != plan_commit:
+            parent = subprocess.check_output(['git', 'rev-parse', 'HEAD^'], cwd=ROOT, text=True).strip()
+            changed = subprocess.check_output(['git', 'diff', '--name-only', plan_commit, code_commit],
+                                              cwd=ROOT, text=True).splitlines()
+            if parent != plan_commit or changed != [Path(__file__).resolve().relative_to(ROOT).as_posix()]:
+                raise ValueError('Only the immediate runner repair can resume this pinned plan')
+    plan.update(commit=plan_commit,
                 manifest_sha256=file_sha256(MANIFEST), source_comparison_sha256=SOURCE_RESULT,
                 endpoints=entries, device='0', gpu=torch.cuda.get_device_name(), batch_size=2,
                 scoring='focal', max_detections=50, criterion=CRITERION, prefix_class=62, prefix_length=12)
@@ -135,15 +147,18 @@ def main():
             model, _ = load_detector(None, Path(entry['path']), torch.device('cuda'))
             report = evaluate_views(model, loader, ds.coco, {'native':(cur['active_classes'],'focal',50)},
                                     spec, prev['classes'], cur['classes'], 'cuda', include_current_stats=True, print_freq=64)
-            write_json(out, dict(view=report['native'], plan_sha256=digest, checkpoint_sha256=entry['sha256']))
+            write_json(out, dict(view=report['native'], plan_sha256=digest, code_commit=code_commit,
+                                 checkpoint_sha256=entry['sha256']))
             del model
         row = read_json(out)
         if row['plan_sha256'] != digest or row['checkpoint_sha256'] != entry['sha256']:
             raise ValueError(f'Changed replay file: {key}')
         views[key] = row['view']
-        verify_replay(row['view'], read_json(entry['reference'])[entry['field']][entry['view']], cur['classes'])
+        reference = read_json(Path(entry['reference']))
+        verify_replay(row['view'], reference[entry['field']][entry['view']], cur['classes'])
     comparison = decompose(views, cur['classes'], result)
-    write_json(OUTPUT/'comparison.json', dict(status='complete', paper_comparable=False, plan_sha256=digest, **comparison))
+    write_json(OUTPUT/'comparison.json', dict(status='complete', paper_comparable=False, plan_sha256=digest,
+                                              code_commit=code_commit, **comparison))
     print('VOC2007 Current AP decomposition saved', flush=True)
 
 
