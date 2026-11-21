@@ -93,8 +93,7 @@ def evaluate(model, criterion, ema, loader, new_ids, previous):
     return dict(counts=totals, images=rows)
 
 
-def main():
-    parent = views.OUTPUT
+def paired_plan(parent, rule, criterion):
     source = read_json(parent / 'plan.json')
     report = read_json(parent / 'comparison.json')
     manifest = read_json(MANIFEST)
@@ -119,12 +118,18 @@ def main():
                 parent_run=parent.name, source_plan_sha256=digest, source_result_sha256=file_sha256(parent / 'comparison.json'),
                 reference_sha256=references, jobs=source['jobs'], gpu=source['gpu'], torch_version=source['torch_version'],
                 manifest_sha256=source['manifest_sha256'], holdout_sha256=source['holdout_sha256'], batch_size=2,
-                rule='Keep the soft-selected queries. Compare student, unflipped teacher and arithmetic midpoint. '
-                'Retain student if proposed geometry, known overlap or within-image suppression fails.',
-                criterion='Both seeds: midpoint beats student on holdout1024, gains at least 5 pp over original hard '
-                'selection there, and matches or beats student on reference128. Teacher is a separate control. '
-                'Upper bound uses any of the three valid coordinates per query and relaxes mutual suppression.',
-                paper_comparable=False)
+                rule=rule, criterion=criterion, paper_comparable=False)
+    return plan, manifest, report, large
+
+
+def main():
+    parent = views.OUTPUT
+    plan, manifest, report, large = paired_plan(
+        parent, 'Keep the soft-selected queries. Compare student, unflipped teacher and arithmetic midpoint. '
+        'Retain student if proposed geometry, known overlap or within-image suppression fails.',
+        'Both seeds: midpoint beats student on holdout1024, gains at least 5 pp over original hard '
+        'selection there, and matches or beats student on reference128. Teacher is a separate control. '
+        'Upper bound uses any of the three valid coordinates per query and relaxes mutual suppression.')
     pin(OUTPUT / 'plan.json', plan)
     plan_hash = file_sha256(OUTPUT / 'plan.json')
     image_root = resolve_image_root(MANIFEST, manifest)

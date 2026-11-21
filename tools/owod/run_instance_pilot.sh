@@ -14,7 +14,7 @@ export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1}"
 export OMP_NUM_THREADS=2
 export PYTHONUNBUFFERED=1
 export PYTHONPATH="$PWD/models/ops:$PWD${PYTHONPATH:+:$PYTHONPATH}"
-if [[ ${1:-} == --task2-duration-holdout || ${1:-} == --task2-distillation-teachers || ${1:-} == --task2-distillation-selection || ${1:-} == --task2-history-retrieval || ${1:-} == --task2-slot-naming || ${1:-} == --task2-slot-features || ${1:-} == --task1-discovery-gates || ${1:-} == --task1-soft-discovery || ${1:-} == --task1-empty-allocation || ${1:-} == --task1-labeled-quality || ${1:-} == --task1-quality-views || ${1:-} == --task1-view-boxes ]]; then
+if [[ ${1:-} == --task2-duration-holdout || ${1:-} == --task2-distillation-teachers || ${1:-} == --task2-distillation-selection || ${1:-} == --task2-history-retrieval || ${1:-} == --task2-slot-naming || ${1:-} == --task2-slot-features || ${1:-} == --task1-discovery-gates || ${1:-} == --task1-soft-discovery || ${1:-} == --task1-empty-allocation || ${1:-} == --task1-labeled-quality || ${1:-} == --task1-quality-views || ${1:-} == --task1-view-boxes || ${1:-} == --task1-decoder-depth ]]; then
   probe="${1#--}"
   dir="output/m-instance-$probe"
   export TMPDIR="$PWD/output/.tmp-owod"
