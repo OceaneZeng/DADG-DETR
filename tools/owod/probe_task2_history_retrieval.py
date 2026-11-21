@@ -39,7 +39,7 @@ def restore_bank(entry, heldout_ids, current):
 
 
 @torch.inference_mode()
-def measure(model, loader, current, bank, labels, image_ids, *, slot_hits=None):
+def measure(model, loader, current, bank, labels, image_ids, *, slot_hits=None, named_features=None):
     seen = set()
     current_ids = torch.tensor(current)
     by_class = {c: Counter(gt=0, localized=0, retrieved=0, named=0, correct=0) for c in current}
@@ -49,6 +49,8 @@ def measure(model, loader, current, bank, labels, image_ids, *, slot_hits=None):
         outputs = model(images.to('cuda'))
         boxes = box_cxcywh_to_xyxy(outputs['pred_boxes']).cpu()
         features = outputs['instance_features'].cpu()
+        if named_features is not None:
+            decoder = outputs['query_features'].cpu()
         for row, target in enumerate(targets):
             image = int(target['image_id'].item())
             if image in seen:
@@ -76,6 +78,8 @@ def measure(model, loader, current, bank, labels, image_ids, *, slot_hits=None):
                     slot_hits.append((image, hit[1], c))
                 predicted = labels.get(hit[1])
                 if predicted is not None:
+                    if named_features is not None:
+                        named_features.append((image, hit[1], c, (decoder[row, q].clone(), features[row, q].clone(), hit[2])))
                     counts['named'] += 1
                     counts['correct'] += int(predicted == c)
                     confusion[c][predicted] += 1

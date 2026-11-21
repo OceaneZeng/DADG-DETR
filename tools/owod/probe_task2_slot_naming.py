@@ -53,7 +53,7 @@ def compare(hits, original, proposed, total_gt, current):
                                     and 20 * vote_correct >= total_gt))
 
 
-def measure_seed(seed, entry, holdout_loader, holdout_ids, ref, current, image_root, digest):
+def seed_inputs(seed, entry, holdout_ids, current, image_root):
     bank, original = retrieval.restore_bank(entry, holdout_ids, current)
     args = SimpleNamespace(owod_manifest=str(MANIFEST), owod_screening=entry['screen'], owod_image_root=str(image_root),
                            seed=int(seed), batch_size=2, num_workers=2)
@@ -63,7 +63,11 @@ def measure_seed(seed, entry, holdout_loader, holdout_ids, ref, current, image_r
     if len(calibration_ids) != bank.settings['query_images'] or calibration_ids & holdout_ids:
         raise ValueError(f'Incomplete calibration set or holdout overlap for seed {seed}')
     model, _ = load_detector(None, Path(entry['parent']), torch.device('cuda'))
-    model.eval()
+    return model.eval(), bank, original, calibration, calibration_ids
+
+
+def measure_seed(seed, entry, holdout_loader, holdout_ids, ref, current, image_root, digest):
+    model, bank, original, calibration, calibration_ids = seed_inputs(seed, entry, holdout_ids, current, image_root)
     print(f'Seed {seed}: calibration on {len(calibration_ids)} images', flush=True)
     calibration_hits = []
     calibration_row = retrieval.measure(model, calibration, current, bank, original, calibration_ids,
