@@ -96,7 +96,11 @@ def main():
                           'and fewer duplicate FPs. A pass merits independent training-source validation.')
     plan_path = OUTPUT / 'plan.json'
     pin(plan_path, plan)
-    plan_hash = file_sha256(plan_path)
+    evaluate_pair(OUTPUT, plan, manifest, annotation, eval_order, scoring['arms'])
+
+
+def evaluate_pair(output, plan, manifest, annotation, eval_order, source_arms=None):
+    plan_hash = file_sha256(output / 'plan.json')
     stage = manifest['stages'][1]
     known, previous, current = stage['active_classes'], manifest['stages'][0]['active_classes'], stage['classes']
     variants = {name: (known, 'focal', LIMIT) for name in ('native', 'dedup')}
@@ -105,8 +109,8 @@ def main():
     dataset, loader = make_loader(resolve_image_root(MANIFEST, manifest), annotation, 2, 2)
     rows, deltas = {}, {}
     for arm in ARMS:
-        entry = checkpoints[arm]
-        path = OUTPUT / f'{arm}.json'
+        entry = plan['checkpoints'][arm]
+        path = output / f'{arm}.json'
         if not path.is_file():
             print(f'Evaluating native and duplicate-suppressed {arm}', flush=True)
             model, _ = load_detector(None, Path(entry['path']), torch.device('cuda'))
@@ -118,7 +122,7 @@ def main():
         rows[arm] = {name: endpoint(report['views'][name]) for name in variants}
         native, dedup = rows[arm]['native'], rows[arm]['dedup']
         if (report['plan_sha256'] != plan_hash or report['checkpoint_sha256'] != entry['sha256'] or
-                native['metrics'] != scoring['arms'][arm]['native'] or
+                (source_arms is not None and native['metrics'] != source_arms[arm]['native']) or
                 any(row['composition']['detections'] != LIMIT * plan['images'] for row in (native, dedup)) or
                 native['composition']['unknown'] != dedup['composition']['unknown']):
             raise ValueError(f'Native baseline or fixed quota mismatch for {arm}')
@@ -127,9 +131,9 @@ def main():
     result = deltas['6epochs']
     follow_up = (result['previous_ap50'] >= .75 and result['current_ap50'] >= -.25 and
                  result['known_ap50'] > 0 and result['duplicate_fp'] < 0)
-    write_json(OUTPUT / 'comparison.json', dict(status='complete', plan_sha256=plan_hash, paper_comparable=False,
+    write_json(output / 'comparison.json', dict(status='complete', plan_sha256=plan_hash, paper_comparable=False,
                arms=rows, dedup_minus_native=deltas, follow_up=follow_up))
-    print('Comparison saved:', OUTPUT / 'comparison.json', flush=True)
+    print('Comparison saved:', output / 'comparison.json', flush=True)
 
 
 if __name__ == '__main__':
