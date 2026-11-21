@@ -83,16 +83,21 @@ def effects(values):
                            if all(v <= -deficit/2 for v in conditional.values())])
 
 
+def load_frozen_pair(endpoints):
+    models, heads = {}, {}
+    for arm, entry in endpoints.items():
+        models[arm], _ = load_detector(None, Path(entry['path']), torch.device('cuda'))
+        module = models[arm].detr.transformer.instance_proposals.quality
+        heads[arm] = {k: v.detach().cpu().clone() for k, v in module.state_dict().items()}
+    return models, heads
+
+
 def main():
     plan, manifest, order = prepare()
     digest = file_sha256(OUTPUT/'plan.json')
     ds, loader = make_loader(resolve_image_root(MANIFEST, manifest), Path(plan['annotation']), plan['batch_size'], 2)
-    models, heads, references = {}, {}, {}
-    for arm, entry in plan['endpoints'].items():
-        models[arm], _ = load_detector(None, Path(entry['path']), torch.device('cuda'))
-        module = models[arm].detr.transformer.instance_proposals.quality
-        heads[arm] = {k: v.detach().cpu().clone() for k, v in module.state_dict().items()}
-        references[arm] = read_json(Path(entry['reference']))['views']
+    models, heads = load_frozen_pair(plan['endpoints'])
+    references = {arm: read_json(Path(e['reference']))['views'] for arm,e in plan['endpoints'].items()}
     fp_control = read_json(FP_SOURCE/'control-finetune.json')['view']
     summarize_fp(fp_control, references['control']['released'])
     summary, current = {}, {arm: {} for arm in ARMS}
