@@ -7,6 +7,10 @@ from tools.owod.protocol import (file_sha256, resolve_image_root, stage_files,
 
 
 def configure_run(args):
+    tail = getattr(args, 'screen_tail_positive_ids', None)
+    if tail and not (args.owod_screening and args.screen_branch_checkpoint and args.owod_discovery
+                     and args.owod_stage == 1 and args.owod_phase == 'increment' and not args.teacher_completion):
+        raise ValueError('Tail positive weighting requires released GT in shared-parent Task 2 increment screening')
     if (getattr(args, 'screen_double_old_box_loss', False) or getattr(args, 'screen_double_current_positives', False)) and not (
             args.owod_screening and args.screen_branch_checkpoint and args.owod_discovery
             and args.owod_stage == 1 and args.owod_phase == 'finetune' and not args.teacher_completion):
@@ -136,6 +140,8 @@ def configure_run(args):
         if supplied is not None and set(supplied) != set(values):
             raise ValueError(f'{field} differs from the author-defined stage')
         setattr(args, field, values)
+    if tail and (not set(tail).issubset(record['classes']) or len(set(tail)) != len(tail)):
+        raise ValueError('Tail positive weights require distinct current class IDs')
     args.owod_image_root = str(resolve_image_root(Path(args.owod_manifest), manifest))
     if not Path(args.owod_image_root).is_dir():
         raise FileNotFoundError(f'Benchmark images missing: {args.owod_image_root}')
@@ -222,6 +228,8 @@ def validate_checkpoint(args, checkpoint, resume=False):
     offset = getattr(args, 'discovery_pseudo_epoch_offset', 0)
     saved_offset = getattr(saved, 'discovery_pseudo_epoch_offset', 0)
     if resume:
+        if getattr(saved, 'screen_tail_positive_ids', None) != getattr(args, 'screen_tail_positive_ids', None):
+            raise ValueError('Cannot change the weighted increment class set on resume')
         if getattr(saved, 'screen_double_current_positives', False) != getattr(args, 'screen_double_current_positives', False):
             raise ValueError('Cannot change matched new-class focal weighting on resume')
         if getattr(saved, 'screen_double_old_box_loss', False) != getattr(args, 'screen_double_old_box_loss', False):

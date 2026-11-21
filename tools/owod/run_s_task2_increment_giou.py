@@ -52,7 +52,7 @@ def prepare(output=OUTPUT, *, variant='giou'):
             or os.environ.get('CUDA_VISIBLE_DEVICES') != duration_plan['devices'] or str(torch.__version__) != duration_plan['torch_version']):
         raise ValueError('Changed phase evidence, control, or two-GPU environment')
     identity = validate_inputs(MANIFEST, SCREEN, CHECKPOINT, DURATION/'off/gnn/gnn_stage0.pt', pilot.WEIGHTS, 42)
-    screening_files(MANIFEST, SCREEN, 1)
+    _, screening = screening_files(MANIFEST, SCREEN, 1)
     cache = DURATION/'retrieval'/f'instances-stage-1-{identity["checkpoint_sha256"]}.json'
     if identity != duration['identity'] or file_sha256(cache) != duration['common_cache_sha256']:
         raise ValueError('Changed shared Task 1 parent, GNN, images or instance cache')
@@ -76,7 +76,7 @@ def prepare(output=OUTPUT, *, variant='giou'):
         cmd[cmd.index('--output_dir')+1] = str(output/phase)
         if variant == 'proposal-quality':
             cmd[cmd.index('--graph-localization') + 1] = 'decoder-bbox-increment-quality'
-        elif phase == 'increment':
+        elif phase == 'increment' and variant != 'tail-positives':
             increment_flags = {'classifier-lr': ['--class_embed_lr_mult', '2'], 'giou': ['--giou_loss_coef', '4'],
                                'no-random-crop': ['--no-random-crop']}
             cmd.extend(increment_flags[variant])
@@ -94,6 +94,9 @@ def prepare(output=OUTPUT, *, variant='giou'):
                 criterion='Advance if Current gains at least 1.00 pp, Previous drops at most 1.00 pp and Known rises. '
                           'Also require mean masked-fold U-Recall not to fall, mean WI and summed A-OSE not to rise. '
                           'Record whether incremental raw Current box coverage improves. No author-test model selection.')
+    if variant == 'tail-positives':
+        from tools.owod.s_task2_tail_positive import configure_tail
+        configure_tail(plan, output, screening['increment_train'])
     if variant == 'proposal-quality':
         from tools.owod.s_task2_proposal_quality import add_evidence
         add_evidence(plan, CHECKPOINT)
@@ -163,6 +166,8 @@ def evaluate(name, checkpoint, plan, dataset, loader, manifest, order, *, proxie
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     options = parser.add_mutually_exclusive_group()
+    options.add_argument('--tail-positives', dest='variant', action='store_const', const='tail-positives',
+                         help='Double increment matched focal positives for the bottom frequency quartile')
     options.add_argument('--classifier-lr', dest='variant', action='store_const', const='classifier-lr',
                          help='Double only the increment classifier LR')
     options.add_argument('--proposal-quality', dest='variant', action='store_const', const='proposal-quality',
@@ -199,6 +204,16 @@ def main():
         report['phases'][phase] = dict(checkpoint_sha256=file_sha256(path), heldout=stats, raw_current=raw,
             delta_raw_hits=raw['hits']-(reference['gt']-reference['no_box']), author=endpoint(path.parent, phase, epoch=args.epochs-1),
             delta={k:stats[k]-reference[k] for k in ('current_ap50','previous_ap50','known_ap50')})
+        if variant == 'tail-positives':
+            expected = plan['tail_class_ids'] if phase == 'increment' else None
+            if args.screen_tail_positive_ids != expected or args.no_random_crop:
+                raise ValueError('Different weighted classes or augmentation at endpoint')
+            if phase == 'increment':
+                epochs = [json.loads(line) for line in (path.parent/'metrics.jsonl').read_text().splitlines()]
+                counts = [r['train_current_positive_matches_unscaled'] for r in epochs]
+                if [r['epoch'] for r in epochs] != [0, 1, 2] or min(counts) <= 0:
+                    raise ValueError('Expected matched weighted positives in all three increment epochs')
+                report['weighted_matches_per_rank_batch'] = counts
         if variant == 'no-random-crop':
             if args.no_random_crop != (phase == 'increment') or args.no_augmentation or args.lightweight:
                 raise ValueError('Trained endpoint used a different augmentation setting')
@@ -221,17 +236,33 @@ def main():
                        proxies=True, output=output)
     if any(control['released']['metrics'][k] != evidence['arms']['3epochs']['finetune'][k] for k in ('previous_ap50','current_ap50','known_ap50')):
         raise ValueError('Historical native finetune AP did not replay')
-    folds = {}
-    for fold in ('proxy_even', 'proxy_odd'):
-        old, new = control[fold]['metrics'], views[fold]['metrics']
-        if old['unknown_gt'] != new['unknown_gt'] or old['unknown_gt'] <= 0:
-            raise ValueError('Invalid proxy fold')
-        folds[fold] = {k:new[k]-old[k] for k in ('u_recall','a_ose','wi')}
     delta = report['phases']['finetune']['delta']
-    known_pass = delta['current_ap50'] >= .01 and delta['previous_ap50'] >= -.01 and delta['known_ap50'] > 0
-    open_pass = (mean(f['u_recall'] for f in folds.values()) >= 0 and sum(f['a_ose'] for f in folds.values()) <= 0
-                 and mean(f['wi'] for f in folds.values()) <= 0)
+    folds, known_pass, open_pass = paired_gates(views, control, delta)
     report.update(status='complete', proxy_deltas=folds, known_pass=known_pass, open_pass=open_pass, follow_up=known_pass and open_pass)
+    if variant == 'tail-positives':
+        from tools.owod.s_task2_tail_positive import gained_classes
+        tail = plan['tail_class_ids']
+        gained = gained_classes(views['released']['current_class_stats'], control['released']['current_class_stats'], tail)
+        ann = Path(plan['independent_annotation'])
+        independent_order = [im['owod_source_id'] for im in read_json(ann)['images']]
+        if (sha256('\n'.join(independent_order).encode()).hexdigest() != plan['independent_order_sha256']
+                or set(independent_order).intersection(order) or file_sha256(ann) != plan['independent_annotation_sha256']):
+            raise ValueError('Independent held-out records or order changed')
+        ds2, loader2 = make_loader(resolve_image_root(MANIFEST, manifest), ann, 2, 2)
+        paired = {}
+        for arm, ckpt in [('control', Path(plan['control']['finetune']['path'])), ('candidate', path)]:
+            paired[arm] = evaluate(arm+'-finetune-independent', ckpt, plan, ds2, loader2, manifest,
+                                   independent_order, proxies=True, output=output)
+        ref, new = paired['control']['released'], paired['candidate']['released']
+        original = read_json(output.with_name('s-instance-task2-crop-ap-independent')/'control-finetune.json')['view']
+        if any(ref['metrics'][k] != original['metrics'][k] for k in delta):
+            raise ValueError('Independent control AP did not replay')
+        gaps = {k:new['metrics'][k]-ref['metrics'][k] for k in delta}
+        folds2, known2, open2 = paired_gates(paired['candidate'], paired['control'], gaps)
+        gained2 = gained_classes(new['current_class_stats'], ref['current_class_stats'], tail)
+        report.update(independent=dict(delta=gaps, proxy_deltas=folds2, known_pass=known2, open_pass=open2),
+                      gained_tail_classes=dict(original=sorted(gained), independent=sorted(gained2), both=sorted(gained & gained2)))
+        report['follow_up'] = report['follow_up'] and known2 and open2 and len(gained & gained2) >= 2
     if variant == 'no-random-crop':
         report['coverage_pass'] = report['phases']['increment']['delta_raw_hits'] > 0
         report['follow_up'] = report['follow_up'] and report['exposure_pass'] and report['coverage_pass']
@@ -241,6 +272,19 @@ def main():
         report['follow_up'] = report['follow_up'] and report['shortlist_pass']
     write_json(output/'comparison.json', report)
     print('Increment comparison saved:', output/'comparison.json', flush=True)
+
+
+def paired_gates(views, control, delta):
+    folds = {}
+    for fold in ('proxy_even', 'proxy_odd'):
+        old, new = control[fold]['metrics'], views[fold]['metrics']
+        if old['unknown_gt'] != new['unknown_gt'] or old['unknown_gt'] <= 0:
+            raise ValueError('Invalid proxy fold')
+        folds[fold] = {k:new[k]-old[k] for k in ('u_recall','a_ose','wi')}
+    known_pass = delta['current_ap50'] >= .01 and delta['previous_ap50'] >= -.01 and delta['known_ap50'] > 0
+    open_pass = (mean(f['u_recall'] for f in folds.values()) >= 0 and sum(f['a_ose'] for f in folds.values()) <= 0
+                 and mean(f['wi'] for f in folds.values()) <= 0)
+    return folds, known_pass, open_pass
 
 
 if __name__ == '__main__':

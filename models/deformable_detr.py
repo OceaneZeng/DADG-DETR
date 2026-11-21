@@ -581,9 +581,12 @@ def build(args):
     criterion.active_class_ids = getattr(args, 'owod_known_class_ids', None)
     if getattr(args, 'screen_double_old_box_loss', False):
         criterion.double_weight_box_ids = torch.tensor(args.owod_previous_class_ids, dtype=torch.long)
+    positive_ids = getattr(args, 'screen_tail_positive_ids', None)
     if getattr(args, 'screen_double_current_positives', False):
+        positive_ids = args.owod_current_class_ids
+    if positive_ids:
         criterion.double_positive_columns = torch.isin(torch.tensor(criterion.active_class_ids),
-                                                      torch.tensor(args.owod_current_class_ids))
+                                                      torch.tensor(positive_ids))
     criterion.to(device)
     postprocessors = {'bbox': PostProcess(
         unknown_threshold=getattr(args, 'unknown_threshold', 0.5),
