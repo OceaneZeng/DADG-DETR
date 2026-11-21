@@ -22,16 +22,7 @@ from tools.owod.validate_discovery import load_checkpoint_metadata
 OUTPUT = ROOT / 'output/m-instance-task1-visible-classes'
 
 
-def prepare():
-    parent = read_json(factors.OUTPUT / 'plan.json')
-    result = read_json(factors.OUTPUT / 'comparison.json')
-    parent_hash = file_sha256(factors.OUTPUT / 'plan.json')
-    manifest, official = stage_files(MANIFEST, 0)
-    classes = manifest['stages'][0]['classes']
-    if (result['status'] != 'complete' or result['plan_sha256'] != parent_hash
-            or not result['released_only_followup']['objectness'] or file_sha256(MANIFEST) != parent['manifest_sha256']
-            or parent['gpu'] != torch.cuda.get_device_name() or parent['torch_version'] != str(torch.__version__)):
-        raise ValueError('Expected completed factor diagnosis with matching inputs and environment')
+def blocked_sources(parent, manifest):
     blocked = set(manifest['evaluation']['image_source_ids'])
     for path, expected in [(factors.SLICES['fresh1024'], parent['fresh_sha256']),
                            (factors.SLICES['reference1024'], parent['holdout_sha256'])]:
@@ -50,6 +41,20 @@ def prepare():
             _, files = screening_files(MANIFEST, screen, stage)
             for path in set(files.values()):
                 blocked.update(source_ids(read_json(path)))
+    return blocked
+
+
+def prepare():
+    parent = read_json(factors.OUTPUT / 'plan.json')
+    result = read_json(factors.OUTPUT / 'comparison.json')
+    parent_hash = file_sha256(factors.OUTPUT / 'plan.json')
+    manifest, official = stage_files(MANIFEST, 0)
+    classes = manifest['stages'][0]['classes']
+    if (result['status'] != 'complete' or result['plan_sha256'] != parent_hash
+            or not result['released_only_followup']['objectness'] or file_sha256(MANIFEST) != parent['manifest_sha256']
+            or parent['gpu'] != torch.cuda.get_device_name() or parent['torch_version'] != str(torch.__version__)):
+        raise ValueError('Expected completed factor diagnosis with matching inputs and environment')
+    blocked = blocked_sources(parent, manifest)
     data = read_json(official['increment_train'])
     names = set(sorted(source_ids(data) - blocked,
                        key=lambda name: hashlib.sha256(f'46:{name}'.encode()).digest())[:1024])
