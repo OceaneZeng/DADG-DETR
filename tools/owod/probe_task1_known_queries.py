@@ -25,7 +25,7 @@ OUTPUT = ROOT / 'output/m-instance-task1-known-queries'
 SOURCES = ('t1_train', 't2_train')
 
 
-def fresh_subset(manifest, excluded, seed):
+def fresh_origins(manifest, excluded, seed):
     blocked = set(excluded)
     origins = {}
     for source in SOURCES:
@@ -35,6 +35,11 @@ def fresh_subset(manifest, excluded, seed):
             raise ValueError(f'Incomplete independent pool for {source}')
         origins.update(dict.fromkeys(chosen, source))
         blocked.update(chosen)
+    return origins
+
+
+def fresh_subset(manifest, excluded, seed):
+    origins = fresh_origins(manifest, excluded, seed)
     root = resolve_image_root(MANIFEST, manifest)
     xml = {s: prepare_benchmarks.read_voc(root.parent, s) for s in origins}
     data = prepare_benchmarks.subset(origins, manifest['stages'][1]['active_classes'], xml)
@@ -130,9 +135,9 @@ def evaluate(model, post, loader, known, proxy, sources, *, extra_selection=None
     return dict(images=images, sources=groups)
 
 
-def run_endpoints(output, plan, manifest, sources, *, extra_selection=None):
+def run_endpoints(output, plan, manifest, sources, *, extra_selection=None, manifest_path=MANIFEST):
     digest = file_sha256(output / 'plan.json')
-    root = resolve_image_root(MANIFEST, manifest)
+    root = resolve_image_root(manifest_path, manifest)
     known = torch.tensor(manifest['stages'][0]['classes'], device='cuda')
     proxy = torch.tensor(manifest['stages'][1]['classes'], device='cuda')
     results = {}

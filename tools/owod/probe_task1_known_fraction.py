@@ -114,10 +114,7 @@ def fraction_picks(ranked, quota, positions, scores, stride, *, numerator, denom
     return arms
 
 
-def main():
-    plan, manifest, sources = prepare()
-    choose = partial(fraction_picks, numerator=plan['numerator'], denominator=plan['denominator'])
-    results = independent.run_endpoints(OUTPUT, plan, manifest, sources, extra_selection=choose)
+def comparison(results, plan_sha256):
     passed, ranking = {}, {}
     for seed, row in results.items():
         p = row['pooled']
@@ -130,8 +127,15 @@ def main():
         dh = hit - p['matched_hits']
         dc = p['matched_known_only'] - overlaps
         ranking[seed] = min(dh, dc) >= 0 and dh + dc > 0
-    write_json(OUTPUT / 'comparison.json', dict(status='complete', plan_sha256=file_sha256(OUTPUT / 'plan.json'),
-               rows=results, passed_by_seed=passed, passes_screen=all(passed.values()), ranking_by_seed=ranking))
+    return dict(status='complete', plan_sha256=plan_sha256, rows=results, passed_by_seed=passed,
+                passes_screen=all(passed.values()), ranking_by_seed=ranking)
+
+
+def main():
+    plan, manifest, sources = prepare()
+    choose = partial(fraction_picks, numerator=plan['numerator'], denominator=plan['denominator'])
+    results = independent.run_endpoints(OUTPUT, plan, manifest, sources, extra_selection=choose)
+    write_json(OUTPUT / 'comparison.json', comparison(results, file_sha256(OUTPUT / 'plan.json')))
     print('Comparison saved:', OUTPUT / 'comparison.json', flush=True)
 
 

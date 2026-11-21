@@ -37,14 +37,15 @@ PRE_EVAL_FIX = "41f42c12d9a64911291ca04e56df102bc5759ce6"
 FIXED_EVAL_BLOB = "675d49ed86e58a63a5522d04fdfb5fc94e22616e"
 
 
-def command(arm, phase, parent=None, gnn=None, *, output=None, screen=None, epochs=None, seed=42):
+def command(arm, phase, parent=None, gnn=None, *, output=None, screen=None, epochs=None, seed=42,
+            manifest=MANIFEST):
     output = OUTPUT if output is None else output
     screen = SCREEN if screen is None else screen
     stage = int(phase != "task1")
     folder = output / arm / phase
     epochs = EPOCHS[phase] if epochs is None else epochs
     lr = 5e-6 if phase == "finetune" else 5e-5
-    image_root = resolve_image_root(MANIFEST, read_json(MANIFEST))
+    image_root = resolve_image_root(manifest, read_json(manifest))
     cmd = [
         sys.executable,
         "-m",
@@ -79,7 +80,7 @@ def command(arm, phase, parent=None, gnn=None, *, output=None, screen=None, epoc
         "--owod-screening",
         str(screen),
         "--owod-manifest",
-        str(MANIFEST),
+        str(manifest),
         "--owod-recipe",
         "ow-detr-paper",
         "--owod-stage",
