@@ -93,7 +93,7 @@ def evaluate(model, criterion, ema, loader, new_ids, previous):
     return dict(counts=totals, images=rows)
 
 
-def paired_plan(parent, rule, criterion):
+def paired_plan(parent, rule, criterion, *, arms=()):
     source = read_json(parent / 'plan.json')
     report = read_json(parent / 'comparison.json')
     manifest = read_json(MANIFEST)
@@ -109,11 +109,14 @@ def paired_plan(parent, rule, criterion):
             if file_sha256(Path(job[name])) != job[name + '_sha256']:
                 raise ValueError(f'Changed {name} for seed {seed}')
         for label in views.SLICES:
-            path = parent / f'seed{seed}-{label}.json'
-            ref = read_json(path)
-            if ref['plan_sha256'] != digest or ref['counts'] != report['rows'][seed][label]:
-                raise ValueError(f'Changed paired reference {path}')
-            references[path.name] = file_sha256(path)
+            for arm in arms or (None,):
+                suffix = f'-{arm}' if arm else ''
+                path = parent / f'seed{seed}-{label}{suffix}.json'
+                ref = read_json(path)
+                counts = report['rows'][seed][label]
+                if ref['plan_sha256'] != digest or ref['counts'] != (counts[arm] if arm else counts):
+                    raise ValueError(f'Changed paired reference {path}')
+                references[path.name] = file_sha256(path)
     plan = dict(commit=subprocess.check_output(['git', 'rev-parse', 'HEAD'], cwd=ROOT, text=True).strip(),
                 parent_run=parent.name, source_plan_sha256=digest, source_result_sha256=file_sha256(parent / 'comparison.json'),
                 reference_sha256=references, jobs=source['jobs'], gpu=source['gpu'], torch_version=source['torch_version'],

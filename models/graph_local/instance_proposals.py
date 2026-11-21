@@ -8,19 +8,24 @@ from torchvision.ops import nms
 from util.box_ops import box_cxcywh_to_xyxy
 
 
+def select_encoder_cells(boxes, valid_ids, scores, quota):
+    pool = valid_ids[scores[valid_ids].topk(min(len(valid_ids), quota * 12)).indices]
+    keep = nms(box_cxcywh_to_xyxy(boxes[pool]).float(), scores[pool].float(), 0.6)[:quota]
+    return pool[keep]
+
+
 class InstanceProposals(nn.Module):
     def __init__(self, dim):
         super().__init__()
         self.rank_within_level = False
+        self.match_encoder_counts = False
         self.offset = nn.Linear(dim, 4)
         nn.init.zeros_(self.offset.weight)
         nn.init.zeros_(self.offset.bias)
         self.quality = nn.Sequential(nn.Linear(dim + 4, 32), nn.ReLU(), nn.Linear(32, 1))
         self.position = nn.Linear(4, dim)
 
-    def selection_scores(self, quality, masks, row):
-        if not self.rank_within_level:
-            return quality
+    def within_level_scores(self, quality, masks, row):
         # Compare valid cells by within-level rank; ties use the original quality.
         rank = torch.full_like(quality, len(quality), dtype=torch.long)
         offset = 0
@@ -57,16 +62,21 @@ class InstanceProposals(nn.Module):
         from .instance_transfer import SETTINGS
 
         quota = max(1, int(query.size(1) * SETTINGS["proposal_fraction"]))
-        indices, live = [], []
+        indices, live, natural_counts = [], [], []
         for row in range(len(boxes)):
             with torch.no_grad():
                 ids = torch.where(valid[row])[0]
-                priority = self.selection_scores(logits[row], masks, row)
-                pool = ids[priority[ids].topk(min(len(ids), quota * 12)).indices]
-                keep = nms(box_cxcywh_to_xyxy(boxes[row, pool]).float(), priority[pool].float(), 0.6)[
-                    :quota
-                ]
-                chosen = pool[keep]
+                quality = logits[row]
+                if self.match_encoder_counts:
+                    global_ids = select_encoder_cells(boxes[row], ids, quality, quota)
+                    priority = self.within_level_scores(quality, masks, row)
+                    level_ids = select_encoder_cells(boxes[row], ids, priority, quota)
+                    counts = (len(global_ids), len(level_ids))
+                    natural_counts.append(counts)
+                    chosen = (level_ids if self.rank_within_level else global_ids)[:min(counts)]
+                else:
+                    priority = self.within_level_scores(quality, masks, row) if self.rank_within_level else quality
+                    chosen = select_encoder_cells(boxes[row], ids, priority, quota)
                 indices.append(F.pad(chosen, (0, quota - len(chosen))))
                 live.append(torch.arange(quota, device=memory.device) < len(chosen))
         index = torch.stack(indices)
@@ -89,6 +99,8 @@ class InstanceProposals(nn.Module):
             chosen=index,
             active=active.squeeze(-1),
         )
+        if self.match_encoder_counts:
+            state["natural_counts"] = natural_counts
         return (
             mix(query, self.position(selected)),
             mix(content, memory[rows, index]),

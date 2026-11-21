@@ -24,7 +24,7 @@ def covered(boxes, truth):
 
 
 @torch.inference_mode()
-def evaluate(model, criterion, ema, loader, new_ids, previous, control):
+def evaluate(model, criterion, ema, loader, new_ids, previous, control, *, teacher_budget=None):
     known_ids = torch.tensor(model.known_ids, device='cuda')
     new_ids = torch.tensor(new_ids, device='cuda')
     rows, total = {}, Counter()
@@ -75,6 +75,14 @@ def evaluate(model, criterion, ema, loader, new_ids, previous, control):
                     raise ValueError(f'Unexpected change before proposal selection at {image}')
                 counts['budget_mismatch_images'] = int(len(active) != base['active'] or len(selected) != quota)
                 counts['replaced_encoder_ids'] = len(set(active.tolist()) - set(base['encoder_ids']))
+            if teacher_budget is not None:
+                student_counts = geometry['natural_counts'][i]
+                teacher_counts, teacher_active = teacher_budget[i]
+                if len(active) != min(student_counts) or teacher_active != min(teacher_counts):
+                    raise ValueError(f'Encoder did not apply the shared count in both views at {image}')
+                counts.update(student_global=student_counts[0], student_within=student_counts[1],
+                              teacher_global=teacher_counts[0], teacher_within=teacher_counts[1],
+                              teacher_active=teacher_active)
             total.update(counts)
             rows[image] = dict(**counts, encoder_ids=active.tolist())
         if step == 1 or step % 64 == 0 or step == len(loader):
