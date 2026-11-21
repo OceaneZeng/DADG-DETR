@@ -22,7 +22,7 @@ from tools.owod.validate_discovery import load_checkpoint_metadata
 OUTPUT = SCALE.with_name('s-instance-task1-proposal-stages')
 
 
-def stage_coverage(out, i, truth):
+def stage_boxes(out, i):
     geo = out['geometry']
     ids = torch.where(geo['valid'][i])[0]
     scores = geo['logits'][i, ids]
@@ -38,9 +38,13 @@ def stage_coverage(out, i, truth):
     stages['final'] = out['pred_boxes'][i]
     if len(out['aux_outputs']) != 5:
         raise ValueError('Expected the six-layer frozen decoder')
+    return stages
+
+
+def stage_coverage(out, i, truth):
     # Coverage is any-box IoU >= .5, including overlapping GT. Report the
     # baseline best-target convention separately to reconcile the parent run.
-    return {name: (overlap(b, truth) >= .5).any(0).cpu().tolist() for name, b in stages.items()}
+    return {name: (overlap(b, truth) >= .5).any(0).cpu().tolist() for name, b in stage_boxes(out, i).items()}
 
 
 @torch.inference_mode()
