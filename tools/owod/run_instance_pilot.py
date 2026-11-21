@@ -159,7 +159,7 @@ def train(arm, phase, parent=None, gnn=None):
     return checkpoint, metrics(folder, EPOCHS[phase] - 1)
 
 
-def calibrate(arm, checkpoint, *, output=None, screen=None, seed=42):
+def calibrate(arm, checkpoint, *, output=None, screen=None, seed=42, manifest=MANIFEST):
     output = OUTPUT if output is None else output
     screen = SCREEN if screen is None else screen
     folder = output / arm / "gnn"
@@ -170,7 +170,7 @@ def calibrate(arm, checkpoint, *, output=None, screen=None, seed=42):
                 sys.executable,
                 str(ROOT / "tools/owod/calibrate_interference_gnn.py"),
                 "--manifest",
-                str(MANIFEST),
+                str(manifest),
                 "--owod-screening",
                 str(screen),
                 "--stage",
