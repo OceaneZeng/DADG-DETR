@@ -103,6 +103,20 @@ def voc_prediction_box(box):
     return [float(f'{float(value) + (1. if i < 2 else 0.):.1f}') for i, value in enumerate(box)]
 
 
+def voc11_ranks(recall, precision, tp, fp):
+    """Locate the first native rank attaining each VOC2007 interpolated precision."""
+    anchors = []
+    for cutoff in np.arange(0., 1.1, .1):
+        start = int(np.searchsorted(recall, cutoff))
+        row = dict(recall_cutoff=float(cutoff), precision=0., rank=None)
+        if start < len(recall):
+            index = start + int(precision[start:].argmax())
+            row.update(precision=float(precision[index]), rank=index + 1,
+                       tp=int(tp[index]), fp=int(fp[index]))
+        anchors.append(row)
+    return anchors
+
+
 def evaluate_author_benchmark(predictions, coco, known_ids, previous_ids, current_ids,
                               specification, *, include_current_stats=False, include_previous_stats=False,
                               include_wi_sources=False, include_matched_ids=False):
@@ -189,6 +203,19 @@ def evaluate_author_benchmark(predictions, coco, known_ids, previous_ids, curren
             current_stats[label] = dict(ap50=ap[label], gt=npos,
                                         tp=int(tp[-1]) if len(tp) else 0,
                                         fp=int(fp[-1]) if len(fp) else 0)
+            if specification.get('diagnostic_current_ap_anchors'):
+                if specification['ap_mode'] != 'voc2007_11point':
+                    raise ValueError('Precision anchor report requires VOC2007 AP')
+                current_stats[label]['anchors'] = voc11_ranks(recall, precision, tp, fp)
+                if label == specification.get('diagnostic_rank_prefix_class'):
+                    prefix = []
+                    for i, index in enumerate(order[:12]):
+                        score, image_id, box = items[index]
+                        prev_tp, prev_fp = (tp[i-1], fp[i-1]) if i else (0, 0)
+                        outcome = 'tp' if tp[i] > prev_tp else 'fp' if fp[i] > prev_fp else 'ignored'
+                        prefix.append(dict(rank=i+1, image=coco.imgs[image_id]['owod_source_id'],
+                                           voc_score=score, voc_box=box, outcome=outcome))
+                    current_stats[label]['rank_prefix'] = prefix
             if specification.get('diagnostic_current_fp_sources'):
                 current_stats[label]['fp_sources'] = current_fp_sources(
                     label, items, order, gt, tp, fp, recall, specification)
