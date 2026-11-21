@@ -21,6 +21,38 @@ from util.box_ops import box_cxcywh_to_xyxy
 
 SOURCE = DURATION.with_name('s-instance-task2-increment-classifier-lr')
 OUTPUT = DURATION.with_name('s-instance-task2-unknown-transition')
+ORIGINAL_PLAN_SHA256 = 'ed22d3eb83664a1374078b2cbfd4ae2e045257d1ad95ecb1d7d3884a3965eb94'
+
+
+def pin_replay_plan(plan):
+    path = OUTPUT / 'plan.json'
+    if not path.exists() or file_sha256(path) != ORIGINAL_PLAN_SHA256:
+        pin(path, plan)
+        return
+
+    planned = read_json(path)['commit']
+    runtime = plan['commit']
+    if runtime == planned:
+        pin(path, plan)
+        return
+
+    def git(*args):
+        return subprocess.check_output(['git', *args], cwd=ROOT, text=True).strip()
+
+    if (git('rev-parse', 'HEAD^') != planned
+            or git('diff', '--name-only', planned, runtime) != 'tools/owod/probe_s_task2_unknown_transition.py'
+            or git('diff', '--name-only', runtime)):
+        raise ValueError('Expected the match-count fix immediately after the pinned diagnostic commit')
+    plan['commit'] = planned
+    pin(path, plan)
+    recovery = dict(planned_commit=planned, runtime_commit=runtime, plan_sha256=ORIGINAL_PLAN_SHA256,
+                    change='Check unique unknown VOC matches against evaluator U-Recall')
+    record = OUTPUT / 'recovery.json'
+    if record.exists():
+        if read_json(record) != recovery:
+            raise ValueError('Conflicting diagnostic recovery record')
+    else:
+        write_json(record, recovery)
 
 
 def prepare():
@@ -65,7 +97,7 @@ def prepare():
                           'unknown VOC TPs, >=60% lack a correct Current VOC TP at both control endpoints, '
                           'and >=60% of those failures at each endpoint have a raw box but no correct Top-50 output. '
                           'Partition the finetune candidate-minus-control TP gains/losses by parent status.')
-    pin(OUTPUT/'plan.json', plan)
+    pin_replay_plan(plan)
     return plan, manifest, order
 
 
@@ -104,8 +136,12 @@ def measure(model, dataset, loader, known, previous, current, specification, par
                                         include_matched_ids=True)
     matched = metrics.pop('matched_annotation_ids')
     hits = set(matched[-1]) if parent else {i for c in current for i in matched[c]}
-    expected = metrics['unknown_tp'] if parent else sum(c['tp'] for c in metrics['current_class_stats'].values())
-    if len(hits) != expected or not hits <= output_hits <= raw_hits:
+    if parent:
+        if not metrics['unknown_gt'] or len(hits) / metrics['unknown_gt'] != metrics['u_recall']:
+            raise ValueError('Unique unknown VOC matches disagree with U-Recall')
+    elif len(hits) != sum(c['tp'] for c in metrics['current_class_stats'].values()):
+        raise ValueError('Unique Current VOC matches disagree with per-class TP counts')
+    if not hits <= output_hits <= raw_hits:
         raise ValueError('Raw geometry, Top-50 or VOC match identities disagree')
     return dict(metrics=metrics, raw=sorted(raw_hits), emitted=sorted(output_hits), matched=sorted(hits))
 
