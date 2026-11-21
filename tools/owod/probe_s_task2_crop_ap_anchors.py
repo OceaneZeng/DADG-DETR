@@ -1,4 +1,5 @@
 """Decompose the paired crop study's S Current AP50 with the original VOC ranking."""
+import argparse
 from hashlib import sha256
 from math import isclose
 import os
@@ -61,18 +62,24 @@ def verify_replay(view, reference, classes):
             or view['composition'] != reference['composition']
             or any(view['metrics'][k] != reference['metrics'][k] for k in ('previous_ap50', 'current_ap50', 'known_ap50'))):
         raise ValueError('Native metrics or prediction composition changed')
+    for label in classes:
+        row = view['current_class_stats'][str(label)]
+        orig = reference['current_class_stats'][str(label)]
+        if any(row[k] != orig[k] for k in ('gt', 'tp', 'fp', 'ap50')):
+            raise ValueError(f'VOC matches changed for class {label}')
+
+
+def verify_anchors(view, classes):
     rows = view['current_class_stats']
     if set(rows) != {str(c) for c in classes} or len(rows) != 21:
         raise ValueError('Unexpected S Task 2 classes')
     for label, row in rows.items():
-        orig = reference['current_class_stats'][label]
-        if (any(row[k] != orig[k] for k in ('gt', 'tp', 'fp', 'ap50'))
-                or len(row['anchors']) != 11
+        if (len(row['anchors']) != 11
                 or not isclose(sum(a['precision'] for a in row['anchors'])/11, row['ap50'], abs_tol=1e-12)):
             raise ValueError(f'VOC ranks fail to reproduce class {label}')
 
 
-def decompose(views, classes, result):
+def decompose(views, classes, phase_gaps):
     # Units in this report are fractions of macro AP50. Positive loss favors the original crop.
     losses = {}
     for label in classes:
@@ -85,20 +92,50 @@ def decompose(views, classes, result):
                                     for a, b in zip(control, candidate)]
         contributions['stage_change'] = [b-a for a,b in zip(contributions['increment'], contributions['finetune'])]
         losses[key] = contributions
-    gaps = {ph: -result['phases'][ph]['delta']['current_ap50'] for ph in PHASES}
+    gaps = dict(phase_gaps)
     gaps['stage_change'] = gaps['finetune'] - gaps['increment']
     for k, gap in gaps.items():
         if not isclose(sum(sum(row[k]) for row in losses.values()), gap, abs_tol=1e-12):
             raise ValueError(f'AP decomposition does not close for {k}')
-    shares = {k: losses['62'][k][0]/gaps[k] for k in ('finetune', 'stage_change')}
+    shares = {k: losses['62'][k][0]/gaps[k] if gaps[k] else None for k in ('finetune', 'stage_change')}
     leading = {k: sorted((dict(category_id=int(label), recall_index=i, contribution=v)
                           for label, row in losses.items() for i,v in enumerate(row[k])),
                          key=lambda a: abs(a['contribution']), reverse=True)[:12] for k in shares}
     return dict(control_minus_candidate=gaps, contributions=losses, chair_zero_shares=shares,
-                largest_absolute_contributions=leading, supported=all(x >= .5 for x in shares.values()))
+                largest_absolute_contributions=leading,
+                supported=all(gaps[k] > 0 and share >= .5 for k, share in shares.items()))
 
 
-def main():
+def independent_slice(plan, manifest, original_order):
+    parent = read_json(OUTPUT/'comparison.json')
+    if (file_sha256(OUTPUT/'comparison.json') != 'd91b8b846efb9036bcb641f8c36fef8aa9f91cb9fb2b93ce066861771c777620'
+            or not parent['supported'] or parent['plan_sha256'] != file_sha256(OUTPUT/'plan.json')
+            or plan['endpoints'] != read_json(OUTPUT/'plan.json')['endpoints']):
+        raise ValueError('Independent check requires the completed four-endpoint attribution')
+    metadata = OUTPUT.with_name('instance-task2-old-only-independent')/'plan.json'
+    if file_sha256(metadata) != '8cc114b9916b2a1f847fe187e2afab0cf03cda72577f7b5c9c6017732a6d7309':
+        raise ValueError('Changed independent validation slice')
+    info = read_json(metadata)['protocols']['s-owodb']
+    annotation = Path(info['annotation'])
+    data = read_json(annotation)
+    order = [im['owod_source_id'] for im in data['images']]
+    if (file_sha256(annotation) != info['annotation_sha256'] or info['manifest_sha256'] != plan['manifest_sha256']
+            or sha256('\n'.join(order).encode()).hexdigest() != info['eval_order_sha256']
+            or len(order) != 1024 or len(set(order)) != 1024 or set(order) != set(info['origins'])
+            or set(order).intersection(original_order) or set(order).intersection(manifest['evaluation']['image_source_ids'])
+            or {a['category_id'] for a in data['annotations']} != set(manifest['stages'][1]['active_classes'])):
+        raise ValueError('Changed independent image order, released classes or overlap')
+    plan.update(annotation=str(annotation), annotation_sha256=info['annotation_sha256'],
+                eval_order_sha256=info['eval_order_sha256'], original_annotation_sha256=plan['annotation_sha256'],
+                parent_attribution_sha256=file_sha256(OUTPUT/'comparison.json'),
+                independent_slice_plan_sha256=file_sha256(metadata), sources=info['sources'],
+                criterion='Require the paired Current gap (original crop minus no crop) to be negative in increment '
+                          'and positive after finetune. The chair recall-zero term must explain at least half of '
+                          'both the positive final gap and its positive change across stages. Report absolute contributions.')
+    return annotation, order
+
+
+def main(independent=False):
     source = read_json(SOURCE/'plan.json')
     result = read_json(SOURCE/'comparison.json')
     manifest = read_json(MANIFEST)
@@ -118,7 +155,8 @@ def main():
     plan = {k: source[k] for k in ('annotation', 'annotation_sha256', 'eval_order_sha256', 'protocol',
                                     'seed', 'paper_comparable', 'torch_version')}
     code_commit = subprocess.check_output(['git', 'rev-parse', 'HEAD'], cwd=ROOT, text=True).strip()
-    plan_file = OUTPUT/'plan.json'
+    output = OUTPUT.with_name('s-instance-task2-crop-ap-independent') if independent else OUTPUT
+    plan_file = output/'plan.json'
     plan_commit = code_commit
     # Keep the existing inference result attached to its original immutable plan.
     if plan_file.exists() and file_sha256(plan_file) == 'acbfba229cc304ade5c25624eac5fda9817323e05cca3b401ea08dad6e88878a':
@@ -133,15 +171,17 @@ def main():
                 manifest_sha256=file_sha256(MANIFEST), source_comparison_sha256=SOURCE_RESULT,
                 endpoints=entries, device='0', gpu=torch.cuda.get_device_name(), batch_size=2,
                 scoring='focal', max_detections=50, criterion=CRITERION, prefix_class=62, prefix_length=12)
-    pin(OUTPUT/'plan.json', plan)
-    digest = file_sha256(OUTPUT/'plan.json')
+    if independent:
+        annotation, order = independent_slice(plan, manifest, order)
+    pin(plan_file, plan)
+    digest = file_sha256(plan_file)
     ds, loader = make_loader(resolve_image_root(MANIFEST,manifest), annotation, 2, 2)
     prev, cur = manifest['stages'][:2]
     spec = dict(manifest['evaluation'], image_source_ids=order, diagnostic_current_ap_anchors=True,
                 diagnostic_rank_prefix_class=plan['prefix_class'])
     views = {}
     for key, entry in entries.items():
-        out = OUTPUT/(key+'.json')
+        out = output/(key+'.json')
         if not out.exists():
             print(f'Evaluating {key} on {len(ds)} images', flush=True)
             model, _ = load_detector(None, Path(entry['path']), torch.device('cuda'))
@@ -154,13 +194,24 @@ def main():
         if row['plan_sha256'] != digest or row['checkpoint_sha256'] != entry['sha256']:
             raise ValueError(f'Changed replay file: {key}')
         views[key] = row['view']
-        reference = read_json(Path(entry['reference']))
-        verify_replay(row['view'], reference[entry['field']][entry['view']], cur['classes'])
-    comparison = decompose(views, cur['classes'], result)
-    write_json(OUTPUT/'comparison.json', dict(status='complete', paper_comparable=False, plan_sha256=digest,
+        verify_anchors(row['view'], cur['classes'])
+        if not independent:
+            reference = read_json(Path(entry['reference']))
+            verify_replay(row['view'], reference[entry['field']][entry['view']], cur['classes'])
+    gaps = {ph: views[f'control-{ph}']['metrics']['current_ap50'] - views[f'candidate-{ph}']['metrics']['current_ap50']
+            for ph in PHASES}
+    if not independent and any(gaps[ph] != -result['phases'][ph]['delta']['current_ap50'] for ph in PHASES):
+        raise ValueError('Original held-out Current gap changed')
+    comparison = decompose(views, cur['classes'], gaps)
+    if independent:
+        comparison['reversal'] = gaps['increment'] < 0 < gaps['finetune']
+        comparison['replicated'] = comparison['reversal'] and comparison['supported']
+    write_json(output/'comparison.json', dict(status='complete', paper_comparable=False, plan_sha256=digest,
                                               code_commit=code_commit, **comparison))
     print('VOC2007 Current AP decomposition saved', flush=True)
 
 
 if __name__ == '__main__':
-    main()
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--independent', action='store_true')
+    main(parser.parse_args().independent)
