@@ -33,6 +33,43 @@ def overlaps(box, boxes):
     return intersection / np.maximum(union, np.finfo(float).eps)
 
 
+def current_fp_sources(label, items, order, gt, tp, fp, recall, specification):
+    """Keep VOC TP assignments fixed and remove one FP family at a time."""
+    families = ('duplicate', 'other_released_class', 'partial_same_class', 'unresolved')
+    fp_ranks = np.flatnonzero(np.diff(fp, prepend=0))
+    source = np.zeros(len(order), dtype=np.int8)
+    confused_with = defaultdict(int)
+    threshold = specification['iou_threshold']
+    for rank in fp_ranks:
+        _, image_id, box = items[order[rank]]
+        box = np.asarray(box)
+        objects = gt[image_id]
+        same = overlaps(box, [b for b, _ in objects[label]])
+        best_same = same.max() if len(same) else 0.
+        if best_same > threshold:
+            # A difficult match was ignored by VOC and cannot be in fp_ranks.
+            source[rank] = 1
+            continue
+        other = [(k, b) for k, annotations in objects.items() if k >= 0 and k != label
+                 for b, difficult in annotations if not difficult]
+        iou = overlaps(box, [b for _, b in other])
+        if len(iou) and iou.max() > threshold:
+            source[rank] = 2
+            confused_with[other[int(iou.argmax())][0]] += 1
+        elif best_same >= .1:
+            source[rank] = 3
+        else:
+            source[rank] = 4
+    result = {}
+    for number, name in enumerate(families, 1):
+        remove = source == number
+        remaining_fp = fp - np.cumsum(remove)
+        precision = tp / np.maximum(tp + remaining_fp, np.finfo(float).eps)
+        result[name] = dict(fp=int(remove.sum()), ap50_without=voc_ap(
+            recall, precision, specification['ap_mode']))
+    return dict(families=result, confused_with=dict(confused_with))
+
+
 def evaluate_author_benchmark(predictions, coco, known_ids, previous_ids, current_ids,
                               specification, *, include_current_stats=False, include_previous_stats=False,
                               include_wi_sources=False):
@@ -116,6 +153,9 @@ def evaluate_author_benchmark(predictions, coco, known_ids, previous_ids, curren
             current_stats[label] = dict(ap50=ap[label], gt=npos,
                                         tp=int(tp[-1]) if len(tp) else 0,
                                         fp=int(fp[-1]) if len(fp) else 0)
+            if specification.get('diagnostic_current_fp_sources'):
+                current_stats[label]['fp_sources'] = current_fp_sources(
+                    label, items, order, gt, tp, fp, recall, specification)
             if specification.get('diagnostic_current_precision'):
                 matched = np.flatnonzero(tp > 0)
                 ceiling = voc_ap(recall[-1:], np.ones(1), specification['ap_mode']) if len(matched) else 0.

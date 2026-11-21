@@ -14,7 +14,7 @@ export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1}"
 export OMP_NUM_THREADS=2
 export PYTHONUNBUFFERED=1
 export PYTHONPATH="$PWD/models/ops:$PWD${PYTHONPATH:+:$PYTHONPATH}"
-if [[ ${1:-} == --s-task2-wi-sources || ${1:-} == --task2-old-only-independent || ${1:-} == --s-task2-current-phase || ${1:-} == --s-task2-increment-giou ]]; then
+if [[ ${1:-} == --s-task2-wi-sources || ${1:-} == --task2-old-only-independent || ${1:-} == --s-task2-current-phase || ${1:-} == --s-task2-increment-giou || ${1:-} == --s-task2-current-fp-sources ]]; then
   dir=output/s-instance-task2-dedup-wi-sources
   module=tools.owod.probe_s_task2_wi_sources
   if [[ $1 == --task2-old-only-independent ]]; then
@@ -26,6 +26,9 @@ if [[ ${1:-} == --s-task2-wi-sources || ${1:-} == --task2-old-only-independent |
   elif [[ $1 == --s-task2-increment-giou ]]; then
     dir=output/s-instance-task2-increment-giou
     module=tools.owod.run_s_task2_increment_giou
+  elif [[ $1 == --s-task2-current-fp-sources ]]; then
+    dir=output/s-instance-task2-current-fp-sources
+    module=tools.owod.probe_s_task2_current_fp_sources
   fi
   export TMPDIR="$PWD/output/.tmp-owod"
   mkdir -p "$dir"
