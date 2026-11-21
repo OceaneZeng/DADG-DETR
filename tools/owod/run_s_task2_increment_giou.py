@@ -98,6 +98,17 @@ def prepare(output=OUTPUT, *, variant='giou'):
     return plan, evidence
 
 
+def evaluate_heldout(model, dataset, loader, manifest, order, *, proxies, fp_sources=False):
+    previous, current = (manifest['stages'][i]['classes'] for i in (0, 1))
+    variants = {'released': (manifest['stages'][1]['active_classes'], 'focal', 50)}
+    if proxies:
+        for fold, visible in [('proxy_even', current[::2]), ('proxy_odd', current[1::2])]:
+            variants[fold] = (previous+visible, 'focal', 50)
+    spec = dict(manifest['evaluation'], image_source_ids=order, diagnostic_current_fp_sources=fp_sources)
+    return evaluate_views(model, loader, dataset.coco, variants, spec, previous, current, 'cuda',
+                          include_current_stats=True, print_freq=64)
+
+
 def evaluate(name, checkpoint, plan, dataset, loader, manifest, order, *, proxies, output=OUTPUT):
     path = output/f'{name}-heldout.json'
     digest = file_sha256(checkpoint)
@@ -105,13 +116,7 @@ def evaluate(name, checkpoint, plan, dataset, loader, manifest, order, *, proxie
     if not path.exists():
         print(f'Evaluating {name} on 1024 held-out images', flush=True)
         model, _ = load_detector(None, checkpoint, torch.device('cuda'))
-        previous, current = (manifest['stages'][i]['classes'] for i in (0,1))
-        variants = {'released': (manifest['stages'][1]['active_classes'], 'focal', 50)}
-        if proxies:
-            for fold, visible in [('proxy_even', current[::2]), ('proxy_odd', current[1::2])]:
-                variants[fold] = (previous+visible, 'focal', 50)
-        views = evaluate_views(model, loader, dataset.coco, variants, dict(manifest['evaluation'], image_source_ids=order),
-                               previous, current, 'cuda', include_current_stats=True, print_freq=64)
+        views = evaluate_heldout(model, dataset, loader, manifest, order, proxies=proxies)
         write_json(path, dict(checkpoint_sha256=digest, plan_sha256=plan_hash, views=views))
     result = read_json(path)
     if result['checkpoint_sha256'] != digest or result['plan_sha256'] != plan_hash:
