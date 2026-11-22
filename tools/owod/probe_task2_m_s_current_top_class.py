@@ -52,6 +52,10 @@ class UniqueQueryScore(DiscoveryPostProcess):
 
 
 class UnknownRefillScore(DiscoveryPostProcess):
+    def __init__(self, *args, protected_ids=(), **kwargs):
+        super().__init__(*args, **kwargs)
+        self.protected_ids = tuple(protected_ids)
+
     def candidate_scores(self, outputs):
         scores, categories, unknown = super().candidate_scores(outputs)
         rows, query_count, class_count = scores.shape
@@ -63,7 +67,10 @@ class UnknownRefillScore(DiscoveryPostProcess):
         positions = torch.arange(self.max_detections, device=scores.device)
         earlier = positions[:, None] > positions[None, :]
         repeated = ((queries[..., None] == queries[:, None, :]) & earlier).any(dim=-1)
-        eligible = repeated & (indices % class_count != class_count - 1)
+        classes = indices % class_count
+        eligible = repeated & (classes != class_count - 1)
+        if self.protected_ids:
+            eligible &= ~torch.isin(categories[classes], categories.new_tensor(self.protected_ids))
         drop = torch.where(eligible, positions, -1).max(dim=1).values
         used = torch.zeros((rows, query_count), dtype=torch.bool, device=scores.device)
         used.scatter_(1, queries, True)
