@@ -20,7 +20,7 @@ from tools.owod.screening_data import write_json
 
 OUTPUT = SOURCE.with_name('task1-m-s-prescreen-replacement')
 RANK_PLAN = 'dc0c336142599f65119b1e80ef3bc91a1d079cf6398e4d406a55a152b3926679'
-RANK_RESULT = '432020813db5e42742b3f6a50b26b08b76fb7d2ffdffea95fb3d6c20344a0a'
+RANK_RESULT = '432020813db5e42742b3f6a50b26b08b76fb7d2ffdffeefa95fb3d6c20344a0a'
 MAX_REPLACEMENTS = 2
 MIN_GAIN = .10
 
