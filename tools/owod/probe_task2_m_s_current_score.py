@@ -40,9 +40,12 @@ class CurrentScore(DiscoveryPostProcess):
 
 
 @torch.inference_mode()
-def measure(model, dataset, loader, known, previous, current, spec, limit, *, evaluation_coco=None):
+def measure(model, dataset, loader, known, previous, current, spec, limit, *, evaluation_coco=None,
+            extra_posts=None):
     posts = dict(native=DiscoveryPostProcess(known_ids=known, max_detections=limit, scoring='focal'),
                  perturbed=CurrentScore(known, set(current), limit, MULTIPLIER))
+    if extra_posts is not None:
+        posts.update(extra_posts)
     predictions = {name: {} for name in posts}
     per_image = {}
     for step, (samples, targets) in enumerate(loader, 1):

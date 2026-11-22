@@ -1,0 +1,127 @@
+"""Test increasing only the leading Current score in each query."""
+
+from pathlib import Path
+import subprocess
+
+from pycocotools.coco import COCO
+import torch
+
+from models.graph_local.discovery import DiscoveryPostProcess
+from tools.owod.diagnose_learning import make_loader
+from tools.owod.gnn_calibration import load_detector
+from tools.owod.probe_task1_paired_discovery import verified
+from tools.owod.probe_task2_m_s_current_fp_open_set import OPEN_KEYS, OPEN_RESULT, OUTPUT as FULL
+from tools.owod.probe_task2_m_s_current_score import AP_TOLERANCE, MULTIPLIER, measure, summarize
+from tools.owod.probe_task2_m_s_shared_current import MANIFESTS, OUTPUT as SOURCE
+from tools.owod.protocol import file_sha256, read_json, resolve_image_root
+from tools.owod.run_cross_attention_study import pin
+from tools.owod.screening_data import write_json
+
+
+OUTPUT = SOURCE.with_name('task2-m-s-current-top-class')
+NEAR = SOURCE.with_name('task2-m-s-current-fp-near-target')
+NEAR_RESULT = '8a841a56fb07c60072bbf5c5efe277ee35f05a0bfa3d8767325d327b39e1b72e'
+
+
+class LeadingCurrentScore(DiscoveryPostProcess):
+    def __init__(self, known, current, limit):
+        super().__init__(known_ids=known, max_detections=limit, scoring='focal')
+        self.current = tuple(current)
+
+    def candidate_scores(self, outputs):
+        scores, categories, unknown = super().candidate_scores(outputs)
+        leading = scores[..., :len(self.known_ids)].argmax(dim=-1, keepdim=True)
+        eligible = torch.isin(categories[leading], categories.new_tensor(self.current))
+        original = scores.gather(-1, leading)
+        scores.scatter_(-1, leading, torch.where(eligible, original * MULTIPLIER, original))
+        return scores, categories, unknown
+
+
+def summarize_views(report, prior, shared):
+    for arm in ('native', 'perturbed'):
+        baseline = prior['views'][arm]
+        view = report['views'][arm]
+        stats = {label: {k: v for k, v in row.items() if k != 'fp_sources'}
+                 for label, row in baseline['metrics']['current_class_stats'].items()}
+        if (view['metrics'] != dict(baseline['metrics'], current_class_stats=stats)
+                or view['matched'] != baseline['matched']
+                or any(views[arm] != prior['per_image'][image][arm] for image, views in report['per_image'].items())):
+            raise ValueError(f'Changed reference Top-50 or VOC metrics: {arm}')
+    metrics = {name: value['metrics'] for name, value in report['views'].items()}
+    fp = {name: sum(x['fp'] for x in row['current_class_stats'].values()) for name, row in metrics.items()}
+    native = report['views']['native']
+    comparisons = {}
+    for name in ('perturbed', 'selective'):
+        pair = dict(views=dict(native=native, perturbed=report['views'][name]),
+                    per_image={key: dict(native=value['native'], perturbed=value[name])
+                               for key, value in report['per_image'].items()})
+        comparisons[name] = summarize(pair, shared)
+    selected = comparisons['selective']
+    return dict(arms=comparisons, current_fp=fp,
+                open_metrics={name: {k: row[k] for k in OPEN_KEYS} for name, row in metrics.items()},
+                passed=selected['passed'] and fp['selective'] < fp['perturbed'])
+
+
+def main():
+    if torch.cuda.device_count() != 1 or torch.cuda.get_device_name() != 'NVIDIA GeForce RTX 3090':
+        raise ValueError('Use one RTX 3090')
+    previous = verified(FULL / 'comparison.json', OPEN_RESULT)
+    near = verified(NEAR / 'comparison.json', NEAR_RESULT)
+    if previous['status'] != 'complete' or near['status'] != 'complete':
+        raise ValueError('Missing completed full-annotation or geometry study')
+    base = verified(FULL / 'plan.json', previous['plan_sha256'])
+    source = verified(SOURCE / 'plan.json', base['parent_plan'])
+    reports = {name: dict(info, reference_sha256=file_sha256(FULL / f'{name}.json'))
+               for name, info in base['reports'].items()}
+    plan = dict(commit=subprocess.check_output(['git', 'rev-parse', 'HEAD'], text=True).strip(),
+                parent_plan=previous['plan_sha256'], parent_result=OPEN_RESULT, near_result=NEAR_RESULT,
+                batch_size=base['batch_size'], limit=base['max_detections'], multiplier=MULTIPLIER,
+                ap_tolerance=AP_TOLERANCE, reports=reports, paper_comparable=False)
+    pin(OUTPUT / 'plan.json', plan)
+    digest = file_sha256(OUTPUT / 'plan.json')
+    results = {}
+    for protocol, entry in source['protocols'].items():
+        manifest_path = MANIFESTS[protocol]
+        manifest = verified(manifest_path, entry['manifest_sha256'])
+        root = resolve_image_root(manifest_path, manifest)
+        checkpoint = Path(entry['endpoints']['finetune']['path'])
+        if file_sha256(checkpoint) != entry['endpoints']['finetune']['sha256']:
+            raise ValueError(f'Changed frozen checkpoint: {protocol}')
+        model, _ = load_detector(None, checkpoint, torch.device('cuda'))
+        model.eval()
+        known = entry['previous'] + entry['current']
+        if set(model.known_ids) != set(known):
+            raise ValueError(f'Changed active classes: {protocol}')
+        results[protocol] = {}
+        for fold, cohort in source['cohorts'].items():
+            label = f'{protocol}-{fold}'
+            info = reports[label]
+            full = FULL / info['file']
+            verified(full, info['sha256'])
+            annotation = cohort['by_protocol'][protocol]
+            released = SOURCE / annotation['file']
+            verified(released, annotation['sha256'])
+            pairs = verified(SOURCE / cohort['paired_file'], cohort['paired_sha256'])
+            path = OUTPUT / f'{label}.json'
+            if not path.exists():
+                print(f'Evaluating {protocol}/{fold} leading Current scores', flush=True)
+                dataset, loader = make_loader(root, released, plan['batch_size'], 2)
+                spec = dict(manifest['evaluation'], image_source_ids=cohort['order'])
+                post = LeadingCurrentScore(known, entry['current'], plan['limit'])
+                report = measure(model, dataset, loader, known, entry['previous'], entry['current'], spec,
+                                 plan['limit'], evaluation_coco=COCO(str(full)), extra_posts=dict(selective=post))
+                write_json(path, dict(plan_sha256=digest, **report))
+            report = read_json(path)
+            prior = verified(FULL / path.name, info['reference_sha256'])
+            if report['plan_sha256'] != digest or report['per_image'].keys() != prior['per_image'].keys():
+                raise ValueError(f'Changed replay plan or image set: {label}')
+            shared = {pair['annotation_ids'][protocol] for pair in pairs}
+            results[protocol][fold] = summarize_views(report, prior, shared)
+        del model
+    accepted = all(r['passed'] for folds in results.values() for r in folds.values())
+    write_json(OUTPUT / 'comparison.json', dict(status='complete', plan_sha256=digest, protocols=results,
+               accepted=accepted, paper_comparable=False))
+
+
+if __name__ == '__main__':
+    main()
