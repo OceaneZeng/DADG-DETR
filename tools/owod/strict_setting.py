@@ -42,7 +42,7 @@ def configure_run(args):
         raise ValueError('screen-author-eval requires a verified diagnostic training subset')
     localization = getattr(args, 'graph_localization', 'frozen')
     decoder_bbox_lr_mult = getattr(args, 'decoder_bbox_lr_mult', 1.)
-    opens_decoder = localization in ('decoder-bbox', 'decoder-bbox-increment-quality')
+    opens_decoder = localization in ('decoder-bbox', 'decoder-bbox-increment-quality', 'decoder-bbox-increment-encoder-ffn')
     if localization == 'decoder-bbox-increment-quality' and instance_mode == 'legacy':
         raise ValueError('Proposal quality training requires the instance proposal model')
     if (not 0 < decoder_bbox_lr_mult <= 1

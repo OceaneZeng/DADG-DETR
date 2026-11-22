@@ -74,8 +74,9 @@ def prepare(output=OUTPUT, *, variant='giou'):
             raise ValueError('Unexpected control loss, assignment cost, batch or seed')
         cmd = list(baseline)
         cmd[cmd.index('--output_dir')+1] = str(output/phase)
-        if variant == 'proposal-quality':
-            cmd[cmd.index('--graph-localization') + 1] = 'decoder-bbox-increment-quality'
+        if variant in ('proposal-quality', 'encoder-ffn'):
+            policy = 'quality' if variant == 'proposal-quality' else 'encoder-ffn'
+            cmd[cmd.index('--graph-localization') + 1] = 'decoder-bbox-increment-' + policy
         elif phase == 'increment' and variant not in ('tail-positives', 'alternate-images'):
             increment_flags = {'classifier-lr': ['--class_embed_lr_mult', '2'], 'giou': ['--giou_loss_coef', '4'],
                                'no-random-crop': ['--no-random-crop']}
@@ -136,6 +137,9 @@ def prepare(output=OUTPUT, *, variant='giou'):
     if variant == 'alternate-images':
         from tools.owod.s_task2_alternate_images import configure_pool
         second_pool = configure_pool(plan, output, MANIFEST, SCREEN, screening)
+    if variant == 'encoder-ffn':
+        from tools.owod.s_task2_encoder_ffn import register_evidence
+        register_evidence(plan, output, CHECKPOINT)
     pin(output/'plan.json', plan)
     if variant == 'alternate-images':
         write_json(output/'pool-b.json', second_pool)
@@ -153,12 +157,13 @@ def evaluate_heldout(model, dataset, loader, manifest, order, *, proxies, fp_sou
                           include_current_stats=True, print_freq=64, rank_observer=rank_observer)
 
 
-def evaluate(name, checkpoint, plan, dataset, loader, manifest, order, *, proxies, output=OUTPUT, fp_sources=False):
-    path = output/f'{name}-heldout.json'
+def evaluate(name, checkpoint, plan, dataset, loader, manifest, order, *, proxies, output=OUTPUT, fp_sources=False,
+             result_path=None):
+    path = result_path if result_path is not None else output/f'{name}-heldout.json'
     digest = file_sha256(checkpoint)
     plan_hash = file_sha256(output/'plan.json')
     if not path.exists():
-        print(f'Evaluating {name} on 1024 held-out images', flush=True)
+        print(f'Evaluating {name} on {len(order)} images', flush=True)
         model, _ = load_detector(None, checkpoint, torch.device('cuda'))
         views = evaluate_heldout(model, dataset, loader, manifest, order, proxies=proxies, fp_sources=fp_sources)
         write_json(path, dict(checkpoint_sha256=digest, plan_sha256=plan_hash, views=views))
@@ -171,6 +176,8 @@ def evaluate(name, checkpoint, plan, dataset, loader, manifest, order, *, proxie
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     options = parser.add_mutually_exclusive_group()
+    options.add_argument('--encoder-ffn', dest='variant', action='store_const', const='encoder-ffn',
+                         help='Train the final encoder feed-forward projections in increment')
     options.add_argument('--alternate-images', dest='variant', action='store_const', const='alternate-images',
                          help='Use a matched, disjoint pool in increment epoch two at the original step budget')
     options.add_argument('--tail-positives', dest='variant', action='store_const', const='tail-positives',
@@ -238,6 +245,11 @@ def main():
                 report['proposal_coverage'] = compare_shortlist(path, output, loader, manifest, plan)
             elif head_digest != report['phases']['increment']['quality_sha256']:
                 raise ValueError('Balanced finetuning changed the frozen proposal quality head')
+        if variant == 'encoder-ffn':
+            from tools.owod.s_task2_encoder_ffn import check_encoder, evaluate_training_pool
+            check_encoder(path, phase, plan, report)
+            if phase == 'increment':
+                report['training_pool'] = evaluate_training_pool(path, plan, output, manifest)
         write_json(output/'progress.json', report)
     control = evaluate('control-finetune', Path(plan['control']['finetune']['path']), plan, ds, loader, manifest, order,
                        proxies=True, output=output)
@@ -246,7 +258,7 @@ def main():
     delta = report['phases']['finetune']['delta']
     folds, known_pass, open_pass = paired_gates(views, control, delta)
     report.update(status='complete', proxy_deltas=folds, known_pass=known_pass, open_pass=open_pass, follow_up=known_pass and open_pass)
-    if variant in ('tail-positives', 'alternate-images'):
+    if variant in ('tail-positives', 'alternate-images', 'encoder-ffn'):
         ann = Path(plan['independent_annotation'])
         independent_order = [im['owod_source_id'] for im in read_json(ann)['images']]
         if (sha256('\n'.join(independent_order).encode()).hexdigest() != plan['independent_order_sha256']
