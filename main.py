@@ -119,6 +119,8 @@ def get_args_parser():
     parser.add_argument('--instance-cache', default='', help='Shared frozen-parent retrieval cache')
     parser.add_argument('--screen-author-eval', action='store_true',
                         help='Evaluate a diagnostic training subset on the full author test set')
+    parser.add_argument('--screen-small-box-extent', action='store_true',
+                        help='Supervise neighboring width and height on released small boxes in Task 1 screening')
     parser.add_argument('--owod-screening', default='',
                         help='Verified training-only diagnostic selection; not an official benchmark run')
     parser.add_argument('--screen-branch-checkpoint', default='',

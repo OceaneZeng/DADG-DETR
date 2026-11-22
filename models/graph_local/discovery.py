@@ -317,10 +317,14 @@ class DiscoveryCriterion(nn.Module):
         self.instance_mode = getattr(args, 'instance_mode', 'legacy')
         self.instance_targets = {}
         self.train_instance_projection = getattr(args, 'owod_stage', 0) == 0
+        self.supervise_small_box_extent = getattr(args, 'screen_small_box_extent', False)
         if self.instance_mode != 'legacy':
             from .instance_transfer import SETTINGS
             self.weight_dict.update(loss_geometry=1., loss_instance_class=.2,
                                     loss_instance_view=.2, loss_instance_align=SETTINGS['alignment_weight'])
+        if self.supervise_small_box_extent:
+            from .instance_proposals import SMALL_BOX_EXTENT_WEIGHT
+            self.weight_dict['loss_small_box_extent'] = SMALL_BOX_EXTENT_WEIGHT
         self.epoch = 0
         self.pseudo_epoch_offset = getattr(args, 'discovery_pseudo_epoch_offset', 0)
         self.evidence = None
@@ -337,6 +341,8 @@ class DiscoveryCriterion(nn.Module):
             filtered = {**target, 'labels': target['labels'][keep], 'boxes': target['boxes'][keep]}
             if 'source_objects' in target:
                 filtered['source_objects'] = target['source_objects'][keep]
+            if self.supervise_small_box_extent:
+                filtered['source_box_area'] = target['source_box_area'][keep]
             released.append(filtered)
         targets = released
         indices = self.matcher(outputs, targets)
@@ -438,7 +444,7 @@ class DiscoveryCriterion(nn.Module):
             consistency = ((feature_cost + box_cost) * confidence).sum() / confidence.sum().clamp_min(1)
         losses['loss_discovery_consistency'] = consistency * pseudo_scale if self.pseudo_ramp_epochs else consistency
         if self.instance_mode != 'legacy':
-            from .instance_proposals import geometry_loss
+            from .instance_proposals import geometry_losses
             from .instance_transfer import alignment_loss
             z = outputs['instance_features']
             scores = outputs['instance_logits'][positive][:, self.known_ids]
@@ -446,7 +452,8 @@ class DiscoveryCriterion(nn.Module):
             columns = (labels[:, None] == labels.new_tensor(self.known_ids)).long().argmax(-1)
             losses['loss_instance_class'] = (F.cross_entropy(scores, columns) if len(labels) and self.train_instance_projection
                                              else scores.sum()*0)
-            losses['loss_geometry'] = geometry_loss(outputs['geometry'], targets)
+            losses.update(geometry_losses(outputs['geometry'], targets,
+                                          supervise_extent=self.supervise_small_box_extent))
             if len(labels):
                 from .instance_transfer import paired_iou
                 gt_boxes = torch.cat([t['boxes'][g] for t, (_,g) in zip(targets, indices)])

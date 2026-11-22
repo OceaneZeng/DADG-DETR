@@ -8,6 +8,9 @@ from torchvision.ops import nms
 from util.box_ops import box_cxcywh_to_xyxy
 
 
+SMALL_BOX_EXTENT_WEIGHT = 0.1
+
+
 def select_encoder_cells(boxes, valid_ids, scores, quota, shortlist_multiplier=12):
     pool = valid_ids[scores[valid_ids].topk(min(len(valid_ids), quota * shortlist_multiplier)).indices]
     keep = nms(box_cxcywh_to_xyxy(boxes[pool]).float(), scores[pool].float(), 0.6)[:quota]
@@ -142,17 +145,40 @@ class InstanceProposals(nn.Module):
         return self.logits(stacked[row, q, level_ids], boxes)
 
 
+def anchor_distance(gt, anchors):
+    scale = gt[..., 2:].clamp_min(0.01)
+    center = ((gt[..., :2] - anchors[..., :2]) / scale).abs().sum(-1)
+    extent = (scale.log() - anchors[..., 2:].log()).abs().sum(-1)
+    return center + 0.5 * extent
+
+
 def nearby_anchor_ids(gt, anchors, valid_ids):
     """Select the anchor cells used for each released target's geometry supervision."""
-    scale = gt[:, 2:].clamp_min(0.01)
-    distance = ((gt[:, None, :2] - anchors[None, :, :2]) / scale[:, None]).abs().sum(-1)
-    distance += 0.5 * (scale.log()[:, None] - anchors[None, :, 2:].log()).abs().sum(-1)
+    distance = anchor_distance(gt[:, None], anchors[None])
     return valid_ids[distance[:, valid_ids].topk(min(16, len(valid_ids)), largest=False).indices]
 
 
-def geometry_loss(state, targets):
+def small_box_extent_loss(gt, source_area, anchors, near, pred):
+    small = torch.where(source_area < 32**2)[0]
+    cells = near[small, :4]
+    target_ids = small[:, None].expand_as(cells).flatten()
+    cells = cells.flatten()
+    # A shared cell gets one size target. Stable ties use the earlier annotation.
+    distance_order = torch.argsort(anchor_distance(gt[target_ids], anchors[cells]), stable=True)
+    cell_order = distance_order[torch.argsort(cells[distance_order], stable=True)]
+    sorted_cells = cells[cell_order]
+    first = torch.ones_like(sorted_cells, dtype=torch.bool)
+    first[1:] = sorted_cells[1:] != sorted_cells[:-1]
+    keep = cell_order[first]
+    expected = gt[target_ids[keep], 2:].float().clamp_min(1e-6)
+    observed = pred[small, :4, 2:].reshape(-1, 2)[keep].float().clamp_min(1e-6)
+    return F.smooth_l1_loss(observed.log(), expected.log(), reduction="sum")
+
+
+def geometry_losses(state, targets, *, supervise_extent=False):
     # Only released boxes supervise geometry. Sample close and offset anchors for quality.
     loss = state["boxes"].sum() * 0 + state["logits"].sum() * 0
+    extent_loss = state["boxes"].new_zeros(())
     count = 0
     for row, target in enumerate(targets):
         gt = target["boxes"]
@@ -177,5 +203,10 @@ def geometry_loss(state, targets):
             .mean(-1)
             .sum()
         )
+        if supervise_extent:
+            extent_loss = extent_loss + small_box_extent_loss(gt, target["source_box_area"], anchors, near, pred)
         count += len(gt)
-    return loss / max(count, 1)
+    losses = {"loss_geometry": loss / max(count, 1)}
+    if supervise_extent:
+        losses["loss_small_box_extent"] = extent_loss / max(count, 1)
+    return losses
