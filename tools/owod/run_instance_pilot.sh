@@ -60,7 +60,7 @@ if [[ ${1:-} == --s-task2-wi-sources || ${1:-} == --task2-old-only-independent |
     module=tools.owod.run_s_task2_finetune_half_lr
     flags=(--double-old-boxes)
   elif [[ $1 == --task1-m-s-small-box-geometry ]]; then
-    dir=output/task1-m-s-small-box-geometry
+    dir=output/task1-m-s-small-box-geometry-replay
     module=tools.owod.probe_task1_m_s_small_box_geometry
   elif [[ $1 == --task1-m-s-paired-discovery ]]; then
     dir=output/task1-m-s-paired-discovery

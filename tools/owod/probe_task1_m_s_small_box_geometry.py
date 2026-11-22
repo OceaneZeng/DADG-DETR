@@ -21,7 +21,7 @@ from tools.owod.run_s_task1_input_scale import valid_annotations
 from tools.owod.screening_data import subset, write_json
 
 
-OUTPUT = SOURCE.with_name('task1-m-s-small-box-geometry')
+OUTPUT = SOURCE.with_name('task1-m-s-small-box-geometry-replay')
 SOURCE_FILES = json.loads("{\"comparison.json\":\"1ca1175febb2e53cf6206024b74ebe817f33944123e2daaa5753dbba9da4eb06\",\"first-annotations.json\":\"640756b275954c84a8f89121166ded54a553f1a2055165800e0abce776374530\",\"second-annotations.json\":\"8bc8abd1483991915ba8aa78437724db2bb21b605f5bc02ae3baf9315dbc1b41\",\"m-owodb-first.json\":\"d01f3b6e90b84131ebef2b19e91eb29d25f7414b9208d239807e8576875a9946\",\"m-owodb-second.json\":\"05cf4b69309d9e7a74d23a9c73d5e06f44ac0aa811ba7fcf3f884a8a7d5112ac\",\"s-owodb-first.json\":\"97365f9a0cb023b69bd71e1dbb10f98469f7a4acd1ab8abcf00d8cb0b3012920\",\"s-owodb-second.json\":\"3060243c463c235cee9135c23212accf34d8ef56ce2696db0109c9691f6c0a42\"}")
 EXPECTED = {'first': 151, 'second': 434}
 CRITERION = (
@@ -52,7 +52,7 @@ def prepare():
         arm = [source[f'{p}-{name}.json'] for p in source_plan['parents']]
         if any(row['plan_sha256'] != source_sha for row in arm):
             raise ValueError(f'Changed paired source plan: {name}')
-        missed = set.intersection(*({r['annotation_id'] for r in a['rows'] if not r['coverage']['dense']}
+        missed = set.intersection(*({r['annotation_id'] for r in a['rows'] if r['missed_group'] == 'no_dense'}
                                     for a in arm))
         payload = source[f'{name}-annotations.json']
         selected = {a['id']: a for a in payload['annotations'] if a['id'] in missed and a['bbox'][2]*a['bbox'][3] < 32**2}
