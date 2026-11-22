@@ -30,13 +30,13 @@ BOX_REPORT_SHAS = {
     'm-owodb': 'a5d09197a68df4ad79d7207696c3c7405aa108a4b1365ada55aa2cb13c07ff63',
     's-owodb': 'c963148291c8d2c65769d1d9f316abfd33a12c0f2c1a0bc0425de61e369ae1dd',
 }
-BOX_TRACE = BOX_MISSES.with_name('task2-m-s-current-low-iou-box-trace')
+BOX_TRACE = BOX_MISSES.with_name('task2-m-s-current-low-iou-box-layer-trace')
 BOX_MISSES_SHA = 'be91805b17a2aa56a7dda7f1048182c8bb6075a2d875ce40a5c33ec6692c8a87'
 BOX_MISS_REPORTS = {
     'm-owodb-first': '28067dd7a3ffc4510abca578abf567eaccee56ffc5274f0bebdcc5b0246c30b6',
     'm-owodb-second': '225fa57bc9cdd1fea299c56eada661d47b6387d63068c9c958619ae0e3d0913a',
     's-owodb-first': 'c7978cd3829bea87b474943d9b0f6d2bab445b98f9b33f3239ffda3a53b0a43b',
-    's-owodb-second': '50a939bc98b413c29d05b43ace56cf1bd0510e1a1df2a440860ef770a595673',
+    's-owodb-second': '50a939bc98b413c29d05b43ace56cf1bdc0510e1a1df2a440860ef770a595673',
 }
 MISSES_SHA = 'c0dd63960c62b950e7ae1ecd0c4ffc0ada7e03a77306df125487851e665a4786'
 MISS_REPORTS = {
