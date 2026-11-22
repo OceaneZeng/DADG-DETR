@@ -7,6 +7,8 @@ from tools.owod.protocol import (file_sha256, resolve_image_root, stage_files,
 
 
 def configure_run(args):
+    if getattr(args, 'task2_refill_same_class_overlap', False) and not getattr(args, 'task2_protected_refill', False):
+        raise ValueError('Same-class overlap requires Task 2 protected refill')
     if getattr(args, 'task2_protected_refill', False) and not (
             args.owod_manifest and args.owod_discovery and args.owod_stage == 1
             and args.owod_phase == 'finetune' and args.discovery_scoring == 'focal'
@@ -256,6 +258,8 @@ def validate_checkpoint(args, checkpoint, resume=False):
     if resume:
         if getattr(saved, 'task2_protected_refill', False) != getattr(args, 'task2_protected_refill', False):
             raise ValueError('Cannot change Task 2 protected refill on resume')
+        if getattr(saved, 'task2_refill_same_class_overlap', False) != getattr(args, 'task2_refill_same_class_overlap', False):
+            raise ValueError('Cannot change Task 2 refill same-class overlap on resume')
         if getattr(saved, 'screen_tail_positive_ids', None) != getattr(args, 'screen_tail_positive_ids', None):
             raise ValueError('Cannot change the weighted increment class set on resume')
         if getattr(saved, 'screen_double_current_positives', False) != getattr(args, 'screen_double_current_positives', False):

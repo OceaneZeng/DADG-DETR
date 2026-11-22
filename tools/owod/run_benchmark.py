@@ -59,6 +59,9 @@ def build_plan(args):
     image_root = resolve_image_root(args.manifest, manifest)
     method = getattr(args, 'method', 'control')
     protected_refill = getattr(args, 'task2_protected_refill', False)
+    refill_same_class_overlap = getattr(args, 'task2_refill_same_class_overlap', False)
+    if refill_same_class_overlap and not protected_refill:
+        raise ValueError('Same-class overlap requires --task2-protected-refill')
     if protected_refill and (
             method != 'discovery' or args.recipe != 'ow-detr-paper' or task1_only
             or getattr(args, 'discovery_scoring', 'hierarchical') != 'focal'):
@@ -216,6 +219,8 @@ def build_plan(args):
                 command += ['--owod-discovery', '--discovery-scoring', getattr(args, 'discovery_scoring', 'hierarchical')]
                 if protected_refill and stage == 1 and phase == 'finetune':
                     command += ['--task2-protected-refill']
+                    if refill_same_class_overlap:
+                        command += ['--task2-refill-same-class-overlap']
                 # Keep legacy v5 command lists identical, including resume plans.
                 if ramp_epochs:
                     command += ['--discovery-pseudo-ramp-epochs', str(ramp_epochs)]
@@ -318,6 +323,8 @@ def get_args_parser():
     parser.add_argument('--discovery-scoring', choices=('hierarchical', 'focal'), default='hierarchical')
     parser.add_argument('--task2-protected-refill', action='store_true',
                         help='Enable protected unknown refill in Task 2 finetune evaluation')
+    parser.add_argument('--task2-refill-same-class-overlap', action='store_true',
+                        help='Require a retained same-class box with IoU >= 0.70 before protected refill')
     parser.add_argument('--discovery-pseudo-ramp-epochs', type=int, default=0,
                         help='Experimental v6 pseudo loss ramp after warmup; default 0 keeps v5')
     parser.add_argument('--discovery-objectness-loss', choices=('balanced-bce', 'focal'), default='balanced-bce')

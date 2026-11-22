@@ -186,6 +186,8 @@ def get_args_parser():
     parser.add_argument('--discovery-scoring', choices=('hierarchical', 'focal'), default='hierarchical')
     parser.add_argument('--task2-protected-refill', action='store_true',
                         help='Use one repeated Previous detection slot for unknown discovery in Task 2 finetune evaluation')
+    parser.add_argument('--task2-refill-same-class-overlap', action='store_true',
+                        help='Require a retained same-class box with IoU >= 0.70 before protected refill')
     parser.add_argument('--graph-sketch-max-images', type=int, default=12)
     parser.add_argument('--owod-discovery', action='store_true')
     parser.add_argument('--discovery-no-message', action='store_true',

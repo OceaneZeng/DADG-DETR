@@ -601,7 +601,9 @@ def build_discovery_postprocessor(args):
         unknown_threshold=args.unknown_threshold,
         scoring=getattr(args, 'discovery_scoring', 'hierarchical'))
     if getattr(args, 'task2_protected_refill', False):
-        return UnknownRefillScore(protected_ids=args.owod_current_class_ids, **options)
+        min_same_class_iou = .70 if getattr(args, 'task2_refill_same_class_overlap', False) else None
+        return UnknownRefillScore(protected_ids=args.owod_current_class_ids,
+                                  min_same_class_iou=min_same_class_iou, **options)
     return DiscoveryPostProcess(**options)
 
 
