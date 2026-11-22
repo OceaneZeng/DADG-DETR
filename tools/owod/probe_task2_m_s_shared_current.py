@@ -21,6 +21,8 @@ from tools.owod.screening_data import screening_files, select_images, source_ids
 OUTPUT = Path('output/task2-m-s-shared-current')
 FOLDS = {'first': 62, 'second': 63}
 IMAGES_PER_FOLD = 1024
+POOL_IMAGES = 4096
+POOL_SEED = 64
 BATCH = 2
 PHASES = {'increment': 3, 'finetune': 1}
 ENDPOINTS = {
@@ -110,18 +112,32 @@ def prepare():
     mr, sr = (registered[p][1] for p in (m, s))
     matches = {key for key in mr.keys() & sr.keys() if mr[key] is not None and sr[key] is not None}
     names_with_matches = {key[0] for key in matches}
-    # Use the matching objects to guarantee positive coverage for every shared class.
+    # Only sample sources that have an exact shared target in both protocols.
     pool = dict(images=[im for name, im in registered[m][0].items() if name in names_with_matches],
                 annotations=[mr[key] for key in sorted(matches)])
+    candidate_names = select_images(pool, POOL_IMAGES, sorted(shared), POOL_SEED)
+    full = {}
+    coverage_pool = dict(images=[im for im in pool['images'] if im['owod_source_id'] in candidate_names],
+                         annotations=[])
+    image_ids = {im['owod_source_id']: im['id'] for im in coverage_pool['images']}
+    coverage_classes = []
+    for role, (protocol, manifest) in enumerate(manifests.items()):
+        training_names = set(manifest['splits']['t1_train']) | set(manifest['splits']['t2_train'])
+        full[protocol] = raw_evaluation_source(protocol, manifest, training_names - candidate_names)
+        offset = 100 * role
+        names_by_id = {im['id']: im['owod_source_id'] for im in full[protocol]['images']}
+        active = specs[protocol]['previous'] + specs[protocol]['current']
+        coverage_classes.extend(offset + c for c in active)
+        coverage_pool['annotations'].extend(
+            dict(image_id=image_ids[names_by_id[row['image_id']]], category_id=offset + row['category_id'],
+                 bbox=row['bbox'])
+            for row in full[protocol]['annotations'] if not row.get('difficult')
+        )
     used, selections = set(), {}
     for fold, seed in FOLDS.items():
-        names = select_images(pool, IMAGES_PER_FOLD, sorted(shared), seed, excluded=used)
+        names = select_images(coverage_pool, IMAGES_PER_FOLD, coverage_classes, seed, excluded=used)
         selections[fold] = sorted(names)
         used.update(names)
-    full = {}
-    for protocol, manifest in manifests.items():
-        training_names = set(manifest['splits']['t1_train']) | set(manifest['splits']['t2_train'])
-        full[protocol] = raw_evaluation_source(protocol, manifest, training_names - used)
 
     cohorts, assets = {}, {}
     for fold, order in selections.items():
@@ -140,10 +156,11 @@ def prepare():
             active = set(spec['previous'] + spec['current'])
             payload = subset(full[protocol], names, active)
             _, raw_rows = register(payload, names, shared)
-            if (source_ids(payload) != names or
-                    {r['category_id'] for r in payload['annotations'] if not r.get('difficult')} != active
-                    or any(raw_rows.get(key) is None for key in common_keys)):
-                raise ValueError(f'Missing released annotations: {protocol}/{fold}')
+            present = {r['category_id'] for r in payload['annotations'] if not r.get('difficult')}
+            unpaired = sum(raw_rows.get(key) is None for key in common_keys)
+            if source_ids(payload) != names or present != active or unpaired:
+                raise ValueError(f'Incomplete {protocol}/{fold}: missing classes={sorted(active - present)}, '
+                                 f'unpaired targets={unpaired}')
             pair_rows[protocol] = [raw_rows[key]['id'] for key in common_keys]
             path = OUTPUT / f'{protocol}-{fold}-annotations.json'
             assets[path] = payload
@@ -159,7 +176,8 @@ def prepare():
     plan = dict(commit=subprocess.check_output(['git', 'rev-parse', 'HEAD'], text=True).strip(),
                 protocols=specs, shared_classes=sorted(shared), cohorts=cohorts, exclusions=exclusions,
                 excluded_ids_sha256=sha256('\n'.join(sorted(blocked)).encode()).hexdigest(),
-                seeds=FOLDS, batch_size=BATCH, paper_comparable=False, scoring='focal', max_detections=50,
+                seeds=FOLDS, candidate_pool=dict(seed=POOL_SEED, images=POOL_IMAGES),
+                batch_size=BATCH, paper_comparable=False, scoring='focal', max_detections=50,
                 gpu=torch.cuda.get_device_name(), torch_version=str(torch.__version__))
     pin(OUTPUT / 'plan.json', plan)
     for path, value in assets.items():
