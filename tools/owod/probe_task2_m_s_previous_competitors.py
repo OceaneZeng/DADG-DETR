@@ -16,6 +16,7 @@ from tools.owod.probe_task1_paired_discovery import verified
 from tools.owod.probe_task2_m_s_previous_hard_negative_misses import SCORES
 from tools.owod.run_cross_attention_study import pin
 from tools.owod.protocol import file_sha256, read_json
+from tools.owod.run_s_task1_proposal_stages import stage_boxes
 from tools.owod.run_task2_m_s_previous_hard_negatives import OUTPUT as TRAINING
 from tools.owod.screening_data import write_json
 from tools.owod.strict_setting import configure_run
@@ -25,6 +26,12 @@ from util.misc import collate_fn
 
 OUTPUT = TRAINING.with_name('task2-m-s-previous-competitor-training-probe')
 RANK_OUTPUT = TRAINING.with_name('task2-m-s-current-training-ranks')
+GEOMETRY_OUTPUT = TRAINING.with_name('task2-m-s-current-training-geometry')
+RANK_RESULT_SHA = '7289dad0db6d10e0400505b962e63971dce7f2695bb3452a2bb490abbbcabb3e'
+RANK_REPORTS = {
+    'm-owodb': '7363bc270fe0156a7aeabfa66b0eec5bc0b68fdabf75e855b41047d6d262c6c7',
+    's-owodb': '1ccea3d66f97ee9d3c78c0852b1d9aa89b9c4e1d8e5869996f8d33d18fcddb0f',
+}
 COMPETITOR_SHA = '7138a048c637626791f9ab8ee55d5edc7f821517f3ea1e12d69873481491f04e'
 SCORE_SHA = '03a17968abd29ece715bc40410166689bc832a23b2b614dcf3b9a4f19b8fb244'
 TRAIN_PLAN_SHA = '9b44fe67f57833d067c1534381695ee09cd93ed98691cf123ba942d518fa7c83'
@@ -106,7 +113,7 @@ def current_annotation_ranks(scores, boxes, target, matches, known, previous_cou
     return rows
 
 
-def prepare(rank_analysis):
+def prepare(rank_analysis, geometry_analysis):
     evidence = verified(SCORES / 'comparison.json', SCORE_SHA)
     source = verified(TRAINING / 'plan.json', TRAIN_PLAN_SHA)
     if evidence['status'] != 'complete' or evidence['preferred'] != ['class_probability']:
@@ -146,12 +153,44 @@ def prepare(rank_analysis):
         plan.update(competitor_result_sha256=COMPETITOR_SHA, competitor_plan_sha256=reference['plan_sha256'],
                     observation='current GT coverage, assigned query IoU and best compatible true-class score rank',
                     decision='Prefer geometry or ranking only if it accounts for at least half of the missing current annotations in both protocols.')
+    if geometry_analysis:
+        output = GEOMETRY_OUTPUT
+        reference = verified(RANK_OUTPUT / 'comparison.json', RANK_RESULT_SHA)
+        prior = verified(RANK_OUTPUT / 'plan.json', reference['plan_sha256'])
+        if reference['preferred'] != ['geometry'] or prior['jobs'] != jobs:
+            raise ValueError('Expected the frozen geometry misses from the same training images')
+        plan.update(rank_result_sha256=RANK_RESULT_SHA, rank_report_shas=RANK_REPORTS,
+                    observation='all final geometry misses, first encoder coverage gap, all decoder layers',
+                    decision='Prioritize a stage family if it accounts for at least half of final geometry misses in both protocols.')
     pin(output / 'plan.json', plan)
     return plan, datasets
 
 
 @torch.inference_mode()
-def probe(protocol, job, dataset, rank_analysis):
+def proposal_coverage(outputs, image, target, expected, current):
+    previous = expected['current_annotations']
+    labels = target['labels'].tolist()
+    if [(idx, label) for idx, label in enumerate(labels) if label in current] != [
+            (row['target'], row['category']) for row in previous]:
+        raise ValueError(f'Current target order changed for image {expected["image"]}')
+    missing = [r for r in previous if r['best_rank'] is None]
+    truth = box_cxcywh_to_xyxy(target['boxes'][[r['target'] for r in missing]])
+    coverage = {}
+    if missing:
+        for stage, boxes in stage_boxes(outputs, image).items():
+            ious, _ = box_iou(box_cxcywh_to_xyxy(boxes), truth)
+            coverage[stage] = (ious > IOU).any(0).tolist()
+    rows = []
+    for index, item in enumerate(missing):
+        flags = {stage: values[index] for stage, values in coverage.items()}
+        if flags['final'] or (flags['shortlist'] and not flags['dense']) or (flags['selected'] and not flags['shortlist']):
+            raise ValueError(f'Inconsistent native proposal coverage: {expected["image"]}/{item["target"]}')
+        first_gap = next((stage for stage in ('dense', 'shortlist', 'selected') if not flags[stage]), 'decoder')
+        rows.append(dict(target=item['target'], category=item['category'], stages=flags, first_gap=first_gap))
+    return rows
+
+
+def probe(protocol, job, dataset, rank_analysis, geometry_reference=None):
     model, criterion = load_detector(None, Path(job['checkpoint']['path']), DEVICE)
     model.eval()
     base = criterion.base
@@ -171,18 +210,23 @@ def probe(protocol, job, dataset, rank_analysis):
         if any(not bool(torch.isin(t['labels'], classes).all()) for t in targets):
             raise ValueError(f'Unreleased target supervision: {protocol}')
         outputs = model(samples.to(DEVICE))
-        scores, _, _ = post.candidate_scores(outputs)
-        matches = base.matcher(outputs, targets)
+        if geometry_reference is None:
+            scores, _, _ = post.candidate_scores(outputs)
+            matches = base.matcher(outputs, targets)
         boxes = outputs['pred_boxes']
         if not rank_analysis:
             original_mask = base.previous_hard_negative_mask(outputs['pred_logits'][..., known], boxes, targets, matches, None)
-        for i, (target, pair) in enumerate(zip(targets, matches, strict=True)):
+        for i, target in enumerate(targets):
             image = int(target['image_id'])
-            if rank_analysis:
-                measured = current_annotation_ranks(scores[i], boxes[i], target, pair, known, len(job['previous']))
+            if geometry_reference is not None:
+                coverage = proposal_coverage(outputs, i, target, geometry_reference[image], job['current'])
+                rows.append(dict(image=image, geometry_misses=coverage))
+            elif rank_analysis:
+                measured = current_annotation_ranks(scores[i], boxes[i], target, matches[i],
+                                                   known, len(job['previous']))
                 rows.append(dict(image=image, current_annotations=measured))
             else:
-                result = select_old_negatives(scores[i], boxes[i], target, pair, classes, len(job['previous']))
+                result = select_old_negatives(scores[i], boxes[i], target, matches[i], classes, len(job['previous']))
                 rows.append(dict(image=image, original_old_terms=int(original_mask[i].sum()), **result))
         if step % 32 == 0 or step == len(loader):
             print(f'Inference {step}/{len(loader)} batches, {len(rows)} training images', flush=True)
@@ -212,17 +256,36 @@ def summarize_ranks(rows):
                 matched_query_rank=dict(assigned))
 
 
-def main(rank_analysis=False):
-    output = RANK_OUTPUT if rank_analysis else OUTPUT
-    plan, datasets = prepare(rank_analysis)
+def summarize_geometry(rows, reference):
+    misses = [target for row in rows for target in row['geometry_misses']]
+    expected = sum(target['best_rank'] is None for row in reference.values() for target in row['current_annotations'])
+    if len(misses) != expected:
+        raise ValueError('Expected every final geometry miss in the stage trace')
+    stages = Counter(stage for target in misses for stage, present in target['stages'].items() if present)
+    return dict(images=len(rows), geometry_misses=len(misses), stage_coverage=dict(stages),
+                first_gap=dict(Counter(target['first_gap'] for target in misses)))
+
+
+def main(rank_analysis=False, geometry_analysis=False):
+    output = GEOMETRY_OUTPUT if geometry_analysis else RANK_OUTPUT if rank_analysis else OUTPUT
+    plan, datasets = prepare(rank_analysis, geometry_analysis)
     digest = file_sha256(output / 'plan.json')
     protocols = {}
     for protocol, job in plan['jobs'].items():
         marker = output / f'{protocol}.json'
         if not marker.exists():
             print(f'Evaluating {protocol} balanced finetune training images', flush=True)
-            rows = probe(protocol, job, datasets[protocol], rank_analysis)
-            counts = summarize_ranks(rows) if rank_analysis else dict(
+            reference = None
+            if geometry_analysis:
+                frozen = verified(RANK_OUTPUT / marker.name, RANK_REPORTS[protocol])
+                reference = {row['image']: row for row in frozen['rows']}
+            rows = probe(protocol, job, datasets[protocol], rank_analysis, reference)
+            if geometry_analysis:
+                counts = summarize_geometry(rows, reference)
+            elif rank_analysis:
+                counts = summarize_ranks(rows)
+            else:
+                counts = dict(
                           images=len(rows), images_near=sum(r['near_current'] > 0 for r in rows),
                           images_admitted=sum(r['admitted_current'] > 0 for r in rows),
                           matches_admitted=sum(r['admitted_current'] for r in rows),
@@ -234,7 +297,11 @@ def main(rank_analysis=False):
             raise ValueError(f'Unexpected report: {protocol}')
         protocols[protocol] = report['counts']
     final = dict(status='complete', plan_sha256=digest, protocols=protocols)
-    if rank_analysis:
+    if geometry_analysis:
+        final['preferred'] = [stage for stage in ('dense', 'shortlist', 'selected', 'decoder')
+                              if all(row['first_gap'].get(stage, 0) * 2 >= row['geometry_misses']
+                                     for row in protocols.values())]
+    elif rank_analysis:
         geometry_majority, rank_majority = [], []
         for rows in protocols.values():
             best = rows['best_compatible_rank']
@@ -251,5 +318,8 @@ def main(rank_analysis=False):
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--current-ranks', action='store_true')
-    main(parser.parse_args().current_ranks)
+    modes = parser.add_mutually_exclusive_group()
+    modes.add_argument('--current-ranks', action='store_true')
+    modes.add_argument('--current-geometry', action='store_true')
+    args = parser.parse_args()
+    main(args.current_ranks or args.current_geometry, args.current_geometry)
