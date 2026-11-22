@@ -66,8 +66,12 @@ def current_fp_sources(label, items, order, gt, tp, fp, recall, specification):
     confused_with = defaultdict(int)
     track_unresolved_unknown = specification.get('diagnostic_unresolved_unknown_overlap', False)
     track_residual_overlap = specification.get('diagnostic_residual_overlap', False)
+    track_near_target = specification.get('diagnostic_near_target_geometry', False)
     unresolved_unknown_overlap = 0
     residual = dict(zero=0, positive_below_point_one=0, at_least_point_one=0, difficult_high_overlap=0)
+    near = dict(same_class=0, other_released_class=0, unreleased_class=0,
+                below_point_three=0, at_least_point_three=0,
+                center_only=0, extent_only=0, both=0, neither=0)
     threshold = specification['iou_threshold']
     for rank in fp_ranks:
         _, image_id, box = items[order[rank]]
@@ -94,13 +98,31 @@ def current_fp_sources(label, items, order, gt, tp, fp, recall, specification):
                 high_unknown = (overlaps(box, unknown) > threshold).any()
                 unresolved_unknown_overlap += int(high_unknown)
                 if track_residual_overlap and not high_unknown:
-                    positive = [b for annotations in objects.values() for b, difficult in annotations if not difficult]
+                    positive = [(category, b) for category, annotations in objects.items()
+                                for b, difficult in annotations if not difficult]
                     ignored = [b for annotations in objects.values() for b, difficult in annotations if difficult]
-                    best = overlaps(box, positive).max(initial=0.)
+                    ious = overlaps(box, [b for _, b in positive])
+                    best = ious.max(initial=0.)
                     band = ('at_least_point_one' if best >= .1 else
                             'positive_below_point_one' if best > 0. else 'zero')
                     residual[band] += 1
                     residual['difficult_high_overlap'] += int((overlaps(box, ignored) > threshold).any())
+                    if track_near_target and best >= .1:
+                        category, target = positive[int(ious.argmax())]
+                        role = ('same_class' if category == label else
+                                'unreleased_class' if category == -1 else 'other_released_class')
+                        near[role] += 1
+                        near['at_least_point_three' if best >= .3 else 'below_point_three'] += 1
+                        target = np.asarray(target)
+                        center, half = (box[:2] + box[2:]) / 2, (box[2:] - box[:2]) / 2
+                        target_center = (target[:2] + target[2:]) / 2
+                        target_half = (target[2:] - target[:2]) / 2
+                        center_box = np.concatenate((target_center - half, target_center + half))
+                        extent_box = np.concatenate((center - target_half, center + target_half))
+                        center_hit, extent_hit = overlaps(target, [center_box, extent_box]) > threshold
+                        recovery = ('both' if center_hit and extent_hit else 'center_only' if center_hit else
+                                    'extent_only' if extent_hit else 'neither')
+                        near[recovery] += 1
     result = {}
     for number, name in enumerate(families, 1):
         remove = source == number
@@ -113,6 +135,8 @@ def current_fp_sources(label, items, order, gt, tp, fp, recall, specification):
         report['unresolved_unknown_overlap'] = unresolved_unknown_overlap
     if track_residual_overlap:
         report['residual_overlap'] = residual
+    if track_near_target:
+        report['near_target_geometry'] = near
     if specification.get('diagnostic_absent_unresolved'):
         report['absent_unresolved'] = absent_unresolved_ranking(
             label, items, order, gt, np.flatnonzero(source == 4), tp, fp, recall, specification)

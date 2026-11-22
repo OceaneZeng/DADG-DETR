@@ -25,6 +25,9 @@ FP_RESULT = '613c1ad9125e1228b97cd1f77e5dfc17877c6623e5c74b677fd74553156a0e4c'
 OPEN_KEYS = ('unknown_gt', 'unknown_predictions', 'u_recall', 'wi', 'a_ose')
 OPEN_RESULT = '5626099bf497f1467272789a293eec0e0164a7597bc7a779973b68f326f0ae38'
 RESIDUAL_BANDS = ('zero', 'positive_below_point_one', 'at_least_point_one')
+RESIDUAL_RESULT = '73fc9cecb14fd58cddd09a27870d871b4bb1ded845efca9ff50807b367ffab30'
+NEAR_TARGET = ('same_class', 'other_released_class', 'unreleased_class',
+               'below_point_three', 'at_least_point_three', 'center_only', 'extent_only', 'both', 'neither')
 
 
 def append_unknown(released, future):
@@ -48,7 +51,8 @@ def summarize(report, prior):
         for category, row in counts.items():
             original = baseline['metrics']['current_class_stats'][category]
             if dict(row, fp_sources={k: v for k, v in row['fp_sources'].items()
-                                    if k not in ('unresolved_unknown_overlap', 'residual_overlap')}) != original:
+                                    if k not in ('unresolved_unknown_overlap', 'residual_overlap',
+                                                 'near_target_geometry')}) != original:
                 raise ValueError(f'Changed Current VOC metrics or false-positive tally: {name}/{category}')
         for key in ('previous_ap50', 'current_ap50', 'known_ap50', 'unknown_predictions'):
             if view['metrics'][key] != baseline['metrics'][key]:
@@ -76,6 +80,7 @@ def summarize_residual(report, prior, base):
         for category, row in stats.items():
             fp = dict(row['fp_sources'])
             residual = fp.pop('residual_overlap')
+            fp.pop('near_target_geometry', None)
             if sum(residual[k] for k in RESIDUAL_BANDS) != (
                     fp['families']['unresolved']['fp'] - fp['unresolved_unknown_overlap']):
                 raise ValueError(f'Incomplete residual attribution: {name}/{category}')
@@ -95,7 +100,37 @@ def summarize_residual(report, prior, base):
                 majority_below_point_one=2*below > base['delta']['no_overlap'])
 
 
-def main(residual_overlap=False):
+def summarize_near_target(report, reference, residual):
+    arms = {}
+    for name, view in report['views'].items():
+        original = reference['views'][name]
+        stats = view['metrics']['current_class_stats']
+        stripped = {}
+        counts = dict.fromkeys(NEAR_TARGET, 0)
+        for category, row in stats.items():
+            fp = dict(row['fp_sources'])
+            near = fp.pop('near_target_geometry')
+            expected = fp['residual_overlap']['at_least_point_one']
+            if any(sum(near[k] for k in keys) != expected
+                   for keys in (NEAR_TARGET[:3], NEAR_TARGET[3:5], NEAR_TARGET[5:])):
+                raise ValueError(f'Incomplete near-target attribution: {name}/{category}')
+            stripped[category] = dict(row, fp_sources=fp)
+            for k in counts:
+                counts[k] += near[k]
+        if (dict(view['metrics'], current_class_stats=stripped) != original['metrics']
+                or view['matched'] != original['matched'] or report['per_image'] != reference['per_image']):
+            raise ValueError(f'Changed residual baseline: {name}')
+        arms[name] = counts
+    delta = {k: arms['perturbed'][k] - arms['native'][k] for k in NEAR_TARGET}
+    total = residual['delta']['at_least_point_one']
+    if sum(delta[k] for k in NEAR_TARGET[:3]) != total:
+        raise ValueError('Changed count of nearby author targets')
+    priority = next((k for k, other in (('center_only', 'extent_only'), ('extent_only', 'center_only'))
+                     if delta[k] > delta[other] and 10*delta[k] >= 3*total), None)
+    return dict(arms=arms, delta=delta, priority=priority)
+
+
+def main(residual_overlap=False, near_target=False):
     if torch.cuda.device_count() != 1 or torch.cuda.get_device_name() != 'NVIDIA GeForce RTX 3090':
         raise ValueError('Use one RTX 3090')
     previous_plan = verified(FP_REPORTS / 'plan.json', FP_PLAN)
@@ -112,6 +147,13 @@ def main(residual_overlap=False):
                 or open_plan['prior_result'] != FP_RESULT):
             raise ValueError('Changed full-annotation baseline')
         output = OUTPUT.with_name('task2-m-s-current-fp-residual')
+    residual_output = output
+    residual_base = None
+    if near_target:
+        residual_base = verified(residual_output / 'comparison.json', RESIDUAL_RESULT)
+        if residual_base['status'] != 'complete' or residual_base['plan_sha256'] != file_sha256(residual_output / 'plan.json'):
+            raise ValueError('Changed residual comparison')
+        output = OUTPUT.with_name('task2-m-s-current-fp-near-target')
     reports, manifests, assets = {}, {}, {}
     for protocol, entry in source['protocols'].items():
         manifest_path = MANIFESTS[protocol]
@@ -122,6 +164,8 @@ def main(residual_overlap=False):
                 reports[label] = dict(open_plan['reports'][label],
                                       open_report_sha256=file_sha256(OUTPUT / f'{label}.json'))
                 verified(OUTPUT / reports[label]['file'], reports[label]['sha256'])
+                if near_target:
+                    reports[label]['residual_report_sha256'] = file_sha256(residual_output / f'{label}.json')
             continue
         all_names = {item for c in source['cohorts'].values() for item in c['order']}
         train_names = set(manifest['splits']['t1_train']) | set(manifest['splits']['t2_train'])
@@ -145,6 +189,8 @@ def main(residual_overlap=False):
     if residual_overlap:
         plan.update(open_base_result=OPEN_RESULT, open_base_plan=open_base['plan_sha256'],
                     residual_iou_bands=RESIDUAL_BANDS)
+    if near_target:
+        plan.update(residual_result=RESIDUAL_RESULT, near_target_minimum_share=.3)
     pin(output / 'plan.json', plan)
     digest = file_sha256(output / 'plan.json')
     for name, data in assets.items():
@@ -177,6 +223,8 @@ def main(residual_overlap=False):
                             diagnostic_current_fp_sources=True, diagnostic_unresolved_unknown_overlap=True)
                 if residual_overlap:
                     spec['diagnostic_residual_overlap'] = True
+                if near_target:
+                    spec['diagnostic_near_target_geometry'] = True
                 result = measure(model, dataset, loader, known, entry['previous'], entry['current'], spec,
                                  plan['max_detections'], evaluation_coco=evaluation_coco)
                 write_json(dest, dict(plan_sha256=digest, **result))
@@ -191,6 +239,13 @@ def main(residual_overlap=False):
                 if older['plan_sha256'] != open_base['plan_sha256'] or results[protocol][fold] != base:
                     raise ValueError(f'Changed open-set baseline: {label}')
                 results[protocol][fold]['residual'] = summarize_residual(report, older, base)
+            if near_target:
+                reference = verified(residual_output / dest.name, reports[label]['residual_report_sha256'])
+                if (reference['plan_sha256'] != residual_base['plan_sha256']
+                        or results[protocol][fold] != residual_base['protocols'][protocol][fold]):
+                    raise ValueError(f'Changed residual source: {label}')
+                results[protocol][fold]['near_target'] = summarize_near_target(
+                    report, reference, results[protocol][fold]['residual'])
         del model
     write_json(output / 'comparison.json', dict(status='complete', plan_sha256=digest,
                protocols=results, paper_comparable=False))
@@ -199,4 +254,6 @@ def main(residual_overlap=False):
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--residual-overlap', action='store_true')
-    main(parser.parse_args().residual_overlap)
+    parser.add_argument('--near-target', action='store_true')
+    args = parser.parse_args()
+    main(args.residual_overlap or args.near_target, args.near_target)
