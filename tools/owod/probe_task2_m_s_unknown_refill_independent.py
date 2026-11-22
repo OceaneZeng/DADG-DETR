@@ -24,13 +24,18 @@ OUTPUT = SOURCE.with_name('task2-m-s-unknown-refill-independent')
 PARENT = SOURCE.with_name('task2-m-s-unknown-refill')
 PROTECTED_DISCOVERY = SOURCE.with_name('task2-m-s-refill-protect-current')
 PROTECTED_OUTPUT = SOURCE.with_name('task2-m-s-refill-protect-current-independent')
+OVERLAP_DISCOVERY = SOURCE.with_name('task2-m-s-refill-same-class-overlap')
+OVERLAP_OUTPUT = SOURCE.with_name('task2-m-s-refill-same-class-overlap-independent')
 PARENT_RESULT = '5d352e7889bda076c3b430a3d080b1c46d5cf8116dd83e384e75dcf54bb694d7'
 PROTECTED_RESULT = '43b7d4533df8b38a0fa725bdd0bd5fb94cd76a8b750e7c9d8cafe8eee06290c5'
+OVERLAP_RESULT = 'e291b6cc0a269949a721a492e6f67b5c37233bfe5faa3190da4d8577f361985a'
 SOURCE_PLAN = 'de4bb126945143a69b5a60e60b83b7761c6270e6e71734fe127129948fd35712'
 FOLD_SEEDS = {'first': 65, 'second': 66}
 POOL_SEED = 67
 PROTECTED_FOLD_SEEDS = {'first': 68, 'second': 69}
 PROTECTED_POOL_SEED = 70
+OVERLAP_FOLD_SEEDS = {'first': 71, 'second': 72}
+OVERLAP_POOL_SEED = 73
 PREPARED_COHORT = '26dd2b7e3579687b4fb247018017029aec9796ab3aae3db5a4cc5118e598cf39'
 
 
@@ -64,10 +69,15 @@ def summarize_refill(report, shared, plan):
     passed = (gain >= plan['minimum_unknown_recall_gain']
               and all(delta >= -plan['refill_ap_tolerance'] for delta in summary['deltas'].values())
               and refill['a_ose'] <= native['a_ose'])
-    return dict(summary, refills=flipped, unknown_recall_gain=gain, open_metrics=metrics, passed=passed)
+    result = dict(summary, refills=flipped, unknown_recall_gain=gain, open_metrics=metrics, passed=passed)
+    if 'previous_matches' in report:
+        before, after = (report['previous_matches'][arm] for arm in ('native', 'unknown_refill'))
+        result['previous_matches_lost'] = sum(len(set(ids) - set(after[category]))
+                                              for category, ids in before.items())
+    return result
 
 
-def main(protect_current=False):
+def main(protect_current=False, same_class_overlap=False):
     if torch.cuda.device_count() != 1 or torch.cuda.get_device_name() != 'NVIDIA GeForce RTX 3090':
         raise ValueError('Use one RTX 3090')
     result = verified(PARENT / 'comparison.json', PARENT_RESULT)
@@ -78,6 +88,8 @@ def main(protect_current=False):
     excluded = {name for spec in original_folds['cohorts'].values() for name in spec['order']}
     output, fold_seeds, pool_seed = OUTPUT, FOLD_SEEDS, POOL_SEED
     protected_plan = None
+    overlap_plan = None
+    protect_current = protect_current or same_class_overlap
     if protect_current:
         output, fold_seeds, pool_seed = PROTECTED_OUTPUT, PROTECTED_FOLD_SEEDS, PROTECTED_POOL_SEED
         selection = verified(PROTECTED_DISCOVERY / 'comparison.json', PROTECTED_RESULT)
@@ -90,6 +102,19 @@ def main(protect_current=False):
             raise ValueError('Changed protected refill rule or acceptance limits')
         discovery_cohorts = verified(OUTPUT / 'cohorts/plan.json', protected_plan['cohort_plan'])
         excluded.update(name for spec in discovery_cohorts['cohorts'].values() for name in spec['order'])
+    if same_class_overlap:
+        output, fold_seeds, pool_seed = OVERLAP_OUTPUT, OVERLAP_FOLD_SEEDS, OVERLAP_POOL_SEED
+        selection = verified(OVERLAP_DISCOVERY / 'comparison.json', OVERLAP_RESULT)
+        rows = [row for folds in selection['protocols'].values() for row in folds.values()]
+        if selection['status'] != 'complete' or len(rows) != 4 or not all(row['passed'] for row in rows):
+            raise ValueError('Expected four passing overlap discovery folds')
+        overlap_plan = verified(OVERLAP_DISCOVERY / 'plan.json', selection['plan_sha256'])
+        if (overlap_plan['protected_group'] != 'current' or overlap_plan['min_same_class_iou'] != .7
+                or any(overlap_plan[key] != original[key] for key in
+                       ('minimum_unknown_recall_gain', 'refill_ap_tolerance'))):
+            raise ValueError('Changed overlap rule or acceptance limits')
+        overlap_cohorts = verified(PROTECTED_OUTPUT / 'cohorts/plan.json', overlap_plan['cohort_plan'])
+        excluded.update(name for spec in overlap_cohorts['cohorts'].values() for name in spec['order'])
     print('Preparing two independent paired Task 2 folds', flush=True)
     cohort_dir = output / 'cohorts'
     cohort_path = cohort_dir / 'plan.json'
@@ -137,6 +162,9 @@ def main(protect_current=False):
     if protected_plan is not None:
         plan.update(protected_group='current', protected_discovery_result=PROTECTED_RESULT,
                     protected_discovery_cohort=protected_plan['cohort_plan'])
+    if overlap_plan is not None:
+        plan.update(overlap_discovery_result=OVERLAP_RESULT, overlap_discovery_cohort=overlap_plan['cohort_plan'],
+                    endpoints=overlap_plan['endpoints'], min_same_class_iou=overlap_plan['min_same_class_iou'])
     if run_plan_path.exists():
         pin(run_plan_path, plan)
     else:
@@ -147,15 +175,16 @@ def main(protect_current=False):
     digest = file_sha256(run_plan_path)
     summaries = {}
     for protocol, info in source['protocols'].items():
-        checkpoint = Path(info['endpoints']['finetune']['path'])
-        if file_sha256(checkpoint) != info['endpoints']['finetune']['sha256']:
+        endpoint = plan['endpoints'][protocol] if same_class_overlap else info['endpoints']['finetune']
+        checkpoint = Path(endpoint['path'])
+        if file_sha256(checkpoint) != endpoint['sha256']:
             raise ValueError(f'Changed frozen endpoint: {protocol}')
         model, _ = load_detector(None, checkpoint, torch.device('cuda'))
         model.eval()
         known = info['previous'] + info['current']
         protected = info['current'] if protect_current else ()
         post = UnknownRefillScore(known_ids=known, max_detections=plan['limit'], scoring='focal',
-                                  protected_ids=protected)
+                                  protected_ids=protected, min_same_class_iou=plan.get('min_same_class_iou'))
         summaries[protocol] = {}
         for fold, cohort in source['cohorts'].items():
             label = f'{protocol}-{fold}'
@@ -168,7 +197,8 @@ def main(protect_current=False):
                 full = COCO(str(output / reports[label]['file']))
                 report = measure(model, dataset, loader, known, info['previous'], info['current'], evaluation,
                                  plan['limit'], evaluation_coco=full, extra_posts=dict(unknown_refill=post),
-                                 audit_query_counts=True, include_perturbed=False)
+                                 audit_query_counts=True, include_perturbed=False,
+                                 audit_previous_matches=same_class_overlap)
                 write_json(dest, dict(plan_sha256=digest, **report))
             report = read_json(dest)
             if report['plan_sha256'] != digest or len(report['per_image']) != len(cohort['order']):
@@ -184,5 +214,8 @@ def main(protect_current=False):
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--protect-current', action='store_true')
-    main(parser.parse_args().protect_current)
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument('--protect-current', action='store_true')
+    mode.add_argument('--same-class-overlap', action='store_true')
+    args = parser.parse_args()
+    main(args.protect_current, args.same_class_overlap)
