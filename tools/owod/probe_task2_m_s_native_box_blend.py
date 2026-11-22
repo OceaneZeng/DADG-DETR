@@ -72,7 +72,7 @@ def main():
         model.eval()
         previous, current = job['previous'], job['current']
         limit = plan['max_detections']
-        blended = NativeBoxBlend(previous + current, max_detections=limit, scoring='focal')
+        blended = NativeBoxBlend(known_ids=previous + current, max_detections=limit, scoring='focal')
         results[protocol] = {}
         for fold, cohort in job['folds'].items():
             marker = OUTPUT / f'{protocol}-{fold}.json'
