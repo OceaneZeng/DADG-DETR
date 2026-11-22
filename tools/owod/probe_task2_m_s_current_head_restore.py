@@ -23,9 +23,11 @@ OUTPUT = SOURCE.with_name('task2-m-s-current-head-restore')
 FFN_OUTPUT = SOURCE.with_name('task2-m-s-decoder-ffn-restore')
 LOGITS_OUTPUT = SOURCE.with_name('task2-m-s-decoder-ffn-current-logits')
 BOX_OUTPUT = SOURCE.with_name('task2-m-s-decoder-ffn-boxes')
+BOX_LOGITS_OUTPUT = SOURCE.with_name('task2-m-s-decoder-ffn-boxes-current-logits')
 HEAD_RESULT = 'e984ea7167a3759d1eefa4dc990a18787bce649993621f890aa6699f568ba349'
 FFN_RESULT = '41f7f4d1cfc22fd08234925d6665e68f8d61f3f6432e481fb0b1485296060c20'
 LOGITS_RESULT = '73cdfdb230dd038eefb895a0d687568eef2e8b7b34f32c74b2e55cdc0c9043d5'
+BOX_RESULT = '4221a9a17eee574e42e5fad4df749b1a5360d8448652dfb5ac9fc738993fa585'
 MARGIN_RESULT = 'f7db72ce7f691be1999440c4115b943b2313edb035a236b288fb2bbf1bc25eec'
 FULL_RESULT = '5626099bf497f1467272789a293eec0e0164a7597bc7a779973b68f326f0ae38'
 METRICS = ('previous_ap50', 'current_ap50', 'known_ap50', 'u_recall', 'wi', 'a_ose')
@@ -34,25 +36,26 @@ MIN_RECOVERY = .25
 
 
 class RestoredOutputs(torch.nn.Module):
-    def __init__(self, native, restored, current):
+    def __init__(self, native, restored, current, replace_boxes):
         super().__init__()
         self.native = native
         self.restored = restored
+        self.replace_boxes = replace_boxes
         indices = None if current is None else torch.tensor(current, device=next(native.parameters()).device)
         self.register_buffer('current', indices)
 
     def forward(self, samples):
         output = self.native(samples)
         restored = self.restored(samples)
-        if self.current is None:
+        if self.replace_boxes:
             output['pred_boxes'] = restored['pred_boxes']
-        else:
+        if self.current is not None:
             changed = restored['pred_logits'].index_select(-1, self.current)
             output['pred_logits'] = output['pred_logits'].index_copy(-1, self.current, changed)
         return output
 
 
-def restored_detector(info, restore_ffn=False, current_logits=False, boxes_only=False):
+def restored_detector(info, restore_ffn=False, current_logits=False, replace_boxes=False):
     models = {}
     for phase, endpoint in info['endpoints'].items():
         path = Path(endpoint['path'])
@@ -65,11 +68,11 @@ def restored_detector(info, restore_ffn=False, current_logits=False, boxes_only=
         destination = after.transformer.decoder.layers[-1]
         for name in ('linear1', 'linear2', 'norm3'):
             getattr(destination, name).load_state_dict(getattr(source, name).state_dict())
-        if current_logits or boxes_only:
+        if current_logits or replace_boxes:
             del models['increment'], before, source
             native, _ = load_detector(None, Path(info['endpoints']['finetune']['path']), torch.device('cuda'))
             current = info['current'] if current_logits else None
-            return RestoredOutputs(native, models['finetune'], current).eval()
+            return RestoredOutputs(native, models['finetune'], current, replace_boxes).eval()
         return models['finetune'].eval()
     original, restored = before.class_embed[-1], after.class_embed[-1]
     if not isinstance(original, torch.nn.Linear) or not isinstance(restored, torch.nn.Linear):
@@ -81,7 +84,7 @@ def restored_detector(info, restore_ffn=False, current_logits=False, boxes_only=
     return models['finetune'].eval()
 
 
-def main(restore_ffn=False, current_logits=False, boxes_only=False):
+def main(restore_ffn=False, current_logits=False, replace_boxes=False):
     if torch.cuda.device_count() != 1 or torch.cuda.get_device_name() != 'NVIDIA GeForce RTX 3090':
         raise ValueError('Use one RTX 3090')
     margins = verified(MARGINS / 'comparison.json', MARGIN_RESULT)
@@ -97,7 +100,7 @@ def main(restore_ffn=False, current_logits=False, boxes_only=False):
                 source_plan=margin_plan['parent_plan'], margin_result=MARGIN_RESULT, full_result=FULL_RESULT,
                 references=references, ap_margin=AP_MARGIN, minimum_recovery=MIN_RECOVERY,
                 paper_comparable=False)
-    restore_ffn = restore_ffn or current_logits or boxes_only
+    restore_ffn = restore_ffn or current_logits or replace_boxes
     output = FFN_OUTPUT if restore_ffn else OUTPUT
     if restore_ffn:
         head = verified(OUTPUT / 'comparison.json', HEAD_RESULT)
@@ -105,26 +108,33 @@ def main(restore_ffn=False, current_logits=False, boxes_only=False):
         if head['status'] != 'complete' or any(prior[k] != plan[k] for k in plan if k != 'commit'):
             raise ValueError('Changed classifier restoration reference')
         plan.update(head_result=HEAD_RESULT, decoder_layer=-1, restored_modules=['linear1', 'linear2', 'norm3'])
-    if current_logits or boxes_only:
+    if current_logits or replace_boxes:
         previous = verified(FFN_OUTPUT / 'comparison.json', FFN_RESULT)
         previous_plan = verified(FFN_OUTPUT / 'plan.json', previous['plan_sha256'])
         if previous['status'] != 'complete' or any(previous_plan[k] != plan[k] for k in plan if k != 'commit'):
             raise ValueError('Changed decoder FFN restoration reference')
         output = LOGITS_OUTPUT
         plan.update(ffn_result=FFN_RESULT, outputs_from_restoration='current_logits_only')
-        if boxes_only:
+        if replace_boxes:
             logits = verified(LOGITS_OUTPUT / 'comparison.json', LOGITS_RESULT)
             logits_plan = verified(LOGITS_OUTPUT / 'plan.json', logits['plan_sha256'])
             if logits['status'] != 'complete' or any(logits_plan[k] != plan[k] for k in plan if k != 'commit'):
                 raise ValueError('Changed Current-only logit restoration reference')
             output = BOX_OUTPUT
             plan.update(logits_result=LOGITS_RESULT, outputs_from_restoration='boxes_only')
+            if current_logits:
+                boxes = verified(BOX_OUTPUT / 'comparison.json', BOX_RESULT)
+                boxes_plan = verified(BOX_OUTPUT / 'plan.json', boxes['plan_sha256'])
+                if boxes['status'] != 'complete' or any(boxes_plan[k] != plan[k] for k in plan if k != 'commit'):
+                    raise ValueError('Changed boxes-only restoration reference')
+                output = BOX_LOGITS_OUTPUT
+                plan.update(boxes_result=BOX_RESULT, outputs_from_restoration='boxes_and_current_logits')
     plan_path = output / 'plan.json'
     pin(plan_path, plan)
     digest = file_sha256(plan_path)
     results = {}
     for protocol, info in source['protocols'].items():
-        model = restored_detector(info, restore_ffn, current_logits, boxes_only)
+        model = restored_detector(info, restore_ffn, current_logits, replace_boxes)
         known = info['previous'] + info['current']
         manifest = verified(MANIFESTS[protocol], info['manifest_sha256'])
         root = resolve_image_root(MANIFESTS[protocol], manifest)
@@ -141,9 +151,11 @@ def main(restore_ffn=False, current_logits=False, boxes_only=False):
             path = output / f'{label}.json'
             if not path.exists():
                 restored = 'last decoder base FFN and normalization' if restore_ffn else 'Current classifier rows'
-                if current_logits:
+                if current_logits and replace_boxes:
+                    restored = 'boxes and Current logits from the restored final decoder FFN'
+                elif current_logits:
                     restored = 'Current logits from the restored final decoder FFN'
-                elif boxes_only:
+                elif replace_boxes:
                     restored = 'boxes from the restored final decoder FFN'
                 print(f'Evaluating {protocol}/{fold} with restored {restored}', flush=True)
                 dataset, loader = make_loader(root, annotation, source['batch_size'], 2)
@@ -180,5 +192,7 @@ if __name__ == '__main__':
     mode.add_argument('--restore-ffn', action='store_true')
     mode.add_argument('--current-logits', action='store_true')
     mode.add_argument('--boxes-only', action='store_true')
+    mode.add_argument('--boxes-current-logits', action='store_true')
     args = parser.parse_args()
-    main(args.restore_ffn, args.current_logits, args.boxes_only)
+    main(args.restore_ffn, args.current_logits or args.boxes_current_logits,
+         args.boxes_only or args.boxes_current_logits)
