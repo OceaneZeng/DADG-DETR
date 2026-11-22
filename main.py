@@ -156,6 +156,8 @@ def get_args_parser():
     parser.add_argument('--distill-max-queries', default=20, type=int)
     parser.add_argument('--screen-double-old-box-loss', action='store_true',
                         help='double L1 and GIoU on matched released old boxes during diagnostic balanced finetuning')
+    parser.add_argument('--screen-double-current-low-iou-boxes', action='store_true',
+                        help='double localization loss on released new-class matches with IoU at most 0.5')
     parser.add_argument('--screen-double-current-positives', action='store_true',
                         help='double only the matched new-class positive focal terms during diagnostic balanced finetuning')
     parser.add_argument('--screen-double-previous-hard-negatives', action='store_true',

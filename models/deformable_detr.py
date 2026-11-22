@@ -256,6 +256,7 @@ class SetCriterion(nn.Module):
         self.focal_alpha = focal_alpha
         self.active_class_ids = None
         self.register_buffer('double_weight_box_ids', None, persistent=False)
+        self.register_buffer('current_low_iou_box_ids', None, persistent=False)
         self.register_buffer('double_positive_columns', None, persistent=False)
         self.register_buffer('previous_hard_negative_ids', None, persistent=False)
         self.register_buffer('previous_hard_negative_columns', None, persistent=False)
@@ -359,10 +360,18 @@ class SetCriterion(nn.Module):
         loss_bbox = F.l1_loss(src_boxes, target_boxes, reduction='none')
 
         losses = {}
-        loss_giou = 1 - torch.diag(box_ops.generalized_box_iou(
-            box_ops.box_cxcywh_to_xyxy(src_boxes),
-            box_ops.box_cxcywh_to_xyxy(target_boxes)))
-        if self.training and self.double_weight_box_ids is not None:
+        src_xyxy = box_ops.box_cxcywh_to_xyxy(src_boxes)
+        target_xyxy = box_ops.box_cxcywh_to_xyxy(target_boxes)
+        loss_giou = 1 - torch.diag(box_ops.generalized_box_iou(src_xyxy, target_xyxy))
+        if self.training and self.current_low_iou_box_ids is not None:
+            labels = torch.cat([t['labels'][i] for t, (_, i) in zip(targets, indices)])
+            matched_iou = box_ops.box_iou(src_xyxy.detach(), target_xyxy)[0].diag()
+            weighted = torch.isin(labels, self.current_low_iou_box_ids) & (matched_iou <= 0.5)
+            weights = 1 + weighted.to(loss_bbox.dtype)
+            loss_bbox = loss_bbox * weights[:, None]
+            loss_giou = loss_giou * weights
+            losses['current_low_iou_box_matches'] = weighted.sum().to(loss_bbox.dtype)
+        elif self.training and self.double_weight_box_ids is not None:
             labels = torch.cat([t['labels'][i] for t, (_, i) in zip(targets, indices)])
             old = torch.isin(labels, self.double_weight_box_ids)
             weights = 1 + old.to(loss_bbox.dtype)
@@ -618,6 +627,8 @@ def build(args):
     criterion.active_class_ids = getattr(args, 'owod_known_class_ids', None)
     if getattr(args, 'screen_double_old_box_loss', False):
         criterion.double_weight_box_ids = torch.tensor(args.owod_previous_class_ids, dtype=torch.long)
+    if getattr(args, 'screen_double_current_low_iou_boxes', False):
+        criterion.current_low_iou_box_ids = torch.tensor(args.owod_current_class_ids, dtype=torch.long)
     if getattr(args, 'screen_double_previous_hard_negatives', False):
         criterion.enable_previous_hard_negatives(args.owod_previous_class_ids)
     positive_ids = getattr(args, 'screen_tail_positive_ids', None)
