@@ -167,17 +167,30 @@ def probe(protocol, job):
 
 
 @torch.inference_mode()
-def evaluate(checkpoint, root, manifest, job, plan):
+def evaluate(checkpoint, root, manifest, job, plan, previous_source=None):
     model, _ = load_detector(None, checkpoint, DEVICE)
     model.eval()
     reports = {}
     previous, current = job['previous'], job['current']
+    if previous_source is not None:
+        donor, _ = load_detector(None, previous_source, DEVICE)
+        source, target = donor.detr.class_embed[-1], model.detr.class_embed[-1]
+        if not isinstance(source, torch.nn.Linear) or not isinstance(target, torch.nn.Linear):
+            raise ValueError('Expected linear final classifiers for the old-class row swap')
+        rows = torch.tensor(previous, device=target.weight.device)
+        target.weight.index_copy_(0, rows, source.weight.index_select(0, rows))
+        target.bias.index_copy_(0, rows, source.bias.index_select(0, rows))
+        del donor, source
     for fold, cohort in job['folds'].items():
         print(f'Evaluating {checkpoint.parent.parent.name}/{fold}', flush=True)
-        _, loader = make_loader(root, SOURCE / cohort['released']['file'], plan['eval_batch'], 2)
-        coco = COCO(str(FULL / cohort['scored']['file']))
+        released = SOURCE / cohort['released']['file']
+        scored = FULL / cohort['scored']['file']
+        if file_sha256(released) != cohort['released']['sha256'] or file_sha256(scored) != cohort['scored']['sha256']:
+            raise ValueError(f'Changed frozen evaluation annotations: {fold}')
+        dataset, loader = make_loader(root, released, plan['eval_batch'], 2)
+        coco = COCO(str(scored))
         spec = dict(manifest['evaluation'], image_source_ids=cohort['order'])
-        reports[fold] = measure(model, loader.dataset, loader, previous + current, previous, current,
+        reports[fold] = measure(model, dataset, loader, previous + current, previous, current,
                                 spec, plan['max_detections'], evaluation_coco=coco,
                                 include_perturbed=False, audit_previous_matches=True)
     return reports
