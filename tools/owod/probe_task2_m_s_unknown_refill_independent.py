@@ -27,10 +27,14 @@ PROTECTED_OUTPUT = SOURCE.with_name('task2-m-s-refill-protect-current-independen
 OVERLAP_DISCOVERY = SOURCE.with_name('task2-m-s-refill-same-class-overlap')
 OVERLAP_OUTPUT = SOURCE.with_name('task2-m-s-refill-same-class-overlap-independent')
 OVERLAP_SHORT_OUTPUT = SOURCE.with_name('task2-m-s-refill-same-class-overlap-three-epoch')
+OVERLAP_SHORT_AUDIT = SOURCE.with_name('task2-m-s-refill-overlap-s-short-order')
 PARENT_RESULT = '5d352e7889bda076c3b430a3d080b1c46d5cf8116dd83e384e75dcf54bb694d7'
 PROTECTED_RESULT = '43b7d4533df8b38a0fa725bdd0bd5fb94cd76a8b750e7c9d8cafe8eee06290c5'
 OVERLAP_RESULT = 'e291b6cc0a269949a721a492e6f67b5c37233bfe5faa3190da4d8577f361985a'
 OVERLAP_INDEPENDENT_RESULT = 'cf60a72534e8d99990f0906562b18eea9483a876805d70296c52da47946e8789'
+OVERLAP_SHORT_RESULT = 'e3c96410363ffb38cfbd874f5242fb0465d467b055ffbc5f3440a7b5d5cb8e5f'
+OVERLAP_AUDIT_LABEL = 's-owodb-second'
+DIAGNOSTIC_ORDERS = ('stable_quantized', 'stable_raw')
 SOURCE_PLAN = 'de4bb126945143a69b5a60e60b83b7761c6270e6e71734fe127129948fd35712'
 FOLD_SEEDS = {'first': 65, 'second': 66}
 POOL_SEED = 67
@@ -79,7 +83,7 @@ def summarize_refill(report, shared, plan):
     return result
 
 
-def main(protect_current=False, same_class_overlap=False, overlap_short=False):
+def main(protect_current=False, same_class_overlap=False, overlap_short=False, audit_short=False):
     if torch.cuda.device_count() != 1 or torch.cuda.get_device_name() != 'NVIDIA GeForce RTX 3090':
         raise ValueError('Use one RTX 3090')
     result = verified(PARENT / 'comparison.json', PARENT_RESULT)
@@ -92,6 +96,7 @@ def main(protect_current=False, same_class_overlap=False, overlap_short=False):
     protected_plan = None
     overlap_plan = None
     replay_plan = None
+    overlap_short = overlap_short or audit_short
     same_class_overlap = same_class_overlap or overlap_short
     protect_current = protect_current or same_class_overlap
     if protect_current:
@@ -187,6 +192,17 @@ def main(protect_current=False, same_class_overlap=False, overlap_short=False):
                     endpoints=endpoints, min_same_class_iou=overlap_plan['min_same_class_iou'])
     if replay_plan is not None:
         plan['six_epoch_independent_result'] = OVERLAP_INDEPENDENT_RESULT
+    if audit_short:
+        result = verified(OVERLAP_SHORT_OUTPUT / 'comparison.json', OVERLAP_SHORT_RESULT)
+        reference_plan = verified(OVERLAP_SHORT_OUTPUT / 'plan.json', result['plan_sha256'])
+        if any(reference_plan[key] != value for key, value in plan.items() if key != 'commit'):
+            raise ValueError('Changed three-epoch overlap replay plan')
+        output = OVERLAP_SHORT_AUDIT
+        run_plan_path = output / 'plan.json'
+        reference_path = OVERLAP_SHORT_OUTPUT / f'{OVERLAP_AUDIT_LABEL}.json'
+        plan.update(reference_report=file_sha256(reference_path), reference_plan=result['plan_sha256'],
+                    reference_result=OVERLAP_SHORT_RESULT, score_orders=list(DIAGNOSTIC_ORDERS),
+                    audit_label=OVERLAP_AUDIT_LABEL)
     if run_plan_path.exists():
         pin(run_plan_path, plan)
     else:
@@ -197,6 +213,8 @@ def main(protect_current=False, same_class_overlap=False, overlap_short=False):
     digest = file_sha256(run_plan_path)
     summaries = {}
     for protocol, info in source['protocols'].items():
+        if audit_short and protocol != 's-owodb':
+            continue
         endpoint = plan['endpoints'][protocol] if same_class_overlap else info['endpoints']['finetune']
         checkpoint = Path(endpoint['path'])
         if file_sha256(checkpoint) != endpoint['sha256']:
@@ -210,6 +228,8 @@ def main(protect_current=False, same_class_overlap=False, overlap_short=False):
         summaries[protocol] = {}
         for fold, cohort in source['cohorts'].items():
             label = f'{protocol}-{fold}'
+            if audit_short and label != OVERLAP_AUDIT_LABEL:
+                continue
             dest = output / f'{label}.json'
             if not dest.exists():
                 print(f'Evaluating {protocol}/{fold} on independent images', flush=True)
@@ -223,14 +243,27 @@ def main(protect_current=False, same_class_overlap=False, overlap_short=False):
                 report = measure(model, dataset, loader, known, info['previous'], info['current'], evaluation,
                                  plan['limit'], evaluation_coco=full, extra_posts=dict(unknown_refill=post),
                                  audit_query_counts=True, include_perturbed=False,
-                                 audit_previous_matches=same_class_overlap)
+                                 audit_previous_matches=same_class_overlap,
+                                 diagnostic_score_orders=plan.get('score_orders', ()))
                 write_json(dest, dict(plan_sha256=digest, **report))
             report = read_json(dest)
             if report['plan_sha256'] != digest or len(report['per_image']) != len(cohort['order']):
                 raise ValueError(f'Changed independent replay: {label}')
             pairs = verified(cohort_dir / cohort['paired_file'], cohort['paired_sha256'])
             shared = {pair['annotation_ids'][protocol] for pair in pairs}
-            summaries[protocol][fold] = summarize_refill(report, shared, plan)
+            summary = summarize_refill(report, shared, plan)
+            if audit_short:
+                reference = verified(reference_path, plan['reference_report'])
+                if (reference['plan_sha256'] != plan['reference_plan']
+                        or any(reference[key] != report[key] for key in
+                               ('views', 'previous_matches', 'per_image', 'queries_per_image'))):
+                    raise ValueError('Changed author-order reference on the S second fold')
+                summary['diagnostic_deltas'] = {
+                    order: {key: arms['unknown_refill'][key] - arms['native'][key]
+                            for key in ('previous_ap50', 'u_recall', 'wi', 'a_ose')}
+                    for order, arms in report['score_order_views'].items()
+                }
+            summaries[protocol][fold] = summary
         del model
     accepted = all(row['passed'] for folds in summaries.values() for row in folds.values())
     write_json(output / 'comparison.json', dict(status='complete', plan_sha256=digest, protocols=summaries,
@@ -243,5 +276,6 @@ if __name__ == '__main__':
     mode.add_argument('--protect-current', action='store_true')
     mode.add_argument('--same-class-overlap', action='store_true')
     mode.add_argument('--overlap-short', action='store_true')
+    mode.add_argument('--audit-overlap-short', action='store_true')
     args = parser.parse_args()
-    main(args.protect_current, args.same_class_overlap, args.overlap_short)
+    main(args.protect_current, args.same_class_overlap, args.overlap_short, args.audit_overlap_short)
