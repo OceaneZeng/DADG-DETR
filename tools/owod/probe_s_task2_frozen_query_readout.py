@@ -1,6 +1,7 @@
 """Test whether frozen S Task 2 features support better class-conditional query ranking."""
 
 from collections import defaultdict
+from contextlib import contextmanager
 from hashlib import sha256
 import os
 from pathlib import Path
@@ -84,24 +85,34 @@ def prepare():
     return plan, manifest
 
 
-@torch.inference_mode()
-def query_images(model, loader, processor, classes, name):
+@contextmanager
+def capture_classifier(model):
     detector = model.detr
     classifier = detector.class_embed[detector.transformer.decoder.num_layers - 1]
-    class_ids = set(classes)
     result = []
 
     def capture(_module, inputs, output):
         result[:] = [inputs[0], output]
 
+    def features(outputs):
+        if len(result) != 2 or not torch.equal(result[1], outputs['pred_logits']):
+            raise ValueError('The recorded classifier input does not reproduce the final head')
+        return result[0]
+
     handle = classifier.register_forward_hook(capture)
     try:
+        yield features
+    finally:
+        handle.remove()
+
+
+@torch.inference_mode()
+def query_images(model, loader, processor, classes, name):
+    class_ids = set(classes)
+    with capture_classifier(model) as classifier_features:
         for step, (samples, targets) in enumerate(loader, 1):
-            result.clear()
             outputs = model(samples.to('cuda'))
-            if len(result) != 2 or not torch.equal(result[1], outputs['pred_logits']):
-                raise ValueError('The recorded classifier input does not reproduce the final head')
-            features = result[0].cpu().numpy()
+            features = classifier_features(outputs).cpu().numpy()
             boxes = box_cxcywh_to_xyxy(outputs['pred_boxes'])
             focal, columns, _ = processor.candidate_scores(outputs)
             classifier_scores = outputs['pred_logits'][..., classes].sigmoid().cpu().numpy()
@@ -119,8 +130,6 @@ def query_images(model, loader, processor, classes, name):
                 yield image_id, features[i], focal[i], classifier_scores[i], matches
             if step % 64 == 0 or step == len(loader):
                 print(f'Inference {step}/{len(loader)} batches: {name}', flush=True)
-    finally:
-        handle.remove()
 
 
 def linear_pair_weights(differences, rng, ridge):
