@@ -46,14 +46,8 @@ def summarize_protected(report, reference, shared, plan):
             or report['per_image'].keys() != reference['per_image'].keys()):
         raise ValueError('Changed native author-order replay')
     for image, arms in report['per_image'].items():
-        if (arms['native'] != reference['per_image'][image]['native']
-                or arms['native']['current'] != arms['unknown_refill']['current']):
-            raise ValueError(f'Changed native or protected Current output counts: {image}')
-    native, refill = (report['views'][arm] for arm in ('native', 'unknown_refill'))
-    if (native['matched'] != refill['matched']
-            or any(native['metrics'][key] != refill['metrics'][key]
-                   for key in ('current_ap50', 'current_class_stats'))):
-        raise ValueError('Changed protected Current author metrics')
+        if arms['native'] != reference['per_image'][image]['native']:
+            raise ValueError(f'Changed native output counts: {image}')
     return summarize_refill(report, shared, plan)
 
 

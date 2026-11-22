@@ -101,7 +101,8 @@ def collect_sources():
     return manifests, originals, specs, roots, blocked, exclusions
 
 
-def prepare(*, output=OUTPUT, fold_seeds=None, pool_seed=POOL_SEED, excluded_sources=()):
+def prepare(*, output=OUTPUT, fold_seeds=None, pool_seed=POOL_SEED, excluded_sources=(),
+            allow_smaller_pool=False):
     manifests, originals, specs, roots, blocked, exclusions = collect_sources()
     fold_seeds = FOLDS if fold_seeds is None else fold_seeds
     blocked.update(excluded_sources)
@@ -117,7 +118,10 @@ def prepare(*, output=OUTPUT, fold_seeds=None, pool_seed=POOL_SEED, excluded_sou
     # Only sample sources that have an exact shared target in both protocols.
     pool = dict(images=[im for name, im in registered[m][0].items() if name in names_with_matches],
                 annotations=[mr[key] for key in sorted(matches)])
-    candidate_names = select_images(pool, POOL_IMAGES, sorted(shared), pool_seed)
+    pool_size = min(POOL_IMAGES, len(pool['images'])) if allow_smaller_pool else POOL_IMAGES
+    if pool_size < len(fold_seeds) * IMAGES_PER_FOLD:
+        raise ValueError(f'Only {pool_size} eligible images for {len(fold_seeds)} independent folds')
+    candidate_names = select_images(pool, pool_size, sorted(shared), pool_seed)
     full = {}
     coverage_pool = dict(images=[im for im in pool['images'] if im['owod_source_id'] in candidate_names],
                          annotations=[])
@@ -178,7 +182,7 @@ def prepare(*, output=OUTPUT, fold_seeds=None, pool_seed=POOL_SEED, excluded_sou
     plan = dict(commit=subprocess.check_output(['git', 'rev-parse', 'HEAD'], text=True).strip(),
                 protocols=specs, shared_classes=sorted(shared), cohorts=cohorts, exclusions=exclusions,
                 excluded_ids_sha256=sha256('\n'.join(sorted(blocked)).encode()).hexdigest(),
-                seeds=fold_seeds, candidate_pool=dict(seed=pool_seed, images=POOL_IMAGES),
+                seeds=fold_seeds, candidate_pool=dict(seed=pool_seed, images=pool_size),
                 batch_size=BATCH, paper_comparable=False, scoring='focal', max_detections=50,
                 gpu=torch.cuda.get_device_name(), torch_version=str(torch.__version__))
     pin(output / 'plan.json', plan)
