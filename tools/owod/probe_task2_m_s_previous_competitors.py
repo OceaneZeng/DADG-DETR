@@ -11,6 +11,7 @@ from torch.utils.data import DataLoader, Subset
 from datasets import build_dataset
 from main import get_args_parser
 from models.graph_local.discovery import DiscoveryPostProcess
+from models.graph_local.instance_proposals import InstanceProposals
 from tools.owod.gnn_calibration import load_detector, move_targets
 from tools.owod.probe_task1_paired_discovery import verified
 from tools.owod.probe_task2_m_s_previous_hard_negative_misses import SCORES
@@ -27,6 +28,12 @@ from util.misc import collate_fn
 OUTPUT = TRAINING.with_name('task2-m-s-previous-competitor-training-probe')
 RANK_OUTPUT = TRAINING.with_name('task2-m-s-current-training-ranks')
 GEOMETRY_OUTPUT = TRAINING.with_name('task2-m-s-current-training-geometry')
+SHORTLIST_OUTPUT = TRAINING.with_name('task2-m-s-current-shortlist-ranks')
+GEOMETRY_RESULT_SHA = 'c9976b58f8e84dca6b0ee112bd31b24eec723471d1e6672a6cf14f8c777a2724'
+GEOMETRY_REPORTS = {
+    'm-owodb': '2168be415bfc456d2ba0647209070e3ce461d3b1112dc6e79b1cbe6f0cadc50c',
+    's-owodb': 'f22fa58edcd1eabc827247c06057bff30c6630fcfc46aba405d4b2db3827f3a8',
+}
 RANK_RESULT_SHA = '7289dad0db6d10e0400505b962e63971dce7f2695bb3452a2bb490abbbcabb3e'
 RANK_REPORTS = {
     'm-owodb': '7363bc270fe0156a7aeabfa66b0eec5bc0b68fdabf75e855b41047d6d262c6c7',
@@ -113,7 +120,7 @@ def current_annotation_ranks(scores, boxes, target, matches, known, previous_cou
     return rows
 
 
-def prepare(rank_analysis, geometry_analysis):
+def prepare(rank_analysis, geometry_analysis, shortlist_analysis):
     evidence = verified(SCORES / 'comparison.json', SCORE_SHA)
     source = verified(TRAINING / 'plan.json', TRAIN_PLAN_SHA)
     if evidence['status'] != 'complete' or evidence['preferred'] != ['class_probability']:
@@ -162,6 +169,15 @@ def prepare(rank_analysis, geometry_analysis):
         plan.update(rank_result_sha256=RANK_RESULT_SHA, rank_report_shas=RANK_REPORTS,
                     observation='all final geometry misses, first encoder coverage gap, all decoder layers',
                     decision='Prioritize a stage family if it accounts for at least half of final geometry misses in both protocols.')
+    if shortlist_analysis:
+        output = SHORTLIST_OUTPUT
+        reference = verified(GEOMETRY_OUTPUT / 'comparison.json', GEOMETRY_RESULT_SHA)
+        prior = verified(GEOMETRY_OUTPUT / 'plan.json', reference['plan_sha256'])
+        if prior['jobs'] != jobs or reference['preferred']:
+            raise ValueError('Expected the same stage-split geometry experiment')
+        plan.update(geometry_result_sha256=GEOMETRY_RESULT_SHA, geometry_report_shas=GEOMETRY_REPORTS,
+                    observation='best quality rank and doubled shortlist membership for every shortlist miss',
+                    decision='Use doubled membership as headroom only if it covers at least half of each protocol.')
     pin(output / 'plan.json', plan)
     return plan, datasets
 
@@ -190,7 +206,34 @@ def proposal_coverage(outputs, image, target, expected, current):
     return rows
 
 
-def probe(protocol, job, dataset, rank_analysis, geometry_reference=None):
+def shortlist_ranks(outputs, image, target, expected):
+    misses = [row for row in expected['geometry_misses'] if row['first_gap'] == 'shortlist']
+    if not misses:
+        return []
+    geometry = outputs['geometry']
+    valid = torch.where(geometry['valid'][image])[0]
+    scores = geometry['logits'][image, valid]
+    quota = geometry['chosen'].shape[1]
+    limit = quota * InstanceProposals.shortlist_multiplier
+    native = scores.topk(min(len(valid), limit)).indices
+    extended = scores.topk(min(len(valid), limit * 2)).indices
+    truths = [row['target'] for row in misses]
+    if target['labels'][truths].tolist() != [row['category'] for row in misses]:
+        raise ValueError(f'Changed shortlist targets: {expected["image"]}')
+    iou, _ = box_iou(box_cxcywh_to_xyxy(geometry['boxes'][image, valid]),
+                     box_cxcywh_to_xyxy(target['boxes'][truths]))
+    covered = iou > IOU
+    if not bool(covered.any(0).all()) or bool(covered[native].any()):
+        raise ValueError(f'Changed dense or shortlist coverage: {expected["image"]}')
+    best_scores = scores[:, None].masked_fill(~covered, -torch.inf).amax(0)
+    ranks = (scores[:, None] > best_scores).sum(0) + 1
+    admitted = covered[extended].any(0).tolist()
+    return [dict(target=row['target'], category=row['category'], rank=rank, native_limit=len(native),
+                 extended_limit=len(extended), admitted_on_double=admission)
+            for row, rank, admission in zip(misses, ranks.tolist(), admitted, strict=True)]
+
+
+def probe(protocol, job, dataset, rank_analysis, geometry_reference=None, shortlist_reference=None):
     model, criterion = load_detector(None, Path(job['checkpoint']['path']), DEVICE)
     model.eval()
     base = criterion.base
@@ -210,7 +253,7 @@ def probe(protocol, job, dataset, rank_analysis, geometry_reference=None):
         if any(not bool(torch.isin(t['labels'], classes).all()) for t in targets):
             raise ValueError(f'Unreleased target supervision: {protocol}')
         outputs = model(samples.to(DEVICE))
-        if geometry_reference is None:
+        if geometry_reference is None and shortlist_reference is None:
             scores, _, _ = post.candidate_scores(outputs)
             matches = base.matcher(outputs, targets)
         boxes = outputs['pred_boxes']
@@ -218,7 +261,10 @@ def probe(protocol, job, dataset, rank_analysis, geometry_reference=None):
             original_mask = base.previous_hard_negative_mask(outputs['pred_logits'][..., known], boxes, targets, matches, None)
         for i, target in enumerate(targets):
             image = int(target['image_id'])
-            if geometry_reference is not None:
+            if shortlist_reference is not None:
+                measured = shortlist_ranks(outputs, i, target, shortlist_reference[image])
+                rows.append(dict(image=image, shortlist_misses=measured))
+            elif geometry_reference is not None:
                 coverage = proposal_coverage(outputs, i, target, geometry_reference[image], job['current'])
                 rows.append(dict(image=image, geometry_misses=coverage))
             elif rank_analysis:
@@ -266,9 +312,15 @@ def summarize_geometry(rows, reference):
                 first_gap=dict(Counter(target['first_gap'] for target in misses)))
 
 
-def main(rank_analysis=False, geometry_analysis=False):
-    output = GEOMETRY_OUTPUT if geometry_analysis else RANK_OUTPUT if rank_analysis else OUTPUT
-    plan, datasets = prepare(rank_analysis, geometry_analysis)
+def main(rank_analysis=False, geometry_analysis=False, shortlist_analysis=False):
+    output = OUTPUT
+    if rank_analysis:
+        output = RANK_OUTPUT
+    if geometry_analysis:
+        output = GEOMETRY_OUTPUT
+    if shortlist_analysis:
+        output = SHORTLIST_OUTPUT
+    plan, datasets = prepare(rank_analysis, geometry_analysis, shortlist_analysis)
     digest = file_sha256(output / 'plan.json')
     protocols = {}
     for protocol, job in plan['jobs'].items():
@@ -276,11 +328,21 @@ def main(rank_analysis=False, geometry_analysis=False):
         if not marker.exists():
             print(f'Evaluating {protocol} balanced finetune training images', flush=True)
             reference = None
+            shortlist_reference = None
             if geometry_analysis:
                 frozen = verified(RANK_OUTPUT / marker.name, RANK_REPORTS[protocol])
                 reference = {row['image']: row for row in frozen['rows']}
-            rows = probe(protocol, job, datasets[protocol], rank_analysis, reference)
-            if geometry_analysis:
+            if shortlist_analysis:
+                frozen = verified(GEOMETRY_OUTPUT / marker.name, GEOMETRY_REPORTS[protocol])
+                shortlist_reference = {row['image']: row for row in frozen['rows']}
+            rows = probe(protocol, job, datasets[protocol], rank_analysis, reference, shortlist_reference)
+            if shortlist_analysis:
+                misses = [target for row in rows for target in row['shortlist_misses']]
+                if len(misses) != frozen['counts']['first_gap']['shortlist']:
+                    raise ValueError(f'Incomplete shortlist replay: {protocol}')
+                counts = dict(images=len(rows), shortlist_misses=len(misses),
+                              admitted_on_double=sum(row['admitted_on_double'] for row in misses))
+            elif geometry_analysis:
                 counts = summarize_geometry(rows, reference)
             elif rank_analysis:
                 counts = summarize_ranks(rows)
@@ -297,7 +359,10 @@ def main(rank_analysis=False, geometry_analysis=False):
             raise ValueError(f'Unexpected report: {protocol}')
         protocols[protocol] = report['counts']
     final = dict(status='complete', plan_sha256=digest, protocols=protocols)
-    if geometry_analysis:
+    if shortlist_analysis:
+        final['depth_headroom'] = all(row['admitted_on_double'] * 2 >= row['shortlist_misses']
+                                     for row in protocols.values())
+    elif geometry_analysis:
         final['preferred'] = [stage for stage in ('dense', 'shortlist', 'selected', 'decoder')
                               if all(row['first_gap'].get(stage, 0) * 2 >= row['geometry_misses']
                                      for row in protocols.values())]
@@ -321,5 +386,7 @@ if __name__ == '__main__':
     modes = parser.add_mutually_exclusive_group()
     modes.add_argument('--current-ranks', action='store_true')
     modes.add_argument('--current-geometry', action='store_true')
+    modes.add_argument('--shortlist-ranks', action='store_true')
     args = parser.parse_args()
-    main(args.current_ranks or args.current_geometry, args.current_geometry)
+    main(args.current_ranks or args.current_geometry or args.shortlist_ranks,
+         args.current_geometry, args.shortlist_ranks)
