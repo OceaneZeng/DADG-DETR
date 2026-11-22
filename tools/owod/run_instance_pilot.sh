@@ -60,7 +60,7 @@ if [[ ${1:-} == --s-task2-wi-sources || ${1:-} == --task2-old-only-independent |
     module=tools.owod.run_s_task2_finetune_half_lr
     flags=(--double-old-boxes)
   elif [[ $1 == --s-task2-ffn-target-transfer ]]; then
-    dir=output/s-instance-task2-ffn-target-transfer
+    dir=output/s-instance-task2-ffn-target-transfer-replay
     module=tools.owod.probe_s_task2_ffn_target_transfer
   elif [[ $1 == --s-task2-increment-encoder-ffn ]]; then
     dir=output/s-instance-task2-increment-encoder-ffn

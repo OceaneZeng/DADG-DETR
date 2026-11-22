@@ -20,7 +20,7 @@ from tools.owod.screening_data import write_json
 
 
 PARENT = DURATION.with_name('s-instance-task2-increment-encoder-ffn')
-OUTPUT = DURATION.with_name('s-instance-task2-ffn-target-transfer')
+OUTPUT = DURATION.with_name('s-instance-task2-ffn-target-transfer-replay')
 SOURCE_SHA256 = 'adcbf7210c91029e3c782192ffda7cc2794bbdfe33de8c37b8eaad4fac88f9b5'
 CRITERION = (
     'Prioritize native selection for newly covered Current targets only if strictly more than half '
@@ -110,33 +110,33 @@ def paired_transitions(control, candidate, classes, threshold):
     return counts
 
 
-def verify_replay(report, reference, classes, threshold):
+def verify_replay(report, reference, annotations):
     for name, view in report['views'].items():
         if view != reference['views'][name]:
             raise ValueError(f'Frozen evaluation changed for {name}')
-    for group, category_ids in classes.items():
-        subjects = [row for row in report['rows'] if row['category'] in category_ids]
-        observed = report['views'][f'raw_{group}_box_recall_iou50']
-        hits = sum(row['best_iou'] > threshold for row in subjects)
-        if (len(subjects), hits) != (observed['gt'], observed['hits']):
-            raise ValueError(f'Frozen annotation coverage changed for {group}')
+    rows = report['rows']
+    identities = {row['annotation_id']: (row['image'], row['category']) for row in rows}
+    if len(identities) != len(rows) or identities != annotations:
+        raise ValueError('Frozen replay does not cover all expected VOC annotations')
 
 
-def replay(name, endpoint, dataset, loader, manifest, order, classes, threshold, plan_hash, ref):
+def replay(name, endpoint, dataset, loader, manifest, order, classes, annotations, threshold, plan_hash, ref):
     path = OUTPUT / f'{name}.json'
     if not path.exists():
         print(f'Evaluating {name} on {len(order)} images', flush=True)
         model, _ = load_detector(None, Path(endpoint['path']), torch.device('cuda'))
         rows = []
-        observe = partial(record_targets, rows, dataset.coco, set.union(*classes.values()), threshold)
+        observe = partial(record_targets, rows, dataset.coco, classes, threshold)
         views = evaluate_heldout(model, dataset, loader, manifest, order, proxies=False, rank_observer=observe)
+        released = views['released']
+        released['current_class_stats'] = {str(k): v for k, v in released['current_class_stats'].items()}
         report = dict(plan_sha256=plan_hash, checkpoint_sha256=endpoint['sha256'], rows=rows, views=views)
-        verify_replay(report, ref, classes, threshold)
+        verify_replay(report, ref, annotations)
         write_json(path, report)
     report = read_json(path)
     if report['plan_sha256'] != plan_hash or report['checkpoint_sha256'] != endpoint['sha256']:
         raise ValueError(f'Changed replay inputs: {name}')
-    verify_replay(report, ref, classes, threshold)
+    verify_replay(report, ref, annotations)
     return report['rows']
 
 
@@ -144,6 +144,7 @@ def main():
     plan, manifest = prepare()
     threshold = manifest['evaluation']['iou_threshold']
     classes = {name: set(stage['classes']) for name, stage in zip(('old', 'current'), manifest['stages'][:2])}
+    active_classes = classes['old'] | classes['current']
     image_root = resolve_image_root(MANIFEST, manifest)
     plan_hash = file_sha256(OUTPUT / 'plan.json')
     comparisons = {}
@@ -151,11 +152,16 @@ def main():
         path = Path(item['annotation'])
         dataset, loader = make_loader(image_root, path, plan['batch_size'], 2)
         order = [image['owod_source_id'] for image in read_json(path)['images']]
+        annotations = {
+            ann['id']: (dataset.coco.imgs[image]['owod_source_id'], ann['category_id'])
+            for image in dataset.ids for ann in dataset.coco.imgToAnns.get(image, [])
+            if ann['category_id'] in active_classes and not ann.get('difficult')
+        }
         rows = {}
         for arm, checkpoint in plan['checkpoints'].items():
             ref = read_json(Path(item['references'][arm]['path']))
             rows[arm] = replay(f'{slice_name}-{arm}', checkpoint, dataset, loader, manifest, order,
-                               classes, threshold, plan_hash, ref)
+                               active_classes, annotations, threshold, plan_hash, ref)
 
         counts = {group: paired_transitions(rows['control'], rows['candidate'], ids, threshold)
                   for group, ids in classes.items()}
@@ -171,6 +177,7 @@ def main():
             old_prioritize_geometry=lost_box > lost_rank,
         )
     write_json(OUTPUT / 'comparison.json', dict(status='complete', paper_comparable=False, plan_sha256=plan_hash,
+               coverage_definition='VOC-rounded per-annotation coverage, separate from normalized raw coverage and AP.',
                slices=comparisons, current_prioritize_selection=all(x['current_prioritize_selection'] for x in comparisons.values()),
                old_prioritize_geometry=all(x['old_prioritize_geometry'] for x in comparisons.values())))
     print('Paired target transfer comparison saved', flush=True)
