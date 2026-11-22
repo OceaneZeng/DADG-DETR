@@ -37,8 +37,7 @@ PRIOR_SLICES = (*PREVIOUS_SLICES,
 def prepare():
     excluded = set()
     exclusions = {}
-    prior = set(PRIOR_SLICES) | set(Path('output').glob('m-instance-task1-*/seed*-holdout1024*.json'))
-    for path in sorted(prior):
+    for path in sorted(set(PRIOR_SLICES)):
         excluded.update(source_ids(read_json(path)))
         exclusions[path.as_posix()] = file_sha256(path)
     inputs = {protocol: protocol_inputs(protocol, excluded) for protocol in LOCKED}
