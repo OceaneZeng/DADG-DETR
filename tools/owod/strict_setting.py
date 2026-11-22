@@ -7,6 +7,11 @@ from tools.owod.protocol import (file_sha256, resolve_image_root, stage_files,
 
 
 def configure_run(args):
+    if getattr(args, 'task2_protected_refill', False) and not (
+            args.owod_manifest and args.owod_discovery and args.owod_stage == 1
+            and args.owod_phase == 'finetune' and args.discovery_scoring == 'focal'
+            and args.owod_recipe == 'ow-detr-paper'):
+        raise ValueError('Protected refill requires OWOD Task 2 finetune with focal discovery and the OW-DETR recipe')
     tail = getattr(args, 'screen_tail_positive_ids', None)
     if tail and not (args.owod_screening and args.screen_branch_checkpoint and args.owod_discovery
                      and args.owod_stage == 1 and args.owod_phase == 'increment' and not args.teacher_completion):
@@ -238,6 +243,8 @@ def validate_checkpoint(args, checkpoint, resume=False):
     offset = getattr(args, 'discovery_pseudo_epoch_offset', 0)
     saved_offset = getattr(saved, 'discovery_pseudo_epoch_offset', 0)
     if resume:
+        if getattr(saved, 'task2_protected_refill', False) != getattr(args, 'task2_protected_refill', False):
+            raise ValueError('Cannot change Task 2 protected refill on resume')
         if getattr(saved, 'screen_tail_positive_ids', None) != getattr(args, 'screen_tail_positive_ids', None):
             raise ValueError('Cannot change the weighted increment class set on resume')
         if getattr(saved, 'screen_double_current_positives', False) != getattr(args, 'screen_double_current_positives', False):

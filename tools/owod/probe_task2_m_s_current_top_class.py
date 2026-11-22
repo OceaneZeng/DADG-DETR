@@ -7,7 +7,7 @@ import subprocess
 from pycocotools.coco import COCO
 import torch
 
-from models.graph_local.discovery import DiscoveryPostProcess
+from models.graph_local.discovery import DiscoveryPostProcess, UnknownRefillScore
 from tools.owod.diagnose_learning import make_loader
 from tools.owod.gnn_calibration import load_detector
 from tools.owod.probe_task1_paired_discovery import verified
@@ -49,38 +49,6 @@ class UniqueQueryScore(DiscoveryPostProcess):
         winning_scores, winners = scores.max(dim=-1, keepdim=True)
         unique = torch.full_like(scores, -torch.inf).scatter_(-1, winners, winning_scores)
         return unique, categories, unknown
-
-
-class UnknownRefillScore(DiscoveryPostProcess):
-    def __init__(self, *args, protected_ids=(), **kwargs):
-        super().__init__(*args, **kwargs)
-        self.protected_ids = tuple(protected_ids)
-
-    def candidate_scores(self, outputs):
-        scores, categories, unknown = super().candidate_scores(outputs)
-        rows, query_count, class_count = scores.shape
-        if len(self.known_ids) + 1 != class_count or int(categories[-1]) != 91:
-            raise ValueError('Expected an active unknown output')
-        native = scores.flatten(1)
-        values, indices = native.topk(self.max_detections, dim=1)
-        queries = indices // class_count
-        positions = torch.arange(self.max_detections, device=scores.device)
-        earlier = positions[:, None] > positions[None, :]
-        repeated = ((queries[..., None] == queries[:, None, :]) & earlier).any(dim=-1)
-        classes = indices % class_count
-        eligible = repeated & (classes != class_count - 1)
-        if self.protected_ids:
-            eligible &= ~torch.isin(categories[classes], categories.new_tensor(self.protected_ids))
-        drop = torch.where(eligible, positions, -1).max(dim=1).values
-        used = torch.zeros((rows, query_count), dtype=torch.bool, device=scores.device)
-        used.scatter_(1, queries, True)
-        refill_scores, refill_queries = unknown.masked_fill(used, -torch.inf).max(dim=1)
-        refill = drop.ge(0) & refill_scores.isfinite()
-        selected = torch.full_like(native, -torch.inf).scatter_(1, indices, values)
-        batch = torch.arange(rows, device=scores.device)[refill]
-        selected[batch, indices[batch, drop[batch]]] = -torch.inf
-        selected[batch, refill_queries[batch] * class_count + class_count - 1] = refill_scores[batch]
-        return selected.reshape_as(scores), categories, unknown
 
 
 def summarize_views(report, prior, shared):

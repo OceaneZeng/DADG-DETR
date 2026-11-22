@@ -58,6 +58,11 @@ def build_plan(args):
         raise FileNotFoundError(args.backbone_weights)
     image_root = resolve_image_root(args.manifest, manifest)
     method = getattr(args, 'method', 'control')
+    protected_refill = getattr(args, 'task2_protected_refill', False)
+    if protected_refill and (
+            method != 'discovery' or args.recipe != 'ow-detr-paper' or task1_only
+            or getattr(args, 'discovery_scoring', 'hierarchical') != 'focal'):
+        raise ValueError('Protected refill requires Task 2 finetune with --method discovery and focal scoring')
     instance_mode = getattr(args, 'instance_mode', 'legacy')
     if instance_mode != 'legacy' and method != 'discovery':
         raise ValueError('Instance transfer requires --method discovery')
@@ -209,6 +214,8 @@ def build_plan(args):
                 if no_distill:
                     command += ['--screen-no-distill']
                 command += ['--owod-discovery', '--discovery-scoring', getattr(args, 'discovery_scoring', 'hierarchical')]
+                if protected_refill and stage == 1 and phase == 'finetune':
+                    command += ['--task2-protected-refill']
                 # Keep legacy v5 command lists identical, including resume plans.
                 if ramp_epochs:
                     command += ['--discovery-pseudo-ramp-epochs', str(ramp_epochs)]
@@ -309,6 +316,8 @@ def get_args_parser():
     parser.add_argument('--graph-localization', choices=('frozen', 'bbox-last', 'cross-attn-last'), default='frozen')
     parser.add_argument('--instance-mode', choices=('legacy','matched','off','shuffled'),default='legacy')
     parser.add_argument('--discovery-scoring', choices=('hierarchical', 'focal'), default='hierarchical')
+    parser.add_argument('--task2-protected-refill', action='store_true',
+                        help='Enable protected unknown refill in Task 2 finetune evaluation')
     parser.add_argument('--discovery-pseudo-ramp-epochs', type=int, default=0,
                         help='Experimental v6 pseudo loss ramp after warmup; default 0 keeps v5')
     parser.add_argument('--discovery-objectness-loss', choices=('balanced-bce', 'focal'), default='balanced-bce')

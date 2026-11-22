@@ -545,14 +545,55 @@ class DiscoveryPostProcess(PostProcess):
         return results
 
 
+class UnknownRefillScore(DiscoveryPostProcess):
+    """Use a repeated known detection's slot for a distinct unknown query."""
+
+    def __init__(self, *args, protected_ids=(), **kwargs):
+        super().__init__(*args, **kwargs)
+        self.protected_ids = tuple(protected_ids)
+
+    def candidate_scores(self, outputs):
+        scores, categories, unknown = super().candidate_scores(outputs)
+        rows, query_count, class_count = scores.shape
+        if len(self.known_ids) + 1 != class_count or int(categories[-1]) != 91:
+            raise ValueError('Expected an active unknown output')
+        native = scores.flatten(1)
+        values, indices = native.topk(self.max_detections, dim=1)
+        queries = indices // class_count
+        positions = torch.arange(self.max_detections, device=scores.device)
+        earlier = positions[:, None] > positions[None, :]
+        repeated = ((queries[..., None] == queries[:, None, :]) & earlier).any(dim=-1)
+        classes = indices % class_count
+        eligible = repeated & (classes != class_count - 1)
+        if self.protected_ids:
+            eligible &= ~torch.isin(categories[classes], categories.new_tensor(self.protected_ids))
+        drop = torch.where(eligible, positions, -1).max(dim=1).values
+        used = torch.zeros((rows, query_count), dtype=torch.bool, device=scores.device)
+        used.scatter_(1, queries, True)
+        refill_scores, refill_queries = unknown.masked_fill(used, -torch.inf).max(dim=1)
+        refill = drop.ge(0) & refill_scores.isfinite()
+        selected = torch.full_like(native, -torch.inf).scatter_(1, indices, values)
+        batch = torch.arange(rows, device=scores.device)[refill]
+        selected[batch, indices[batch, drop[batch]]] = -torch.inf
+        selected[batch, refill_queries[batch] * class_count + class_count - 1] = refill_scores[batch]
+        return selected.reshape_as(scores), categories, unknown
+
+
+def build_discovery_postprocessor(args):
+    options = dict(
+        known_ids=args.owod_known_class_ids, max_detections=args.owod_max_detections,
+        unknown_threshold=args.unknown_threshold,
+        scoring=getattr(args, 'discovery_scoring', 'hierarchical'))
+    if getattr(args, 'task2_protected_refill', False):
+        return UnknownRefillScore(protected_ids=args.owod_current_class_ids, **options)
+    return DiscoveryPostProcess(**options)
+
+
 def build(args):
     base, criterion, _ = build_base(args)
     model = DiscoveryDetector(base, args)
     criterion = DiscoveryCriterion(criterion, model, args)
-    return model, criterion, {'bbox': DiscoveryPostProcess(
-        known_ids=args.owod_known_class_ids, max_detections=args.owod_max_detections,
-        unknown_threshold=args.unknown_threshold,
-        scoring=getattr(args, 'discovery_scoring', 'hierarchical'))}
+    return model, criterion, {'bbox': build_discovery_postprocessor(args)}
 
 
 def make_ema(model):

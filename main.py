@@ -180,6 +180,8 @@ def get_args_parser():
                                                          'decoder-bbox-increment-quality', 'decoder-bbox-increment-encoder-ffn'),
                         default='frozen')
     parser.add_argument('--discovery-scoring', choices=('hierarchical', 'focal'), default='hierarchical')
+    parser.add_argument('--task2-protected-refill', action='store_true',
+                        help='Use one repeated Previous detection slot for unknown discovery in Task 2 finetune evaluation')
     parser.add_argument('--graph-sketch-max-images', type=int, default=12)
     parser.add_argument('--owod-discovery', action='store_true')
     parser.add_argument('--discovery-no-message', action='store_true',
