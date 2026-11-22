@@ -200,7 +200,7 @@ def prepare():
 
 
 @torch.inference_mode()
-def measure(model, manifest, image_root, path, batch, max_detections):
+def measure(model, manifest, image_root, path, batch, max_detections, *, observer=None):
     dataset, loader = make_loader(image_root, path, batch, 2)
     known = manifest['stages'][0]['classes']
     post = DiscoveryPostProcess(known_ids=known, scoring='focal', max_detections=max_detections)
@@ -213,6 +213,8 @@ def measure(model, manifest, image_root, path, batch, max_detections):
         out = model(samples.to('cuda'))
         sizes = torch.stack([t['orig_size'] for t in targets]).cuda()
         detections = post(out, sizes)
+        if observer is not None:
+            observer(dataset, samples, targets, out, detections, sizes, post)
         for i, t in enumerate(targets):
             image = int(t['image_id'])
             height, width = t['orig_size'].tolist()
