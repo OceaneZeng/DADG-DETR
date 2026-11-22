@@ -13,7 +13,7 @@ from tools.owod.probe_task2_m_s_current_fp_open_set import OPEN_KEYS, append_unk
 from tools.owod.probe_task2_m_s_current_score import measure, summarize
 from tools.owod.probe_task2_m_s_current_top_class import UnknownRefillScore
 from tools.owod.probe_task2_m_s_shared_current import MANIFESTS, OUTPUT as SOURCE, prepare
-from tools.owod.protocol import file_sha256, read_json
+from tools.owod.protocol import file_sha256, read_json, resolve_image_root
 from tools.owod.run_cross_attention_study import pin
 from tools.owod.run_task1_m_s_released_small_extent import annotation_digest, raw_evaluation_source
 from tools.owod.screening_data import subset, write_json
@@ -25,6 +25,7 @@ PARENT_RESULT = '5d352e7889bda076c3b430a3d080b1c46d5cf8116dd83e384e75dcf54bb694d
 SOURCE_PLAN = 'de4bb126945143a69b5a60e60b83b7761c6270e6e71734fe127129948fd35712'
 FOLD_SEEDS = {'first': 65, 'second': 66}
 POOL_SEED = 67
+PREPARED_COHORT = '26dd2b7e3579687b4fb247018017029aec9796ab3aae3db5a4cc5118e598cf39'
 
 
 def summarize_refill(report, shared, plan):
@@ -62,8 +63,16 @@ def main():
     excluded = {name for spec in original_folds['cohorts'].values() for name in spec['order']}
     print('Preparing two independent paired Task 2 folds', flush=True)
     cohort_dir = OUTPUT / 'cohorts'
-    source, manifests, roots = prepare(output=cohort_dir, fold_seeds=FOLD_SEEDS,
-                                       pool_seed=POOL_SEED, excluded_sources=excluded)
+    cohort_path = cohort_dir / 'plan.json'
+    run_plan_path = OUTPUT / 'plan.json'
+    if cohort_path.exists():
+        locked = read_json(run_plan_path)['cohort_plan'] if run_plan_path.exists() else PREPARED_COHORT
+        source = verified(cohort_path, locked)
+        manifests = {p: verified(MANIFESTS[p], info['manifest_sha256']) for p, info in source['protocols'].items()}
+        roots = {p: resolve_image_root(MANIFESTS[p], manifest) for p, manifest in manifests.items()}
+    else:
+        source, manifests, roots = prepare(output=cohort_dir, fold_seeds=FOLD_SEEDS,
+                                           pool_seed=POOL_SEED, excluded_sources=excluded)
     if any(excluded.intersection(cohort['order']) for cohort in source['cohorts'].values()):
         raise ValueError('Repeated discovery images in independent folds')
     if source['protocols'] != original_folds['protocols']:
@@ -92,11 +101,19 @@ def main():
                 refill_ap_tolerance=original['refill_ap_tolerance'],
                 max_refills_per_image=original['max_refills_per_image'],
                 batch_size=source['batch_size'], limit=source['max_detections'], paper_comparable=False)
-    pin(OUTPUT / 'plan.json', plan)
-    digest = file_sha256(OUTPUT / 'plan.json')
+    if run_plan_path.exists():
+        pin(run_plan_path, plan)
+    else:
+        prepared = {'cohorts', 'run.lock', 'console.log'} | {entry['file'] for entry in reports.values()}
+        if any(path.name not in prepared for path in OUTPUT.iterdir()):
+            raise ValueError('Unexpected files before the independent replay plan')
+        write_json(run_plan_path, plan)
+    digest = file_sha256(run_plan_path)
     summaries = {}
     for protocol, info in source['protocols'].items():
         checkpoint = Path(info['endpoints']['finetune']['path'])
+        if file_sha256(checkpoint) != info['endpoints']['finetune']['sha256']:
+            raise ValueError(f'Changed frozen endpoint: {protocol}')
         model, _ = load_detector(None, checkpoint, torch.device('cuda'))
         model.eval()
         known = info['previous'] + info['current']
