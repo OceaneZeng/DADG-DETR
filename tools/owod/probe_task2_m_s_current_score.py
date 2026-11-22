@@ -41,9 +41,10 @@ class CurrentScore(DiscoveryPostProcess):
 
 @torch.inference_mode()
 def measure(model, dataset, loader, known, previous, current, spec, limit, *, evaluation_coco=None,
-            extra_posts=None, restore_scores_for=None, audit_query_counts=False):
-    posts = dict(native=DiscoveryPostProcess(known_ids=known, max_detections=limit, scoring='focal'),
-                 perturbed=CurrentScore(known, set(current), limit, MULTIPLIER))
+            extra_posts=None, restore_scores_for=None, audit_query_counts=False, include_perturbed=True):
+    posts = dict(native=DiscoveryPostProcess(known_ids=known, max_detections=limit, scoring='focal'))
+    if include_perturbed:
+        posts['perturbed'] = CurrentScore(known, set(current), limit, MULTIPLIER)
     if extra_posts is not None:
         posts.update(extra_posts)
     predictions = {name: {} for name in posts}

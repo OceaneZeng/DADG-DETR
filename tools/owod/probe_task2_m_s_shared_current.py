@@ -101,8 +101,10 @@ def collect_sources():
     return manifests, originals, specs, roots, blocked, exclusions
 
 
-def prepare():
+def prepare(*, output=OUTPUT, fold_seeds=None, pool_seed=POOL_SEED, excluded_sources=()):
     manifests, originals, specs, roots, blocked, exclusions = collect_sources()
+    fold_seeds = FOLDS if fold_seeds is None else fold_seeds
+    blocked.update(excluded_sources)
     m, s = ('m-owodb', 's-owodb')
     shared = set(specs[m]['current']) & set(specs[s]['current'])
     if len(shared) != 15:
@@ -115,7 +117,7 @@ def prepare():
     # Only sample sources that have an exact shared target in both protocols.
     pool = dict(images=[im for name, im in registered[m][0].items() if name in names_with_matches],
                 annotations=[mr[key] for key in sorted(matches)])
-    candidate_names = select_images(pool, POOL_IMAGES, sorted(shared), POOL_SEED)
+    candidate_names = select_images(pool, POOL_IMAGES, sorted(shared), pool_seed)
     full = {}
     coverage_pool = dict(images=[im for im in pool['images'] if im['owod_source_id'] in candidate_names],
                          annotations=[])
@@ -134,7 +136,7 @@ def prepare():
             for row in full[protocol]['annotations'] if not row.get('difficult')
         )
     used, selections = set(), {}
-    for fold, seed in FOLDS.items():
+    for fold, seed in fold_seeds.items():
         names = select_images(coverage_pool, IMAGES_PER_FOLD, coverage_classes, seed, excluded=used)
         selections[fold] = sorted(names)
         used.update(names)
@@ -162,13 +164,13 @@ def prepare():
                 raise ValueError(f'Incomplete {protocol}/{fold}: missing classes={sorted(active - present)}, '
                                  f'unpaired targets={unpaired}')
             pair_rows[protocol] = [raw_rows[key]['id'] for key in common_keys]
-            path = OUTPUT / f'{protocol}-{fold}-annotations.json'
+            path = output / f'{protocol}-{fold}-annotations.json'
             assets[path] = payload
             fold_specs[protocol] = dict(file=path.name, sha256=annotation_digest(payload))
         pairs = [dict(image=key[0], category=key[1], voc_bbox=key[2],
                       annotation_ids={protocol: ids[i] for protocol, ids in pair_rows.items()})
                  for i, key in enumerate(common_keys)]
-        pair_path = OUTPUT / f'{fold}-paired-targets.json'
+        pair_path = output / f'{fold}-paired-targets.json'
         assets[pair_path] = pairs
         cohorts[fold] = dict(order=order, image_bytes_sha256=identity.hexdigest(), targets=len(pairs),
                              paired_file=pair_path.name, paired_sha256=annotation_digest(pairs),
@@ -176,10 +178,10 @@ def prepare():
     plan = dict(commit=subprocess.check_output(['git', 'rev-parse', 'HEAD'], text=True).strip(),
                 protocols=specs, shared_classes=sorted(shared), cohorts=cohorts, exclusions=exclusions,
                 excluded_ids_sha256=sha256('\n'.join(sorted(blocked)).encode()).hexdigest(),
-                seeds=FOLDS, candidate_pool=dict(seed=POOL_SEED, images=POOL_IMAGES),
+                seeds=fold_seeds, candidate_pool=dict(seed=pool_seed, images=POOL_IMAGES),
                 batch_size=BATCH, paper_comparable=False, scoring='focal', max_detections=50,
                 gpu=torch.cuda.get_device_name(), torch_version=str(torch.__version__))
-    pin(OUTPUT / 'plan.json', plan)
+    pin(output / 'plan.json', plan)
     for path, value in assets.items():
         if not path.exists():
             write_json(path, value)
