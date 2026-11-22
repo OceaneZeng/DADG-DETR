@@ -1,5 +1,6 @@
 """Compare three- and six-epoch Task 2 endpoints on the same protected-refill folds."""
 
+import argparse
 from pathlib import Path
 import subprocess
 
@@ -19,11 +20,14 @@ from tools.owod.screening_data import write_json
 
 
 OUTPUT = PROTECTED_OUTPUT.with_name('task2-m-s-refill-duration')
+PREVIOUS_ORDER_OUTPUT = OUTPUT.with_name('task2-m-s-refill-previous-order')
 SHORT_RESULT = '235e6303e8df7511fcf3271f2c33268341066dd808e169deb6f23c8ac974cb9b'
+DURATION_RESULT = 'dd8eb5343ccb41605a4cc89358582cd9e4b1614ee43f6ee227e806511fe8acde'
 M_ENDPOINTS = 'f1bfb8aa346039aa631f17b9f710f2f039af1c6d5829650c5d8895225fa7fd83'
 S_ENDPOINTS = '4f698b6c4c608cb835f063960416ba546af06e557356f623555b4158eee9172f'
 DURATION_MARGIN = .01
 METRICS = ('previous_ap50', 'current_ap50', 'known_ap50', 'u_recall', 'wi', 'a_ose')
+ORDERS = ('stable_quantized', 'stable_raw')
 
 
 def checkpoints(cohorts):
@@ -66,7 +70,40 @@ def compare(short, long, refill_summary):
         and score['known_ap50'] >= 0))
 
 
-def main():
+def compare_previous_order(reference, report, tolerance):
+    arms = ('native', 'unknown_refill')
+    for arm in arms:
+        observed = report['views'][arm]
+        original = reference['views'][arm]
+        metrics = {key: value for key, value in observed['metrics'].items() if key != 'previous_class_stats'}
+        if metrics != original['metrics'] or observed['matched'] != original['matched']:
+            raise ValueError(f'Changed six-epoch author-order replay: {arm}')
+    if any(report[key] != reference[key] for key in ('per_image', 'queries_per_image')):
+        raise ValueError('Changed six-epoch output budget or queries')
+
+    native, refill = (report['previous_matches'][arm] for arm in arms)
+    before, after = (report['views'][arm]['metrics'] for arm in arms)
+    classes = {}
+    for category, ids in native.items():
+        kept = set(refill[category])
+        earlier = set(ids)
+        ap_before, ap_after = (score['previous_class_stats'][category]['ap50'] for score in (before, after))
+        classes[category] = dict(lost=sorted(earlier - kept), gained=sorted(kept - earlier),
+                                 previous_ap50_delta=ap_after - ap_before)
+    author = after['previous_ap50'] - before['previous_ap50']
+    order_deltas = {}
+    for order, views in report['score_order_views'].items():
+        earlier, later = (views[arm]['previous_ap50'] for arm in arms)
+        order_deltas[order] = later - earlier
+    lost = sum(len(row['lost']) for row in classes.values())
+    gained = sum(len(row['gained']) for row in classes.values())
+    sensitive = (author < -tolerance and not (lost or gained)
+                 and all(delta >= -tolerance for delta in order_deltas.values()))
+    return dict(author_previous_ap50_delta=author, diagnostic_previous_ap50_deltas=order_deltas,
+                lost=lost, gained=gained, classes=classes, ranking_sensitive=sensitive)
+
+
+def main(audit_previous=False):
     if torch.cuda.device_count() != 1 or torch.cuda.get_device_name() != 'NVIDIA GeForce RTX 3090':
         raise ValueError('Use one RTX 3090')
     short = verified(PROTECTED_OUTPUT / 'comparison.json', SHORT_RESULT)
@@ -83,7 +120,16 @@ def main():
                 duration_margin=DURATION_MARGIN, protected_group='current',
                 minimum_unknown_recall_gain=parent['minimum_unknown_recall_gain'],
                 refill_ap_tolerance=parent['refill_ap_tolerance'], paper_comparable=False)
-    plan_path = OUTPUT / 'plan.json'
+    output = PREVIOUS_ORDER_OUTPUT if audit_previous else OUTPUT
+    if audit_previous:
+        duration = verified(OUTPUT / 'comparison.json', DURATION_RESULT)
+        previous = verified(OUTPUT / 'plan.json', duration['plan_sha256'])
+        if any(previous[key] != plan[key] for key in plan if key != 'commit'):
+            raise ValueError('Changed six-epoch replay plan')
+        references = {label: file_sha256(OUTPUT / f'{label}.json') for label in parent['reports']}
+        plan.update(duration_result=DURATION_RESULT, duration_plan=duration['plan_sha256'],
+                    references=references, diagnostic_score_orders=list(ORDERS))
+    plan_path = output / 'plan.json'
     pin(plan_path, plan)
     digest = file_sha256(plan_path)
     results = {}
@@ -104,7 +150,7 @@ def main():
             full = parent['reports'][label]
             full_path = PROTECTED_OUTPUT / full['file']
             verified(full_path, full['sha256'])
-            dest = OUTPUT / f'{label}.json'
+            dest = output / f'{label}.json'
             if not dest.exists():
                 print(f'Evaluating {protocol}/{fold} at the six-epoch finetune endpoint', flush=True)
                 dataset, loader = make_loader(root, path, parent['batch_size'], 2)
@@ -112,11 +158,18 @@ def main():
                 report = measure(model, dataset, loader, known, info['previous'], info['current'], spec,
                                  parent['limit'], evaluation_coco=COCO(str(full_path)),
                                  extra_posts=dict(unknown_refill=post), audit_query_counts=True,
-                                 include_perturbed=False)
+                                 include_perturbed=False, audit_previous_matches=audit_previous,
+                                 diagnostic_score_orders=plan.get('diagnostic_score_orders', ()))
                 write_json(dest, dict(plan_sha256=digest, **report))
             report = read_json(dest)
             if report['plan_sha256'] != digest or len(report['per_image']) != len(cohort['order']):
                 raise ValueError(f'Changed duration replay: {label}')
+            if audit_previous:
+                reference = verified(OUTPUT / f'{label}.json', plan['references'][label])
+                if reference['plan_sha256'] != plan['duration_plan']:
+                    raise ValueError(f'Changed duration reference: {label}')
+                results[protocol][fold] = compare_previous_order(reference, report, plan['refill_ap_tolerance'])
+                continue
             pairs = verified(cohort_dir / cohort['paired_file'], cohort['paired_sha256'])
             shared = {pair['annotation_ids'][protocol] for pair in pairs}
             reference = read_json(PROTECTED_OUTPUT / f'{label}.json')
@@ -125,9 +178,11 @@ def main():
                 raise ValueError(f'Changed three-epoch matched cohort: {label}')
             results[protocol][fold] = compare(reference, report, summarize_refill(report, shared, plan))
         del model
-    write_json(OUTPUT / 'comparison.json', dict(status='complete', plan_sha256=digest,
+    write_json(output / 'comparison.json', dict(status='complete', plan_sha256=digest,
                protocols=results, paper_comparable=False))
 
 
 if __name__ == '__main__':
-    main()
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--audit-previous', action='store_true')
+    main(parser.parse_args().audit_previous)

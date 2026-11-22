@@ -42,7 +42,7 @@ class CurrentScore(DiscoveryPostProcess):
 @torch.inference_mode()
 def measure(model, dataset, loader, known, previous, current, spec, limit, *, evaluation_coco=None,
             extra_posts=None, restore_scores_for=None, audit_query_counts=False, include_perturbed=True,
-            diagnostic_score_orders=()):
+            diagnostic_score_orders=(), audit_previous_matches=False):
     posts = dict(native=DiscoveryPostProcess(known_ids=known, max_detections=limit, scoring='focal'))
     if include_perturbed:
         posts['perturbed'] = CurrentScore(known, set(current), limit, MULTIPLIER)
@@ -88,16 +88,22 @@ def measure(model, dataset, loader, known, previous, current, spec, limit, *, ev
         if step % 64 == 0 or step == len(loader):
             print(f'Inference {step}/{len(loader)} batches', flush=True)
     views = {}
+    previous_matches = {}
     coco = dataset.coco if evaluation_coco is None else evaluation_coco
     for name, values in predictions.items():
         metrics = evaluate_author_benchmark(values, coco, known, previous, current, spec,
-                                            include_current_stats=True, include_matched_ids=True)
+                                            include_current_stats=True, include_matched_ids=True,
+                                            include_previous_stats=audit_previous_matches)
         by_class = metrics.pop('matched_annotation_ids')
         matched = {i for category in current for i in by_class[category]}
         if len(matched) != sum(c['tp'] for c in metrics['current_class_stats'].values()):
             raise ValueError(f'Changed Current VOC matching: {name}')
         views[name] = dict(metrics=metrics, matched=sorted(matched))
+        if audit_previous_matches:
+            previous_matches[name] = {category: by_class[category] for category in previous}
     report = dict(views=views, per_image=per_image)
+    if audit_previous_matches:
+        report['previous_matches'] = previous_matches
     if audit_query_counts:
         report['queries_per_image'] = queries_per_image
     if diagnostic_score_orders:
