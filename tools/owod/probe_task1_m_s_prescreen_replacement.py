@@ -95,7 +95,7 @@ def choose(out, i, target, objects, before, *, assignments=None):
 
 
 @torch.inference_mode()
-def replay(model, dataset, loader, known, cases, *, observer=None):
+def replay(model, dataset, loader, known, cases, *, observer=None, batch_observer=None):
     post = DiscoveryPostProcess(known_ids=known, scoring='focal', max_detections=50)
     module = model.detr.transformer.instance_proposals
     rows, counts = [], []
@@ -125,6 +125,8 @@ def replay(model, dataset, loader, known, cases, *, observer=None):
                 alternate = post(changed, sizes, include_top_indices=observer is not None)
                 if observer is not None:
                     observer(changed, alternate, targets, objects, cells, assignments)
+                if batch_observer is not None:
+                    batch_observer(samples, changed, alternate, targets, objects, cells, assignments)
             else:
                 changed, alternate = native, detections
             for i, v in objects.items():
