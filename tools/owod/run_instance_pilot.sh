@@ -14,7 +14,7 @@ export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1}"
 export OMP_NUM_THREADS=2
 export PYTHONUNBUFFERED=1
 export PYTHONPATH="$PWD/models/ops:$PWD${PYTHONPATH:+:$PYTHONPATH}"
-if [[ ${1:-} == --task2-m-s-previous-hard-negatives || ${1:-} == --task2-m-s-previous-hard-negative-head || ${1:-} == --task2-m-s-previous-hard-negative-misses || ${1:-} == --task2-m-s-previous-hard-negative-scores || ${1:-} == --task2-m-s-previous-competitor-training-probe || ${1:-} == --task2-m-s-current-training-ranks || ${1:-} == --task2-m-s-current-training-geometry || ${1:-} == --task2-m-s-current-shortlist-ranks || ${1:-} == --task2-m-s-current-shortlist-replacement || ${1:-} == --task2-m-s-current-replacement-trace || ${1:-} == --task2-m-s-native-box-blend || ${1:-} == --task2-m-s-current-low-iou-boxes ]]; then
+if [[ ${1:-} == --task2-m-s-previous-hard-negatives || ${1:-} == --task2-m-s-previous-hard-negative-head || ${1:-} == --task2-m-s-previous-hard-negative-misses || ${1:-} == --task2-m-s-previous-hard-negative-scores || ${1:-} == --task2-m-s-previous-competitor-training-probe || ${1:-} == --task2-m-s-current-training-ranks || ${1:-} == --task2-m-s-current-training-geometry || ${1:-} == --task2-m-s-current-shortlist-ranks || ${1:-} == --task2-m-s-current-shortlist-replacement || ${1:-} == --task2-m-s-current-replacement-trace || ${1:-} == --task2-m-s-native-box-blend || ${1:-} == --task2-m-s-current-low-iou-boxes || ${1:-} == --task2-m-s-current-low-iou-box-misses ]]; then
   dir="output/${1#--}"
   module=tools.owod.run_task2_m_s_previous_hard_negatives
   flags=()
@@ -38,10 +38,12 @@ if [[ ${1:-} == --task2-m-s-previous-hard-negatives || ${1:-} == --task2-m-s-pre
     elif [[ $1 == --task2-m-s-current-shortlist-ranks ]]; then
       flags=(--shortlist-ranks)
     fi
-  elif [[ $1 == --task2-m-s-previous-hard-negative-misses || $1 == --task2-m-s-previous-hard-negative-scores ]]; then
+  elif [[ $1 == --task2-m-s-previous-hard-negative-misses || $1 == --task2-m-s-previous-hard-negative-scores || $1 == --task2-m-s-current-low-iou-box-misses ]]; then
     module=tools.owod.probe_task2_m_s_previous_hard_negative_misses
     if [[ $1 == --task2-m-s-previous-hard-negative-scores ]]; then
       flags=(--score-components)
+    elif [[ flags=(--score-components) == --task2-m-s-current-low-iou-box-misses ]]; then
+      flags=(--low-iou-boxes)
     fi
   fi
   export TMPDIR="$PWD/output/.tmp-owod"
