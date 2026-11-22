@@ -90,10 +90,11 @@ def cohorts(raw, known, blocked, *, seeds=SLICE_SEEDS):
         yield name, dict(raw, images=images, annotations=[a for a in raw['annotations'] if a['image_id'] in ids])
 
 
-def raw_evaluation_source(protocol, manifest, blocked):
+def raw_evaluation_source(protocol, manifest, blocked, *, allowed=None):
     names = sorted((set(manifest['splits']['t1_train']) | set(manifest['splits']['t2_train'])) - blocked)
     image_root = resolve_image_root(MANIFESTS[protocol], manifest)
-    allowed = manifest['stages'][1]['active_classes']
+    if allowed is None:
+        allowed = manifest['stages'][1]['active_classes']
     if protocol == 's-owodb':
         images, boxes, actual = prepare_benchmarks.load_coco(image_root)
         expected = {Path(path).name: digest for path, digest in manifest['source_hashes'].items()}

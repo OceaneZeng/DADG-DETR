@@ -40,7 +40,7 @@ class CurrentScore(DiscoveryPostProcess):
 
 
 @torch.inference_mode()
-def measure(model, dataset, loader, known, previous, current, spec, limit):
+def measure(model, dataset, loader, known, previous, current, spec, limit, *, evaluation_coco=None):
     posts = dict(native=DiscoveryPostProcess(known_ids=known, max_detections=limit, scoring='focal'),
                  perturbed=CurrentScore(known, set(current), limit, MULTIPLIER))
     predictions = {name: {} for name in posts}
@@ -63,8 +63,9 @@ def measure(model, dataset, loader, known, previous, current, spec, limit):
         if step % 64 == 0 or step == len(loader):
             print(f'Inference {step}/{len(loader)} batches', flush=True)
     views = {}
+    coco = dataset.coco if evaluation_coco is None else evaluation_coco
     for name, values in predictions.items():
-        metrics = evaluate_author_benchmark(values, dataset.coco, known, previous, current, spec,
+        metrics = evaluate_author_benchmark(values, coco, known, previous, current, spec,
                                             include_current_stats=True, include_matched_ids=True)
         by_class = metrics.pop('matched_annotation_ids')
         matched = {i for category in current for i in by_class[category]}

@@ -64,6 +64,8 @@ def current_fp_sources(label, items, order, gt, tp, fp, recall, specification):
     fp_ranks = np.flatnonzero(np.diff(fp, prepend=0))
     source = np.zeros(len(order), dtype=np.int8)
     confused_with = defaultdict(int)
+    track_unresolved_unknown = specification.get('diagnostic_unresolved_unknown_overlap', False)
+    unresolved_unknown_overlap = 0
     threshold = specification['iou_threshold']
     for rank in fp_ranks:
         _, image_id, box = items[order[rank]]
@@ -85,6 +87,9 @@ def current_fp_sources(label, items, order, gt, tp, fp, recall, specification):
             source[rank] = 3
         else:
             source[rank] = 4
+            if track_unresolved_unknown:
+                unknown = [b for b, difficult in objects[-1] if not difficult]
+                unresolved_unknown_overlap += int((overlaps(box, unknown) > threshold).any())
     result = {}
     for number, name in enumerate(families, 1):
         remove = source == number
@@ -93,6 +98,8 @@ def current_fp_sources(label, items, order, gt, tp, fp, recall, specification):
         result[name] = dict(fp=int(remove.sum()), ap50_without=voc_ap(
             recall, precision, specification['ap_mode']))
     report = dict(families=result, confused_with=dict(confused_with))
+    if track_unresolved_unknown:
+        report['unresolved_unknown_overlap'] = unresolved_unknown_overlap
     if specification.get('diagnostic_absent_unresolved'):
         report['absent_unresolved'] = absent_unresolved_ranking(
             label, items, order, gt, np.flatnonzero(source == 4), tp, fp, recall, specification)
