@@ -1,5 +1,6 @@
 """Locate the Previous candidates that compete with recovered Current matches."""
 
+import argparse
 from collections import Counter, defaultdict
 from pathlib import Path
 import subprocess
@@ -22,6 +23,8 @@ from util.box_ops import box_cxcywh_to_xyxy
 
 
 OUTPUT = SOURCE.with_name('task2-m-s-previous-competition')
+BACKGROUND_OUTPUT = OUTPUT.with_name('task2-m-s-previous-competition-background')
+COMPETITION_RESULT = 'c68f1e200031fe62255a35e1ca1a3736a5867904d0847d106f7c20fcb1542b32'
 ROLE_RESULT = '7b137773982dacc07babaec3d5fe9954c9fed04fae3883b5a1985850b2ea88d2'
 
 
@@ -30,7 +33,7 @@ def selected_queries(posts, current_position, class_count, limit):
     return set((indices[indices % class_count == current_position] // class_count).tolist())
 
 
-def attribution(full, hybrid, correct_queries, current_position, previous_count, limit):
+def attribution(full, hybrid, correct_queries, current_position, previous_count, limit, competitors=None):
     class_count = full.shape[-1]
     full_queries = selected_queries(full, current_position, class_count, limit)
     if not full_queries.intersection(correct_queries):
@@ -44,16 +47,36 @@ def attribution(full, hybrid, correct_queries, current_position, previous_count,
     outside[correct_queries, :previous_count] = hybrid[correct_queries, :previous_count]
     active = [bool(selected_queries(values, current_position, class_count, limit).intersection(correct_queries))
               for values in (within, outside)]
-    return {
+    label = {
         (True, True): 'either',
         (True, False): 'overlapping_queries_only',
         (False, True): 'other_queries_only',
         (False, False): 'both_required',
     }[tuple(active)]
+    if competitors is None or label != 'other_queries_only':
+        return label
+    # Keep any old candidate that overlaps an old GT or an ignored instance.
+    for query in correct_queries:
+        competitors[query] = False
+    guarded = hybrid.clone()
+    guarded[:, :previous_count] = torch.where(competitors, full[:, :previous_count],
+                                            hybrid[:, :previous_count])
+    return label, bool(selected_queries(guarded, current_position, class_count, limit).intersection(correct_queries))
+
+
+def previous_background(voc_boxes, annotations, categories, threshold, device):
+    by_category = defaultdict(list)
+    for annotation in annotations:
+        by_category[annotation['category_id']].append(annotation['voc_bbox'])
+    eligible = np.ones((len(voc_boxes), len(categories)), dtype=bool)
+    for label, category in enumerate(categories):
+        truth = by_category[category]
+        eligible[:, label] = [not (overlaps(box, truth) > threshold).any() for box in voc_boxes]
+    return torch.as_tensor(eligible, device=device)
 
 
 @torch.inference_mode()
-def replay(model, loader, wanted, previous, current, limit, threshold):
+def replay(model, loader, wanted, previous, current, limit, threshold, background_only=False):
     post = DiscoveryPostProcess(known_ids=previous + current, scoring='focal', max_detections=limit)
     positions = {category: index for index, category in enumerate(previous + current)}
     rows = []
@@ -72,13 +95,22 @@ def replay(model, loader, wanted, previous, current, limit, threshold):
                 height, width = target['orig_size'].tolist()
                 scaled = boxes[image] * boxes.new_tensor([width, height, width, height])
                 voc_boxes = np.asarray([voc_prediction_box(box) for box in scaled.tolist()])
+                background = None
+                if background_only:
+                    annotations = loader.dataset.coco.imgToAnns[int(target['image_id'])]
+                    background = previous_background(voc_boxes, annotations, previous, threshold, full.device)
                 for pair in wanted[name]:
                     queries = np.flatnonzero(overlaps(np.asarray(pair['voc_bbox']), voc_boxes) > threshold).tolist()
                     if not queries:
                         raise ValueError(f'No compatible query for {pair["target"]}: {name}')
                     result = attribution(full[image], hybrid[image], queries, positions[pair['category']],
-                                         len(previous), limit)
-                    rows.append(dict(target=pair['target'], overlap_queries=len(queries), attribution=result))
+                                         len(previous), limit, None if background is None else background.clone())
+                    row = dict(target=pair['target'], overlap_queries=len(queries), attribution=result)
+                    if background_only:
+                        if isinstance(result, str):
+                            raise ValueError(f'Changed competition attribution: {name}/{pair["target"]}')
+                        row['attribution'], row['background_sufficient'] = result
+                    rows.append(row)
         if step % 64 == 0 or step == len(loader):
             print(f'Inference {step}/{len(loader)} batches, {len(rows)} tracked targets', flush=True)
     expected = {pair['target'] for pairs in wanted.values() for pair in pairs}
@@ -87,7 +119,7 @@ def replay(model, loader, wanted, previous, current, limit, threshold):
     return rows
 
 
-def main():
+def main(background_only=False):
     if torch.cuda.device_count() != 1 or torch.cuda.get_device_name() != 'NVIDIA GeForce RTX 3090':
         raise ValueError('Use one RTX 3090')
     references = {}
@@ -104,7 +136,15 @@ def main():
     plan = dict(commit=subprocess.check_output(['git', 'rev-parse', 'HEAD'], text=True).strip(),
                 source_plan=source_sha, full_result=FFN_RESULT, hybrid_result=DISCOVERY_RESULT,
                 fixed_counts_result=ROLE_RESULT, paper_comparable=False)
-    plan_path = OUTPUT / 'plan.json'
+    output = OUTPUT
+    if background_only:
+        competition = verified(OUTPUT / 'comparison.json', COMPETITION_RESULT)
+        prior = verified(OUTPUT / 'plan.json', competition['plan_sha256'])
+        if competition['status'] != 'complete' or any(prior[k] != plan[k] for k in plan if k != 'commit'):
+            raise ValueError('Changed Previous competition reference')
+        output = BACKGROUND_OUTPUT
+        plan.update(competition_result=COMPETITION_RESULT, competition_plan=competition['plan_sha256'])
+    plan_path = output / 'plan.json'
     pin(plan_path, plan)
     digest = file_sha256(plan_path)
     summaries = {}
@@ -118,6 +158,11 @@ def main():
             full, hybrid = (set(references[key][0]['protocols'][protocol][fold]['recovered'])
                             for key in ('full', 'hybrid'))
             targets = full - hybrid
+            if background_only:
+                original = read_json(OUTPUT / f'{label}.json')
+                if original['plan_sha256'] != plan['competition_plan'] or {r['target'] for r in original['rows']} != targets:
+                    raise ValueError(f'Changed Previous competition targets: {label}')
+                targets = {row['target'] for row in original['rows'] if row['attribution'] == 'other_queries_only'}
             pairs = verified(SOURCE / cohort['paired_file'], cohort['paired_sha256'])
             wanted = defaultdict(list)
             for pair in pairs:
@@ -126,7 +171,7 @@ def main():
                     wanted[pair['image']].append(dict(pair, target=target))
             if sum(map(len, wanted.values())) != len(targets):
                 raise ValueError(f'Changed registered target identities: {label}')
-            path = OUTPUT / f'{label}.json'
+            path = output / f'{label}.json'
             if not path.exists():
                 annotation = cohort['by_protocol'][protocol]
                 annotation_path = SOURCE / annotation['file']
@@ -134,17 +179,22 @@ def main():
                 _, loader = make_loader(root, annotation_path, source['batch_size'], 2)
                 print(f'Evaluating Previous competition on {protocol}/{fold}', flush=True)
                 rows = replay(model, loader, wanted, info['previous'], info['current'],
-                              source['max_detections'], manifest['evaluation']['iou_threshold'])
+                              source['max_detections'], manifest['evaluation']['iou_threshold'], background_only)
                 write_json(path, dict(plan_sha256=digest, rows=rows))
             report = read_json(path)
             if report['plan_sha256'] != digest or {row['target'] for row in report['rows']} != targets:
                 raise ValueError(f'Changed matched target replay: {label}')
             summaries[protocol][fold] = dict(targets=len(targets),
                                              counts=dict(Counter(row['attribution'] for row in report['rows'])))
+            if background_only:
+                summaries[protocol][fold]['background_sufficient'] = sum(row['background_sufficient']
+                                                                        for row in report['rows'])
         del model
-    write_json(OUTPUT / 'comparison.json', dict(status='complete', plan_sha256=digest,
+    write_json(output / 'comparison.json', dict(status='complete', plan_sha256=digest,
                protocols=summaries, paper_comparable=False))
 
 
 if __name__ == '__main__':
-    main()
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--background-only', action='store_true')
+    main(parser.parse_args().background_only)
