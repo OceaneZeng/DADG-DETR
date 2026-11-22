@@ -1,5 +1,6 @@
 """Check unresolved Current false positives against unreleased author annotations."""
 
+import argparse
 from pathlib import Path
 import subprocess
 
@@ -22,6 +23,8 @@ FP_REPORTS = SCORES.with_name('task2-m-s-current-fp')
 FP_PLAN = '080f4d1ec0dfd8754fb3b1fd52b8ebab170706d9192b0bb6228fbe7d344c5a3f'
 FP_RESULT = '613c1ad9125e1228b97cd1f77e5dfc17877c6623e5c74b677fd74553156a0e4c'
 OPEN_KEYS = ('unknown_gt', 'unknown_predictions', 'u_recall', 'wi', 'a_ose')
+OPEN_RESULT = '5626099bf497f1467272789a293eec0e0164a7597bc7a779973b68f326f0ae38'
+RESIDUAL_BANDS = ('zero', 'positive_below_point_one', 'at_least_point_one')
 
 
 def append_unknown(released, future):
@@ -45,7 +48,7 @@ def summarize(report, prior):
         for category, row in counts.items():
             original = baseline['metrics']['current_class_stats'][category]
             if dict(row, fp_sources={k: v for k, v in row['fp_sources'].items()
-                                    if k != 'unresolved_unknown_overlap'}) != original:
+                                    if k not in ('unresolved_unknown_overlap', 'residual_overlap')}) != original:
                 raise ValueError(f'Changed Current VOC metrics or false-positive tally: {name}/{category}')
         for key in ('previous_ap50', 'current_ap50', 'known_ap50', 'unknown_predictions'):
             if view['metrics'][key] != baseline['metrics'][key]:
@@ -63,7 +66,36 @@ def summarize(report, prior):
                 open_metrics=metrics)
 
 
-def main():
+def summarize_residual(report, prior, base):
+    arms = {}
+    for name, view in report['views'].items():
+        original = prior['views'][name]
+        stats = view['metrics']['current_class_stats']
+        stripped = {}
+        bands = dict.fromkeys((*RESIDUAL_BANDS, 'difficult_high_overlap'), 0)
+        for category, row in stats.items():
+            fp = dict(row['fp_sources'])
+            residual = fp.pop('residual_overlap')
+            if sum(residual[k] for k in RESIDUAL_BANDS) != (
+                    fp['families']['unresolved']['fp'] - fp['unresolved_unknown_overlap']):
+                raise ValueError(f'Incomplete residual attribution: {name}/{category}')
+            stripped[category] = dict(row, fp_sources=fp)
+            for key in bands:
+                bands[key] += residual[key]
+        if (dict(view['metrics'], current_class_stats=stripped) != original['metrics']
+                or view['matched'] != original['matched']
+                or report['per_image'] != prior['per_image']):
+            raise ValueError(f'Changed parent open-set report: {name}')
+        arms[name] = bands
+    delta = {k: arms['perturbed'][k] - arms['native'][k] for k in arms['native']}
+    if sum(delta[k] for k in RESIDUAL_BANDS) != base['delta']['no_overlap']:
+        raise ValueError('Changed net residual count')
+    below = delta['zero'] + delta['positive_below_point_one']
+    return dict(arms=arms, delta=delta, below_point_one=below,
+                majority_below_point_one=2*below > base['delta']['no_overlap'])
+
+
+def main(residual_overlap=False):
     if torch.cuda.device_count() != 1 or torch.cuda.get_device_name() != 'NVIDIA GeForce RTX 3090':
         raise ValueError('Use one RTX 3090')
     previous_plan = verified(FP_REPORTS / 'plan.json', FP_PLAN)
@@ -71,10 +103,26 @@ def main():
     if previous['status'] != 'complete' or previous['plan_sha256'] != FP_PLAN or previous['shared_priority'] != 'unresolved':
         raise ValueError('Missing completed false-positive attribution')
     source = verified(SOURCE / 'plan.json', previous_plan['parent_plan'])
+    output = OUTPUT
+    open_base = open_plan = None
+    if residual_overlap:
+        open_base = verified(OUTPUT / 'comparison.json', OPEN_RESULT)
+        open_plan = verified(OUTPUT / 'plan.json', open_base['plan_sha256'])
+        if (open_base['status'] != 'complete' or open_plan['prior_plan'] != FP_PLAN
+                or open_plan['prior_result'] != FP_RESULT):
+            raise ValueError('Changed full-annotation baseline')
+        output = OUTPUT.with_name('task2-m-s-current-fp-residual')
     reports, manifests, assets = {}, {}, {}
     for protocol, entry in source['protocols'].items():
         manifest_path = MANIFESTS[protocol]
         manifest = manifests[protocol] = verified(manifest_path, entry['manifest_sha256'])
+        if residual_overlap:
+            for fold in source['cohorts']:
+                label = f'{protocol}-{fold}'
+                reports[label] = dict(open_plan['reports'][label],
+                                      open_report_sha256=file_sha256(OUTPUT / f'{label}.json'))
+                verified(OUTPUT / reports[label]['file'], reports[label]['sha256'])
+            continue
         all_names = {item for c in source['cohorts'].values() for item in c['order']}
         train_names = set(manifest['splits']['t1_train']) | set(manifest['splits']['t2_train'])
         unknown = set(manifest['stages'][1]['unknown_classes'])
@@ -94,8 +142,11 @@ def main():
                 prior_plan=FP_PLAN, prior_result=FP_RESULT, parent_plan=previous_plan['parent_plan'],
                 multiplier=previous_plan['multiplier'], max_detections=previous_plan['max_detections'],
                 batch_size=previous_plan['batch_size'], paper_comparable=False, reports=reports)
-    pin(OUTPUT / 'plan.json', plan)
-    digest = file_sha256(OUTPUT / 'plan.json')
+    if residual_overlap:
+        plan.update(open_base_result=OPEN_RESULT, open_base_plan=open_base['plan_sha256'],
+                    residual_iou_bands=RESIDUAL_BANDS)
+    pin(output / 'plan.json', plan)
+    digest = file_sha256(output / 'plan.json')
     for name, data in assets.items():
         path = OUTPUT / name
         if not path.exists():
@@ -116,7 +167,7 @@ def main():
         results[protocol] = {}
         for fold, cohort in source['cohorts'].items():
             label = f'{protocol}-{fold}'
-            dest = OUTPUT / f'{label}.json'
+            dest = output / f'{label}.json'
             if not dest.exists():
                 print(f'Evaluating {protocol}/{fold} with unreleased labels used for scoring', flush=True)
                 released = SOURCE / cohort['by_protocol'][protocol]['file']
@@ -124,6 +175,8 @@ def main():
                 evaluation_coco = COCO(str(OUTPUT / reports[label]['file']))
                 spec = dict(manifest['evaluation'], image_source_ids=cohort['order'],
                             diagnostic_current_fp_sources=True, diagnostic_unresolved_unknown_overlap=True)
+                if residual_overlap:
+                    spec['diagnostic_residual_overlap'] = True
                 result = measure(model, dataset, loader, known, entry['previous'], entry['current'], spec,
                                  plan['max_detections'], evaluation_coco=evaluation_coco)
                 write_json(dest, dict(plan_sha256=digest, **result))
@@ -132,10 +185,18 @@ def main():
             if report['plan_sha256'] != digest or prior['plan_sha256'] != FP_PLAN:
                 raise ValueError(f'Changed evaluation run: {label}')
             results[protocol][fold] = summarize(report, prior)
+            if residual_overlap:
+                older = verified(OUTPUT / dest.name, reports[label]['open_report_sha256'])
+                base = open_base['protocols'][protocol][fold]
+                if older['plan_sha256'] != open_base['plan_sha256'] or results[protocol][fold] != base:
+                    raise ValueError(f'Changed open-set baseline: {label}')
+                results[protocol][fold]['residual'] = summarize_residual(report, older, base)
         del model
-    write_json(OUTPUT / 'comparison.json', dict(status='complete', plan_sha256=digest,
+    write_json(output / 'comparison.json', dict(status='complete', plan_sha256=digest,
                protocols=results, paper_comparable=False))
 
 
 if __name__ == '__main__':
-    main()
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--residual-overlap', action='store_true')
+    main(parser.parse_args().residual_overlap)

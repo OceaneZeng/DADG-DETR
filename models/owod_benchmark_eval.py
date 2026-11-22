@@ -65,7 +65,9 @@ def current_fp_sources(label, items, order, gt, tp, fp, recall, specification):
     source = np.zeros(len(order), dtype=np.int8)
     confused_with = defaultdict(int)
     track_unresolved_unknown = specification.get('diagnostic_unresolved_unknown_overlap', False)
+    track_residual_overlap = specification.get('diagnostic_residual_overlap', False)
     unresolved_unknown_overlap = 0
+    residual = dict(zero=0, positive_below_point_one=0, at_least_point_one=0, difficult_high_overlap=0)
     threshold = specification['iou_threshold']
     for rank in fp_ranks:
         _, image_id, box = items[order[rank]]
@@ -87,9 +89,18 @@ def current_fp_sources(label, items, order, gt, tp, fp, recall, specification):
             source[rank] = 3
         else:
             source[rank] = 4
-            if track_unresolved_unknown:
+            if track_unresolved_unknown or track_residual_overlap:
                 unknown = [b for b, difficult in objects[-1] if not difficult]
-                unresolved_unknown_overlap += int((overlaps(box, unknown) > threshold).any())
+                high_unknown = (overlaps(box, unknown) > threshold).any()
+                unresolved_unknown_overlap += int(high_unknown)
+                if track_residual_overlap and not high_unknown:
+                    positive = [b for annotations in objects.values() for b, difficult in annotations if not difficult]
+                    ignored = [b for annotations in objects.values() for b, difficult in annotations if difficult]
+                    best = overlaps(box, positive).max(initial=0.)
+                    band = ('at_least_point_one' if best >= .1 else
+                            'positive_below_point_one' if best > 0. else 'zero')
+                    residual[band] += 1
+                    residual['difficult_high_overlap'] += int((overlaps(box, ignored) > threshold).any())
     result = {}
     for number, name in enumerate(families, 1):
         remove = source == number
@@ -100,6 +111,8 @@ def current_fp_sources(label, items, order, gt, tp, fp, recall, specification):
     report = dict(families=result, confused_with=dict(confused_with))
     if track_unresolved_unknown:
         report['unresolved_unknown_overlap'] = unresolved_unknown_overlap
+    if track_residual_overlap:
+        report['residual_overlap'] = residual
     if specification.get('diagnostic_absent_unresolved'):
         report['absent_unresolved'] = absent_unresolved_ranking(
             label, items, order, gt, np.flatnonzero(source == 4), tp, fp, recall, specification)
