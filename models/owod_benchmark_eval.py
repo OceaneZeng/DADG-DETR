@@ -183,6 +183,9 @@ def evaluate_author_benchmark(predictions, coco, known_ids, previous_ids, curren
                 hidden_classes[image_id].append(ann['category_id'])
         gt[image_id] = objects
     sequence = [source_to_id[stem] for stem in specification['image_source_ids']]
+    score_order = specification.get('diagnostic_score_order', 'author')
+    if score_order not in ('author', 'stable_quantized', 'stable_raw'):
+        raise ValueError(f'Unknown diagnostic score order: {score_order}')
     if set(predictions) != set(sequence):
         raise ValueError('Evaluation predictions must cover the entire official test split')
     detections = defaultdict(list)
@@ -198,7 +201,8 @@ def evaluate_author_benchmark(predictions, coco, known_ids, previous_ids, curren
             elif label not in known:
                 raise ValueError(f'Prediction uses an unseen or invalid category: {label}')
             box = voc_prediction_box(box)
-            detections[label].append((float(f'{score:.3f}'), image_id, box))
+            confidence = float(score) if score_order == 'stable_raw' else float(f'{score:.3f}')
+            detections[label].append((confidence, image_id, box))
     ap, curves = {}, {}
     a_ose, fp_at_recall, total_at_recall = 0, [], []
     current_stats, previous_stats = {}, {}
@@ -212,7 +216,8 @@ def evaluate_author_benchmark(predictions, coco, known_ids, previous_ids, curren
                        'matched': set()} for i in gt}
         npos = sum(sum(not d for _, d in gt[i][label]) for i in sequence)
         items = detections[label]
-        order = np.argsort(-np.asarray([item[0] for item in items]))
+        scores = -np.asarray([item[0] for item in items])
+        order = np.argsort(scores) if score_order == 'author' else np.argsort(scores, kind='stable')
         tp, fp, fp_open = np.zeros(len(items)), np.zeros(len(items)), np.zeros(len(items))
         duplicate_fp = np.zeros(len(items)) if track_previous else None
         proxy_hits = []

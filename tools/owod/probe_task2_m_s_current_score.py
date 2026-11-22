@@ -41,7 +41,8 @@ class CurrentScore(DiscoveryPostProcess):
 
 @torch.inference_mode()
 def measure(model, dataset, loader, known, previous, current, spec, limit, *, evaluation_coco=None,
-            extra_posts=None, restore_scores_for=None, audit_query_counts=False, include_perturbed=True):
+            extra_posts=None, restore_scores_for=None, audit_query_counts=False, include_perturbed=True,
+            diagnostic_score_orders=()):
     posts = dict(native=DiscoveryPostProcess(known_ids=known, max_detections=limit, scoring='focal'))
     if include_perturbed:
         posts['perturbed'] = CurrentScore(known, set(current), limit, MULTIPLIER)
@@ -99,6 +100,13 @@ def measure(model, dataset, loader, known, previous, current, spec, limit, *, ev
     report = dict(views=views, per_image=per_image)
     if audit_query_counts:
         report['queries_per_image'] = queries_per_image
+    if diagnostic_score_orders:
+        report['score_order_views'] = {
+            order: {name: evaluate_author_benchmark(
+                values, coco, known, previous, current, dict(spec, diagnostic_score_order=order),
+                include_current_stats=True) for name, values in predictions.items()}
+            for order in diagnostic_score_orders
+        }
     return report
 
 
