@@ -26,9 +26,11 @@ PROTECTED_DISCOVERY = SOURCE.with_name('task2-m-s-refill-protect-current')
 PROTECTED_OUTPUT = SOURCE.with_name('task2-m-s-refill-protect-current-independent')
 OVERLAP_DISCOVERY = SOURCE.with_name('task2-m-s-refill-same-class-overlap')
 OVERLAP_OUTPUT = SOURCE.with_name('task2-m-s-refill-same-class-overlap-independent')
+OVERLAP_SHORT_OUTPUT = SOURCE.with_name('task2-m-s-refill-same-class-overlap-three-epoch')
 PARENT_RESULT = '5d352e7889bda076c3b430a3d080b1c46d5cf8116dd83e384e75dcf54bb694d7'
 PROTECTED_RESULT = '43b7d4533df8b38a0fa725bdd0bd5fb94cd76a8b750e7c9d8cafe8eee06290c5'
 OVERLAP_RESULT = 'e291b6cc0a269949a721a492e6f67b5c37233bfe5faa3190da4d8577f361985a'
+OVERLAP_INDEPENDENT_RESULT = 'cf60a72534e8d99990f0906562b18eea9483a876805d70296c52da47946e8789'
 SOURCE_PLAN = 'de4bb126945143a69b5a60e60b83b7761c6270e6e71734fe127129948fd35712'
 FOLD_SEEDS = {'first': 65, 'second': 66}
 POOL_SEED = 67
@@ -77,7 +79,7 @@ def summarize_refill(report, shared, plan):
     return result
 
 
-def main(protect_current=False, same_class_overlap=False):
+def main(protect_current=False, same_class_overlap=False, overlap_short=False):
     if torch.cuda.device_count() != 1 or torch.cuda.get_device_name() != 'NVIDIA GeForce RTX 3090':
         raise ValueError('Use one RTX 3090')
     result = verified(PARENT / 'comparison.json', PARENT_RESULT)
@@ -89,6 +91,8 @@ def main(protect_current=False, same_class_overlap=False):
     output, fold_seeds, pool_seed = OUTPUT, FOLD_SEEDS, POOL_SEED
     protected_plan = None
     overlap_plan = None
+    replay_plan = None
+    same_class_overlap = same_class_overlap or overlap_short
     protect_current = protect_current or same_class_overlap
     if protect_current:
         output, fold_seeds, pool_seed = PROTECTED_OUTPUT, PROTECTED_FOLD_SEEDS, PROTECTED_POOL_SEED
@@ -115,12 +119,26 @@ def main(protect_current=False, same_class_overlap=False):
             raise ValueError('Changed overlap rule or acceptance limits')
         overlap_cohorts = verified(PROTECTED_OUTPUT / 'cohorts/plan.json', overlap_plan['cohort_plan'])
         excluded.update(name for spec in overlap_cohorts['cohorts'].values() for name in spec['order'])
-    print('Preparing two independent paired Task 2 folds', flush=True)
-    cohort_dir = output / 'cohorts'
+    if overlap_short:
+        output = OVERLAP_SHORT_OUTPUT
+        replay = verified(OVERLAP_OUTPUT / 'comparison.json', OVERLAP_INDEPENDENT_RESULT)
+        if replay['status'] != 'complete' or not replay['accepted']:
+            raise ValueError('Expected the passing six-epoch independent overlap replay')
+        replay_plan = verified(OVERLAP_OUTPUT / 'plan.json', replay['plan_sha256'])
+        if (replay_plan['overlap_discovery_result'] != OVERLAP_RESULT
+                or replay_plan['min_same_class_iou'] != overlap_plan['min_same_class_iou']):
+            raise ValueError('Changed independent overlap replay eligibility')
+    print('Checking the frozen paired Task 2 folds' if overlap_short
+          else 'Preparing two independent paired Task 2 folds', flush=True)
+    input_output = OVERLAP_OUTPUT if overlap_short else output
+    cohort_dir = input_output / 'cohorts'
     cohort_path = cohort_dir / 'plan.json'
     run_plan_path = output / 'plan.json'
-    if cohort_path.exists() and (run_plan_path.exists() or not protect_current):
-        locked = read_json(run_plan_path)['cohort_plan'] if run_plan_path.exists() else PREPARED_COHORT
+    if replay_plan is not None or (cohort_path.exists() and (run_plan_path.exists() or not protect_current)):
+        if replay_plan is not None:
+            locked = replay_plan['cohort_plan']
+        else:
+            locked = read_json(run_plan_path)['cohort_plan'] if run_plan_path.exists() else PREPARED_COHORT
         source = verified(cohort_path, locked)
         manifests = {p: verified(MANIFESTS[p], info['manifest_sha256']) for p, info in source['protocols'].items()}
         roots = {p: resolve_image_root(MANIFESTS[p], manifest) for p, manifest in manifests.items()}
@@ -135,8 +153,8 @@ def main(protect_current=False, same_class_overlap=False):
         used.update(cohort['order'])
     if source['protocols'] != original_folds['protocols']:
         raise ValueError('Changed protocol or checkpoint identity')
-    reports = {}
-    for protocol, manifest in manifests.items():
+    reports = replay_plan['reports'] if replay_plan is not None else {}
+    for protocol, manifest in (() if overlap_short else manifests.items()):
         names = {name for spec in source['cohorts'].values() for name in spec['order']}
         training = set(manifest['splits']['t1_train']) | set(manifest['splits']['t2_train'])
         unknown = set(manifest['stages'][1]['unknown_classes'])
@@ -163,8 +181,12 @@ def main(protect_current=False, same_class_overlap=False):
         plan.update(protected_group='current', protected_discovery_result=PROTECTED_RESULT,
                     protected_discovery_cohort=protected_plan['cohort_plan'])
     if overlap_plan is not None:
+        endpoints = ({protocol: info['endpoints']['finetune'] for protocol, info in source['protocols'].items()}
+                     if overlap_short else overlap_plan['endpoints'])
         plan.update(overlap_discovery_result=OVERLAP_RESULT, overlap_discovery_cohort=overlap_plan['cohort_plan'],
-                    endpoints=overlap_plan['endpoints'], min_same_class_iou=overlap_plan['min_same_class_iou'])
+                    endpoints=endpoints, min_same_class_iou=overlap_plan['min_same_class_iou'])
+    if replay_plan is not None:
+        plan['six_epoch_independent_result'] = OVERLAP_INDEPENDENT_RESULT
     if run_plan_path.exists():
         pin(run_plan_path, plan)
     else:
@@ -194,7 +216,10 @@ def main(protect_current=False, same_class_overlap=False):
                 annotation = cohort['by_protocol'][protocol]
                 dataset, loader = make_loader(roots[protocol], cohort_dir / annotation['file'], plan['batch_size'], 2)
                 evaluation = dict(manifests[protocol]['evaluation'], image_source_ids=cohort['order'])
-                full = COCO(str(output / reports[label]['file']))
+                full_path = input_output / reports[label]['file']
+                if overlap_short and file_sha256(full_path) != reports[label]['sha256']:
+                    raise ValueError(f'Changed frozen full evaluation input: {label}')
+                full = COCO(str(full_path))
                 report = measure(model, dataset, loader, known, info['previous'], info['current'], evaluation,
                                  plan['limit'], evaluation_coco=full, extra_posts=dict(unknown_refill=post),
                                  audit_query_counts=True, include_perturbed=False,
@@ -217,5 +242,6 @@ if __name__ == '__main__':
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument('--protect-current', action='store_true')
     mode.add_argument('--same-class-overlap', action='store_true')
+    mode.add_argument('--overlap-short', action='store_true')
     args = parser.parse_args()
-    main(args.protect_current, args.same_class_overlap)
+    main(args.protect_current, args.same_class_overlap, args.overlap_short)
