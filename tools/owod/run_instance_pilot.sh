@@ -14,14 +14,17 @@ export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1}"
 export OMP_NUM_THREADS=2
 export PYTHONUNBUFFERED=1
 export PYTHONPATH="$PWD/models/ops:$PWD${PYTHONPATH:+:$PYTHONPATH}"
-if [[ ${1:-} == --task2-m-s-previous-hard-negatives || ${1:-} == --task2-m-s-previous-hard-negative-head || ${1:-} == --task2-m-s-previous-hard-negative-misses || ${1:-} == --task2-m-s-previous-hard-negative-scores || ${1:-} == --task2-m-s-previous-competitor-training-probe ]]; then
+if [[ ${1:-} == --task2-m-s-previous-hard-negatives || ${1:-} == --task2-m-s-previous-hard-negative-head || ${1:-} == --task2-m-s-previous-hard-negative-misses || ${1:-} == --task2-m-s-previous-hard-negative-scores || ${1:-} == --task2-m-s-previous-competitor-training-probe || ${1:-} == --task2-m-s-current-training-ranks ]]; then
   dir="output/${1#--}"
   module=tools.owod.run_task2_m_s_previous_hard_negatives
   flags=()
   if [[ $1 == --task2-m-s-previous-hard-negative-head ]]; then
     module=tools.owod.probe_task2_m_s_previous_hard_negative_head
-  elif [[ $1 == --task2-m-s-previous-competitor-training-probe ]]; then
+  elif [[ $1 == --task2-m-s-previous-competitor-training-probe || $1 == --task2-m-s-current-training-ranks ]]; then
     module=tools.owod.probe_task2_m_s_previous_competitors
+    if [[ $1 == --task2-m-s-current-training-ranks ]]; then
+      flags=(--current-ranks)
+    fi
   elif [[ $1 == --task2-m-s-previous-hard-negative-misses || $1 == --task2-m-s-previous-hard-negative-scores ]]; then
     module=tools.owod.probe_task2_m_s_previous_hard_negative_misses
     if [[ $1 == --task2-m-s-previous-hard-negative-scores ]]; then
