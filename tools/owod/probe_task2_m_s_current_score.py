@@ -41,7 +41,7 @@ class CurrentScore(DiscoveryPostProcess):
 
 @torch.inference_mode()
 def measure(model, dataset, loader, known, previous, current, spec, limit, *, evaluation_coco=None,
-            extra_posts=None, restore_scores_for=None):
+            extra_posts=None, restore_scores_for=None, audit_query_counts=False):
     posts = dict(native=DiscoveryPostProcess(known_ids=known, max_detections=limit, scoring='focal'),
                  perturbed=CurrentScore(known, set(current), limit, MULTIPLIER))
     if extra_posts is not None:
@@ -50,6 +50,7 @@ def measure(model, dataset, loader, known, previous, current, spec, limit, *, ev
     if restore_scores_for is not None:
         predictions['restored'] = {}
     per_image = {}
+    queries_per_image = {}
     for step, (samples, targets) in enumerate(loader, 1):
         output = model(samples.to('cuda'))
         sizes = torch.stack([t['orig_size'] for t in targets]).cuda()
@@ -58,7 +59,8 @@ def measure(model, dataset, loader, known, previous, current, spec, limit, *, ev
             native_scores = native_scores.flatten(1)
         for name, post in posts.items():
             restore = name == restore_scores_for
-            selected = post(output, sizes, include_top_indices=restore)
+            audit = audit_query_counts and name in ('native', 'unique')
+            selected = post(output, sizes, include_top_indices=restore or audit)
             for index, (target, pred) in enumerate(zip(targets, selected, strict=True)):
                 image = int(target['image_id'])
                 if image in predictions[name] or len(pred['labels']) != limit:
@@ -70,6 +72,13 @@ def measure(model, dataset, loader, known, previous, current, spec, limit, *, ev
                 if sum(counts.values()) != limit:
                     raise ValueError(f'Unexpected predicted category: {image}/{name}')
                 per_image.setdefault(image, {})[name] = counts
+                if audit:
+                    categories = len(known) + int(len(known) < 80)
+                    queries = pred['top_indices'] // categories
+                    count = queries.unique().numel()
+                    if name == 'unique' and count != limit:
+                        raise ValueError(f'Repeated query in unique Top-50: {image}')
+                    queries_per_image.setdefault(image, {})[name] = count
                 if restore:
                     scores = native_scores[index].gather(0, pred['top_indices']).cpu()
                     predictions['restored'][image] = dict(predictions[name][image], scores=scores)
@@ -86,7 +95,10 @@ def measure(model, dataset, loader, known, previous, current, spec, limit, *, ev
         if len(matched) != sum(c['tp'] for c in metrics['current_class_stats'].values()):
             raise ValueError(f'Changed Current VOC matching: {name}')
         views[name] = dict(metrics=metrics, matched=sorted(matched))
-    return dict(views=views, per_image=per_image)
+    report = dict(views=views, per_image=per_image)
+    if audit_query_counts:
+        report['queries_per_image'] = queries_per_image
+    return report
 
 
 def summarize(report, shared_ids):

@@ -23,6 +23,7 @@ OUTPUT = SOURCE.with_name('task2-m-s-current-top-class')
 NEAR = SOURCE.with_name('task2-m-s-current-fp-near-target')
 NEAR_RESULT = '8a841a56fb07c60072bbf5c5efe277ee35f05a0bfa3d8767325d327b39e1b72e'
 TOP_RESULT = '62428d324a76a3a711a5efdb601a8d8185167738107f7b3176138505b41634eb'
+ORDER_RESULT = 'f9eb597a03348486df77666d7e8dd7ceb9272feeabfa447d52b552708c28d42d'
 
 
 class LeadingCurrentScore(DiscoveryPostProcess):
@@ -37,6 +38,14 @@ class LeadingCurrentScore(DiscoveryPostProcess):
         original = scores.gather(-1, leading)
         scores.scatter_(-1, leading, torch.where(eligible, original * MULTIPLIER, original))
         return scores, categories, unknown
+
+
+class UniqueQueryScore(DiscoveryPostProcess):
+    def candidate_scores(self, outputs):
+        scores, categories, unknown = super().candidate_scores(outputs)
+        winning_scores, winners = scores.max(dim=-1, keepdim=True)
+        unique = torch.full_like(scores, -torch.inf).scatter_(-1, winners, winning_scores)
+        return unique, categories, unknown
 
 
 def summarize_views(report, prior, shared):
@@ -66,7 +75,7 @@ def summarize_views(report, prior, shared):
                 passed=selected['passed'] and fp['selective'] < fp['perturbed'])
 
 
-def main(native_order=False):
+def main(native_order=False, unique_query=False):
     if torch.cuda.device_count() != 1 or torch.cuda.get_device_name() != 'NVIDIA GeForce RTX 3090':
         raise ValueError('Use one RTX 3090')
     previous = verified(FULL / 'comparison.json', OPEN_RESULT)
@@ -90,6 +99,14 @@ def main(native_order=False):
         for name, info in reports.items():
             info['selective_sha256'] = file_sha256(OUTPUT / f'{name}.json')
         plan.update(selective_plan=top['plan_sha256'], selective_result=TOP_RESULT, minimum_recovery_fraction=.5)
+    if unique_query:
+        order_path = OUTPUT.with_name('task2-m-s-current-native-order')
+        order = verified(order_path / 'comparison.json', ORDER_RESULT)
+        if order['status'] != 'complete' or order['plan_sha256'] != file_sha256(order_path / 'plan.json'):
+            raise ValueError('Changed native-order comparison')
+        output = OUTPUT.with_name('task2-m-s-unique-query')
+        plan.update(native_order_plan=order['plan_sha256'], native_order_result=ORDER_RESULT,
+                    maximum_outputs_per_query=1)
     pin(output / 'plan.json', plan)
     digest = file_sha256(output / 'plan.json')
     results = {}
@@ -117,13 +134,17 @@ def main(native_order=False):
             pairs = verified(SOURCE / cohort['paired_file'], cohort['paired_sha256'])
             path = output / f'{label}.json'
             if not path.exists():
-                print(f'Evaluating {protocol}/{fold} leading Current scores', flush=True)
+                print(f'Evaluating {protocol}/{fold} at the fixed query budget', flush=True)
                 dataset, loader = make_loader(root, released, plan['batch_size'], 2)
                 spec = dict(manifest['evaluation'], image_source_ids=cohort['order'])
                 post = LeadingCurrentScore(known, entry['current'], plan['limit'])
+                extra = dict(selective=post)
+                if unique_query:
+                    extra['unique'] = UniqueQueryScore(known_ids=known, max_detections=plan['limit'], scoring='focal')
                 report = measure(model, dataset, loader, known, entry['previous'], entry['current'], spec,
-                                 plan['limit'], evaluation_coco=COCO(str(full)), extra_posts=dict(selective=post),
-                                 restore_scores_for='selective' if native_order else None)
+                                 plan['limit'], evaluation_coco=COCO(str(full)), extra_posts=extra,
+                                 restore_scores_for='selective' if native_order else None,
+                                 audit_query_counts=unique_query)
                 write_json(path, dict(plan_sha256=digest, **report))
             report = read_json(path)
             prior = verified(FULL / path.name, info['reference_sha256'])
@@ -146,6 +167,19 @@ def main(native_order=False):
                                           -plan['minimum_recovery_fraction']*selective)
                 summary['passed'] = (summary['arms']['restored']['passed']
                                      and summary['current_fp']['restored'] < summary['current_fp']['perturbed'])
+            if unique_query:
+                counts = report['queries_per_image']
+                if counts.keys() != report['per_image'].keys() or any(
+                        row['unique'] != plan['limit'] or not 0 < row['native'] <= plan['limit']
+                        for row in counts.values()):
+                    raise ValueError(f'Changed distinct-query accounting: {label}')
+                summary['query_budget'] = dict(
+                    native_repeated_slots=sum(plan['limit'] - row['native'] for row in counts.values()),
+                    native_images_with_repeats=sum(row['native'] < plan['limit'] for row in counts.values()),
+                    unique_repeated_slots=0)
+                open_metrics = summary['open_metrics']
+                summary['passed'] = (summary['arms']['unique']['passed'] and
+                                     open_metrics['unique']['u_recall'] >= open_metrics['native']['u_recall'])
             results[protocol][fold] = summary
         del model
     accepted = all(r['passed'] for folds in results.values() for r in folds.values())
@@ -157,5 +191,8 @@ def main(native_order=False):
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--native-order', action='store_true')
-    main(parser.parse_args().native_order)
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument('--native-order', action='store_true')
+    mode.add_argument('--unique-query', action='store_true')
+    args = parser.parse_args()
+    main(args.native_order, args.unique_query)
