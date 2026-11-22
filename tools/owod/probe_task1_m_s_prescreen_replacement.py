@@ -63,7 +63,7 @@ def coverage(out, detections, i, target, objects):
             for ann in objects}
 
 
-def choose(out, i, target, objects, before):
+def choose(out, i, target, objects, before, *, assignments=None):
     geom = out['geometry']
     ids = torch.where(geom['valid'][i])[0]
     active = geom['chosen'][i, geom['active'][i]]
@@ -87,13 +87,15 @@ def choose(out, i, target, objects, before):
         assigned.add(ann)
         used.add(index)
         chosen.append(index)
+        if assignments is not None:
+            assignments.append(ann)
         if len(chosen) == min(MAX_REPLACEMENTS, len(active)):
             break
     return ids[chosen]
 
 
 @torch.inference_mode()
-def replay(model, dataset, loader, known, cases):
+def replay(model, dataset, loader, known, cases, *, observer=None):
     post = DiscoveryPostProcess(known_ids=known, scoring='focal', max_detections=50)
     module = model.detr.transformer.instance_proposals
     rows, counts = [], []
@@ -106,7 +108,9 @@ def replay(model, dataset, loader, known, cases):
             native = model(samples)
             detections = emit(native, targets, post)
             before = {i: coverage(native, detections, i, targets[i], v) for i, v in objects.items()}
-            cells = {i: choose(native, i, targets[i], v, before[i]) for i, v in objects.items()}
+            assignments = {i: [] for i in objects}
+            cells = {i: choose(native, i, targets[i], v, before[i], assignments=assignments[i])
+                     for i, v in objects.items()}
             cells = {i: indices for i, indices in cells.items() if len(indices)}
             if cells:
                 with module.register_forward_hook(lambda m, x, y: replace_cells(m, x, y, cells)):
@@ -117,7 +121,10 @@ def replay(model, dataset, loader, known, cases):
                 for i, indices in cells.items():
                     if not torch.isin(indices, selected[i, changed['geometry']['active'][i]]).all():
                         raise ValueError('Replacement did not reach decoder query construction')
-                alternate = emit(changed, targets, post)
+                sizes = torch.stack([t['orig_size'] for t in targets]).to(changed['pred_boxes'].device)
+                alternate = post(changed, sizes, include_top_indices=observer is not None)
+                if observer is not None:
+                    observer(changed, alternate, targets, objects, cells, assignments)
             else:
                 changed, alternate = native, detections
             for i, v in objects.items():
