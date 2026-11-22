@@ -158,6 +158,8 @@ def get_args_parser():
                         help='double L1 and GIoU on matched released old boxes during diagnostic balanced finetuning')
     parser.add_argument('--screen-double-current-positives', action='store_true',
                         help='double only the matched new-class positive focal terms during diagnostic balanced finetuning')
+    parser.add_argument('--screen-double-previous-hard-negatives', action='store_true',
+                        help='double selected unmatched previous-class focal terms during diagnostic balanced finetuning')
     parser.add_argument('--screen-tail-positive-ids', type=int, nargs='+',
                         help='released new classes receiving double matched positive focal weight in diagnostic increment')
     parser.add_argument('--screen-annotated-distill', action='store_true',

@@ -229,6 +229,10 @@ class DeformableDETR(nn.Module):
                 for a, b in zip(outputs_class[:-1], outputs_coord[:-1])]
 
 
+PREVIOUS_HARD_NEGATIVE_TOPK = 50
+PREVIOUS_HARD_NEGATIVE_MAX_IOU = 0.5
+
+
 class SetCriterion(nn.Module):
     """ This class computes the loss for DETR.
     The process happens in two steps:
@@ -253,6 +257,32 @@ class SetCriterion(nn.Module):
         self.active_class_ids = None
         self.register_buffer('double_weight_box_ids', None, persistent=False)
         self.register_buffer('double_positive_columns', None, persistent=False)
+        self.register_buffer('previous_hard_negative_ids', None, persistent=False)
+        self.register_buffer('previous_hard_negative_columns', None, persistent=False)
+
+    def enable_previous_hard_negatives(self, previous_ids):
+        columns = [self.active_class_ids.index(class_id) for class_id in previous_ids]
+        self.previous_hard_negative_ids = torch.tensor(previous_ids, dtype=torch.long)
+        self.previous_hard_negative_columns = torch.tensor(columns, dtype=torch.long)
+
+    @torch.no_grad()
+    def previous_hard_negative_mask(self, logits, boxes, targets, indices, query_weights):
+        scores = logits[..., self.previous_hard_negative_columns].detach().flatten(1)
+        hardest = scores.topk(min(PREVIOUS_HARD_NEGATIVE_TOPK, scores.shape[1]), dim=1).indices
+        selected = torch.zeros_like(scores, dtype=torch.bool).scatter_(1, hardest, True)
+        selected = selected.view(logits.shape[0], logits.shape[1], -1)
+        for image, (target, (matched, _)) in enumerate(zip(targets, indices)):
+            iou, _ = box_ops.box_iou(box_ops.box_cxcywh_to_xyxy(boxes[image].detach()),
+                                     box_ops.box_cxcywh_to_xyxy(target['boxes']))
+            same_class = target['labels'][:, None] == self.previous_hard_negative_ids
+            overlaps = (iou[..., None] > PREVIOUS_HARD_NEGATIVE_MAX_IOU) & same_class
+            selected[image] &= ~overlaps.any(dim=1)
+            selected[image, matched] = False
+        if query_weights is not None:
+            selected &= query_weights[..., None] > 0
+        mask = torch.zeros_like(logits, dtype=torch.bool)
+        mask[..., self.previous_hard_negative_columns] = selected
+        return mask
 
     def loss_labels(self, outputs, targets, indices, num_boxes, log=True):
         """Classification loss (NLL)
@@ -281,12 +311,19 @@ class SetCriterion(nn.Module):
             query_weights = query_weights.clone()
             query_weights[idx] = 1  # Auxiliary matching may differ; GT is never ignored.
         positive_columns = self.double_positive_columns if self.training else None
+        hard_negatives = None
+        if self.training and self.previous_hard_negative_ids is not None:
+            hard_negatives = self.previous_hard_negative_mask(
+                supervised_logits, outputs['pred_boxes'], targets, indices, query_weights)
         loss_ce = sigmoid_focal_loss(supervised_logits, target_classes_onehot, num_boxes,
                                     alpha=self.focal_alpha, gamma=2, query_weights=query_weights,
-                                    double_positive_columns=positive_columns) * src_logits.shape[1]
+                                    double_positive_columns=positive_columns,
+                                    double_negative_mask=hard_negatives) * src_logits.shape[1]
         losses = {'loss_ce': loss_ce}
         if positive_columns is not None:
             losses['current_positive_matches'] = target_classes_onehot[..., positive_columns].sum()
+        if hard_negatives is not None:
+            losses['previous_hard_negative_terms'] = hard_negatives.sum().float()
 
         if log:
             # TODO this should probably be a separate loss, not hacked in this one here
@@ -581,6 +618,8 @@ def build(args):
     criterion.active_class_ids = getattr(args, 'owod_known_class_ids', None)
     if getattr(args, 'screen_double_old_box_loss', False):
         criterion.double_weight_box_ids = torch.tensor(args.owod_previous_class_ids, dtype=torch.long)
+    if getattr(args, 'screen_double_previous_hard_negatives', False):
+        criterion.enable_previous_hard_negatives(args.owod_previous_class_ids)
     positive_ids = getattr(args, 'screen_tail_positive_ids', None)
     if getattr(args, 'screen_double_current_positives', False):
         positive_ids = args.owod_current_class_ids

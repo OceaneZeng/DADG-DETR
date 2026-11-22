@@ -20,6 +20,11 @@ def configure_run(args):
             args.owod_screening and args.screen_branch_checkpoint and args.owod_discovery
             and args.owod_stage == 1 and args.owod_phase == 'finetune' and not args.teacher_completion):
         raise ValueError('Matched GT weighting requires shared-parent Task 2 discovery screening finetuning on released GT')
+    if getattr(args, 'screen_double_previous_hard_negatives', False) and not (
+            args.owod_manifest and args.owod_screening and args.screen_branch_checkpoint and args.owod_discovery
+            and args.owod_stage == 1 and args.owod_phase == 'finetune' and not args.teacher_completion
+            and not args.two_stage):
+        raise ValueError('Previous hard negatives require one-stage Task 2 discovery screening finetuning on released GT')
     if getattr(args, 'screen_annotated_distill', False) and not (
             args.owod_screening and args.screen_branch_checkpoint and args.owod_discovery
             and args.owod_stage == 1 and args.owod_phase == 'finetune'
@@ -251,6 +256,8 @@ def validate_checkpoint(args, checkpoint, resume=False):
             raise ValueError('Cannot change matched new-class focal weighting on resume')
         if getattr(saved, 'screen_double_old_box_loss', False) != getattr(args, 'screen_double_old_box_loss', False):
             raise ValueError('Cannot change matched old-box weighting on resume')
+        if getattr(saved, 'screen_double_previous_hard_negatives', False) != getattr(args, 'screen_double_previous_hard_negatives', False):
+            raise ValueError('Cannot change previous-class hard-negative weighting on resume')
         if getattr(saved, 'screen_annotated_distill', False) != getattr(args, 'screen_annotated_distill', False):
             raise ValueError('Cannot change annotation-supported distillation on resume')
         if offset != saved_offset:

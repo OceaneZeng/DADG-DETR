@@ -45,6 +45,7 @@ def validate_plan_arguments(run, saved):
                    'instance_mode': 'legacy', 'instance_cache': '', 'screen_author_eval': False,
                    'expanded_instance_bank': False, 'screen_exposure': '', 'screen_annotated_distill': False,
                    'screen_double_old_box_loss': False, 'screen_double_current_positives': False,
+                   'screen_double_previous_hard_negatives': False,
                    'screen_small_box_extent': False}.get(field)
         if getattr(saved, field, default) != value:
             raise ValueError(f'Saved checkpoint differs from launch arguments: {field}')

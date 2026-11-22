@@ -194,7 +194,7 @@ def dice_loss(inputs, targets, num_boxes):
 
 
 def sigmoid_focal_loss(inputs, targets, num_boxes, alpha: float = 0.25, gamma: float = 2, query_weights=None,
-                       double_positive_columns=None):
+                       double_positive_columns=None, double_negative_mask=None):
     """
     Loss used in RetinaNet for dense detection: https://arxiv.org/abs/1708.02002.
     Args:
@@ -222,6 +222,8 @@ def sigmoid_focal_loss(inputs, targets, num_boxes, alpha: float = 0.25, gamma: f
         loss = loss * query_weights[..., None]
     if double_positive_columns is not None:
         loss = loss * (1 + targets * double_positive_columns)
+    if double_negative_mask is not None:
+        loss = loss * (1 + (1 - targets) * double_negative_mask)
 
     return loss.mean(1).sum() / num_boxes
 
