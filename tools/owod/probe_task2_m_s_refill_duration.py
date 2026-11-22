@@ -21,13 +21,16 @@ from tools.owod.screening_data import write_json
 
 OUTPUT = PROTECTED_OUTPUT.with_name('task2-m-s-refill-duration')
 PREVIOUS_ORDER_OUTPUT = OUTPUT.with_name('task2-m-s-refill-previous-order')
+OVERLAP_OUTPUT = OUTPUT.with_name('task2-m-s-refill-same-class-overlap')
 SHORT_RESULT = '235e6303e8df7511fcf3271f2c33268341066dd808e169deb6f23c8ac974cb9b'
 DURATION_RESULT = 'dd8eb5343ccb41605a4cc89358582cd9e4b1614ee43f6ee227e806511fe8acde'
+PREVIOUS_ORDER_RESULT = '8a7f7deae0857ffaa8685f3274ac72ad8f7a17dd62afeb82dc374267859d10f3'
 M_ENDPOINTS = 'f1bfb8aa346039aa631f17b9f710f2f039af1c6d5829650c5d8895225fa7fd83'
 S_ENDPOINTS = '4f698b6c4c608cb835f063960416ba546af06e557356f623555b4158eee9172f'
 DURATION_MARGIN = .01
 METRICS = ('previous_ap50', 'current_ap50', 'known_ap50', 'u_recall', 'wi', 'a_ose')
 ORDERS = ('stable_quantized', 'stable_raw')
+MIN_SAME_CLASS_IOU = .7
 
 
 def checkpoints(cohorts):
@@ -103,7 +106,23 @@ def compare_previous_order(reference, report, tolerance):
                 lost=lost, gained=gained, classes=classes, ranking_sensitive=sensitive)
 
 
-def main(audit_previous=False):
+def compare_overlap(reference, report, summary):
+    if (report['views']['native'] != reference['views']['native']
+            or report['previous_matches']['native'] != reference['previous_matches']['native']
+            or report['per_image'].keys() != reference['per_image'].keys()):
+        raise ValueError('Changed native six-epoch reference')
+    for image, arms in report['per_image'].items():
+        if arms['native'] != reference['per_image'][image]['native']:
+            raise ValueError(f'Changed native candidate count: {image}')
+        if arms['unknown_refill']['unknown'] > reference['per_image'][image]['unknown_refill']['unknown']:
+            raise ValueError(f'Overlap condition increased the number of refill slots: {image}')
+    native, refill = (report['previous_matches'][arm] for arm in ('native', 'unknown_refill'))
+    lost = {category: sorted(set(ids) - set(refill[category])) for category, ids in native.items()}
+    return dict(summary, previous_matches_lost=sum(map(len, lost.values())),
+                previous_lost_by_class={category: ids for category, ids in lost.items() if ids})
+
+
+def main(audit_previous=False, same_class_overlap=False):
     if torch.cuda.device_count() != 1 or torch.cuda.get_device_name() != 'NVIDIA GeForce RTX 3090':
         raise ValueError('Use one RTX 3090')
     short = verified(PROTECTED_OUTPUT / 'comparison.json', SHORT_RESULT)
@@ -129,6 +148,15 @@ def main(audit_previous=False):
         references = {label: file_sha256(OUTPUT / f'{label}.json') for label in parent['reports']}
         plan.update(duration_result=DURATION_RESULT, duration_plan=duration['plan_sha256'],
                     references=references, diagnostic_score_orders=list(ORDERS))
+    elif same_class_overlap:
+        output = OVERLAP_OUTPUT
+        previous_order = verified(PREVIOUS_ORDER_OUTPUT / 'comparison.json', PREVIOUS_ORDER_RESULT)
+        checked = verified(PREVIOUS_ORDER_OUTPUT / 'plan.json', previous_order['plan_sha256'])
+        if any(checked[key] != plan[key] for key in plan if key != 'commit'):
+            raise ValueError('Changed previous-order replay plan')
+        references = {label: file_sha256(PREVIOUS_ORDER_OUTPUT / f'{label}.json') for label in parent['reports']}
+        plan.update(previous_order_result=PREVIOUS_ORDER_RESULT, previous_order_plan=previous_order['plan_sha256'],
+                    references=references, min_same_class_iou=MIN_SAME_CLASS_IOU)
     plan_path = output / 'plan.json'
     pin(plan_path, plan)
     digest = file_sha256(plan_path)
@@ -140,7 +168,7 @@ def main(audit_previous=False):
         model.eval()
         known = info['previous'] + info['current']
         post = UnknownRefillScore(known_ids=known, max_detections=parent['limit'], scoring='focal',
-                                  protected_ids=info['current'])
+                                  protected_ids=info['current'], min_same_class_iou=plan.get('min_same_class_iou'))
         results[protocol] = {}
         for fold, cohort in cohorts['cohorts'].items():
             label = f'{protocol}-{fold}'
@@ -158,7 +186,7 @@ def main(audit_previous=False):
                 report = measure(model, dataset, loader, known, info['previous'], info['current'], spec,
                                  parent['limit'], evaluation_coco=COCO(str(full_path)),
                                  extra_posts=dict(unknown_refill=post), audit_query_counts=True,
-                                 include_perturbed=False, audit_previous_matches=audit_previous,
+                                 include_perturbed=False, audit_previous_matches=audit_previous or same_class_overlap,
                                  diagnostic_score_orders=plan.get('diagnostic_score_orders', ()))
                 write_json(dest, dict(plan_sha256=digest, **report))
             report = read_json(dest)
@@ -172,11 +200,18 @@ def main(audit_previous=False):
                 continue
             pairs = verified(cohort_dir / cohort['paired_file'], cohort['paired_sha256'])
             shared = {pair['annotation_ids'][protocol] for pair in pairs}
+            summary = summarize_refill(report, shared, plan)
+            if same_class_overlap:
+                reference = verified(PREVIOUS_ORDER_OUTPUT / f'{label}.json', plan['references'][label])
+                if reference['plan_sha256'] != plan['previous_order_plan']:
+                    raise ValueError(f'Changed previous-order reference: {label}')
+                results[protocol][fold] = compare_overlap(reference, report, summary)
+                continue
             reference = read_json(PROTECTED_OUTPUT / f'{label}.json')
             if (reference['plan_sha256'] != short['plan_sha256']
                     or reference['per_image'].keys() != report['per_image'].keys()):
                 raise ValueError(f'Changed three-epoch matched cohort: {label}')
-            results[protocol][fold] = compare(reference, report, summarize_refill(report, shared, plan))
+            results[protocol][fold] = compare(reference, report, summary)
         del model
     write_json(output / 'comparison.json', dict(status='complete', plan_sha256=digest,
                protocols=results, paper_comparable=False))
@@ -184,5 +219,8 @@ def main(audit_previous=False):
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--audit-previous', action='store_true')
-    main(parser.parse_args().audit_previous)
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument('--audit-previous', action='store_true')
+    mode.add_argument('--same-class-overlap', action='store_true')
+    args = parser.parse_args()
+    main(args.audit_previous, args.same_class_overlap)

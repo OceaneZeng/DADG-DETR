@@ -548,9 +548,23 @@ class DiscoveryPostProcess(PostProcess):
 class UnknownRefillScore(DiscoveryPostProcess):
     """Use a repeated known detection's slot for a distinct unknown query."""
 
-    def __init__(self, *args, protected_ids=(), **kwargs):
+    def __init__(self, *args, protected_ids=(), min_same_class_iou=None, **kwargs):
         super().__init__(*args, **kwargs)
         self.protected_ids = tuple(protected_ids)
+        self.min_same_class_iou = min_same_class_iou
+
+    def same_class_overlap(self, predictions, queries, classes, earlier):
+        boxes = box_ops.box_cxcywh_to_xyxy(predictions)
+        boxes = boxes.gather(1, queries[..., None].expand(-1, -1, 4))
+        lower, upper = boxes[..., :2], boxes[..., 2:]
+        intersection = (torch.minimum(upper[:, :, None], upper[:, None, :])
+                        - torch.maximum(lower[:, :, None], lower[:, None, :])).clamp_min(0).prod(dim=-1)
+        area = (upper - lower).clamp_min(0).prod(dim=-1)
+        union = area[:, :, None] + area[:, None, :] - intersection
+        compatible = (earlier & (classes[:, :, None] == classes[:, None, :])
+                      & (queries[:, :, None] != queries[:, None, :]))
+        overlaps = (union > 0) & (intersection >= self.min_same_class_iou * union)
+        return (compatible & overlaps).any(dim=-1)
 
     def candidate_scores(self, outputs):
         scores, categories, unknown = super().candidate_scores(outputs)
@@ -567,6 +581,8 @@ class UnknownRefillScore(DiscoveryPostProcess):
         eligible = repeated & (classes != class_count - 1)
         if self.protected_ids:
             eligible &= ~torch.isin(categories[classes], categories.new_tensor(self.protected_ids))
+        if self.min_same_class_iou is not None:
+            eligible &= self.same_class_overlap(outputs['pred_boxes'], queries, classes, earlier)
         drop = torch.where(eligible, positions, -1).max(dim=1).values
         used = torch.zeros((rows, query_count), dtype=torch.bool, device=scores.device)
         used.scatter_(1, queries, True)
