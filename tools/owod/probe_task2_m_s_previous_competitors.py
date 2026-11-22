@@ -127,24 +127,7 @@ def prepare(rank_analysis, geometry_analysis, shortlist_analysis):
         raise ValueError('Expected the dual-protocol class-probability result')
     if torch.cuda.device_count() != 1 or torch.cuda.get_device_name() != 'NVIDIA GeForce RTX 3090':
         raise ValueError('Use one RTX 3090 for the frozen training probe')
-    jobs, datasets = {}, {}
-    for protocol, job in source['jobs'].items():
-        command = job['command']
-        argv = next(i for i, token in enumerate(command) if Path(token).name == 'main.py') + 1
-        args = get_args_parser().parse_args(command[argv:])
-        configure_run(args)
-        if file_sha256(Path(args.train_ann)) != job['train_sha256']:
-            raise ValueError(f'Changed balanced finetune annotations: {protocol}')
-        endpoint = job['endpoints']['increment']
-        if file_sha256(Path(endpoint['path'])) != endpoint['sha256']:
-            raise ValueError(f'Changed increment endpoint: {protocol}')
-        dataset = build_dataset('train', args)
-        indices = torch.randperm(len(dataset), generator=torch.Generator().manual_seed(SEED))[:SAMPLE_IMAGES].tolist()
-        if len(indices) != SAMPLE_IMAGES:
-            raise ValueError(f'Insufficient balanced training images: {protocol}')
-        jobs[protocol] = dict(checkpoint=endpoint, train_sha256=job['train_sha256'], indices=indices,
-                              image_ids=[dataset.ids[i] for i in indices], previous=job['previous'], current=job['current'])
-        datasets[protocol] = Subset(dataset, indices)
+    jobs, datasets = training_samples(source)
     plan = dict(commit=subprocess.check_output(['git', 'rev-parse', 'HEAD'], text=True).strip(),
                 score_result_sha256=SCORE_SHA, train_plan_sha256=TRAIN_PLAN_SHA, jobs=jobs, seed=SEED, batch=2,
                 device=torch.cuda.get_device_name(), torch_version=str(torch.__version__), sample_images=SAMPLE_IMAGES,
@@ -180,6 +163,28 @@ def prepare(rank_analysis, geometry_analysis, shortlist_analysis):
                     decision='Use doubled membership as headroom only if it covers at least half of each protocol.')
     pin(output / 'plan.json', plan)
     return plan, datasets
+
+
+def training_samples(source):
+    jobs, datasets = {}, {}
+    for protocol, job in source['jobs'].items():
+        command = job['command']
+        argv = next(i for i, token in enumerate(command) if Path(token).name == 'main.py') + 1
+        args = get_args_parser().parse_args(command[argv:])
+        configure_run(args)
+        if file_sha256(Path(args.train_ann)) != job['train_sha256']:
+            raise ValueError(f'Changed balanced finetune annotations: {protocol}')
+        endpoint = job['endpoints']['increment']
+        if file_sha256(Path(endpoint['path'])) != endpoint['sha256']:
+            raise ValueError(f'Changed increment endpoint: {protocol}')
+        dataset = build_dataset('train', args)
+        indices = torch.randperm(len(dataset), generator=torch.Generator().manual_seed(SEED))[:SAMPLE_IMAGES].tolist()
+        if len(indices) != SAMPLE_IMAGES:
+            raise ValueError(f'Insufficient balanced training images: {protocol}')
+        jobs[protocol] = dict(checkpoint=endpoint, train_sha256=job['train_sha256'], indices=indices,
+                              image_ids=[dataset.ids[i] for i in indices], previous=job['previous'], current=job['current'])
+        datasets[protocol] = Subset(dataset, indices)
+    return jobs, datasets
 
 
 @torch.inference_mode()
