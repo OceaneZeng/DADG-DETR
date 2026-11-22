@@ -30,7 +30,7 @@ SMALL_THRESHOLD = .25
 
 
 @torch.inference_mode()
-def replay(model, criterion, ema, dataset, loader, reference=None):
+def replay(model, criterion, ema, dataset, loader, reference=None, *, audit_capacity=False):
     prior_rows = {row['annotation_id']: row for row in reference['rows']} if reference is not None else None
     prior_counts = {row['image_id']: row['queries']['selected'] for row in reference['images']} if reference is not None else None
     known = set(model.known_ids)
@@ -67,6 +67,10 @@ def replay(model, criterion, ema, dataset, loader, reference=None):
                                expanded=int((relaxed & ~gate['confident']).sum()), fallback=fallback))
             native_boxes = voc_coords(boxes[native], width, height)
             candidate_boxes = voc_coords(boxes[candidate], width, height)
+            if audit_capacity:
+                all_boxes = voc_coords(boxes, width, height)
+                native_pool = gate['confident'].cpu().numpy()
+                relaxed_pool = relaxed.cpu().numpy()
             for ann in dataset.coco.imgToAnns[image_id]:
                 if ann.get('difficult'):
                     continue
@@ -82,6 +86,12 @@ def replay(model, criterion, ema, dataset, loader, reference=None):
                 row = dict(annotation_id=ann['id'], released=released, size=size, native=before, candidate=after)
                 if reference is None:
                     row['image_id'] = image_id
+                if audit_capacity and not before and not released and size != '32_sq_plus':
+                    correct = overlaps(truth, all_boxes) > .5
+                    row['capacity'] = dict(raw=bool(correct.any()),
+                                           native_pool=bool((correct & native_pool).any()),
+                                           relaxed_pool=bool((correct & relaxed_pool).any()),
+                                           positive_quota=bool(quota))
                 rows.append(row)
         if step % 64 == 0 or step == len(loader):
             print(f'Inference {step}/{len(loader)} batches', flush=True)
