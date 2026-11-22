@@ -30,6 +30,14 @@ BOX_REPORT_SHAS = {
     'm-owodb': 'a5d09197a68df4ad79d7207696c3c7405aa108a4b1365ada55aa2cb13c07ff63',
     's-owodb': 'c963148291c8d2c65769d1d9f316abfd33a12c0f2c1a0bc0425de61e369ae1dd',
 }
+BOX_TRACE = BOX_MISSES.with_name('task2-m-s-current-low-iou-box-trace')
+BOX_MISSES_SHA = 'be91805b17a2aa56a7dda7f1048182c8bb6075a2d875ce40a5c33ec6692c8a87'
+BOX_MISS_REPORTS = {
+    'm-owodb-first': '28067dd7a3ffc4510abca578abf567eaccee56ffc5274f0bebdcc5b0246c30b6',
+    'm-owodb-second': '225fa57bc9cdd1fea299c56eada661d47b6387d63068c9c958619ae0e3d0913a',
+    's-owodb-first': 'c7978cd3829bea87b474943d9b0f6d2bab445b98f9b33f3239ffda3a53b0a43b',
+    's-owodb-second': '50a939bc98b413c29d05b43ace56cf1bd0510e1a1df2a440860ef770a595673',
+}
 MISSES_SHA = 'c0dd63960c62b950e7ae1ecd0c4ffc0ada7e03a77306df125487851e665a4786'
 MISS_REPORTS = {
     'm-owodb-first': '32da40cc31c6cbcca359382d20d564ccbf95711c05a3406c38c49291005de4b7',
@@ -40,6 +48,7 @@ MISS_REPORTS = {
 HEAD_SHA = 'c9d06aa7a29986bdc98a8f715f2227fd7304a1d444343261602f8a2627e037eb'
 OUTCOMES = ('no_compatible_box', 'outside_top50', 'voc_assignment')
 COMPONENTS = ('class_probability', 'objectness', 'both')
+BOX_TRACE_OUTCOMES = ('never_covered', *(f'decoder_{layer}' for layer in range(1, 7)))
 
 
 def match_ids(report):
@@ -61,6 +70,16 @@ def checked_top_indices(result, report, image, previous, current):
     return set(result['top_indices'].tolist())
 
 
+def early_voc_boxes(output, image, target):
+    geo = output['geometry']
+    cells = geo['chosen'][image, geo['active'][image]]
+    layers = output['aux_outputs']
+    if len(layers) != 5:
+        raise ValueError('Expected five intermediate decoder layers')
+    boxes = (geo['boxes'][image, cells], *(layer['pred_boxes'][image] for layer in layers))
+    return [voc_output_boxes(box_cxcywh_to_xyxy(stage), target) for stage in boxes]
+
+
 def restore_scores(output, control, image, probabilities, object_queries, label, column, top50):
     control_cls = control['pred_logits'][image, object_queries, label].sigmoid()
     control_obj = control['pred_objectness'][image, object_queries].sigmoid()
@@ -78,13 +97,14 @@ def restore_scores(output, control, image, probabilities, object_queries, label,
 
 
 @torch.inference_mode()
-def replay(model, dataset, loader, ref, previous, current, limit, threshold, *, donor=None, pinned=None):
+def replay(model, dataset, loader, ref, previous, current, limit, threshold, *, donor=None, pinned=None,
+           trace_boxes=False):
     post = DiscoveryPostProcess(known_ids=previous + current, scoring='focal', max_detections=limit)
     positions = {label: index for index, label in enumerate(previous + current)}
     lost = match_ids(ref['control']) - match_ids(ref['candidate'])
     if pinned is not None:
         if not pinned.keys() <= lost:
-            raise ValueError('Rank misses differ from the frozen lost annotations')
+            raise ValueError('Pinned misses differ from the frozen lost annotations')
         lost = pinned.keys()
     wanted = defaultdict(list)
     for ann_id in sorted(lost):
@@ -93,7 +113,7 @@ def replay(model, dataset, loader, ref, previous, current, limit, threshold, *, 
             raise ValueError(f'Unexpected lost previous-class annotation: {ann_id}')
         wanted[ann['image_id']].append(ann)
     rows = []
-    check_control = donor is not None and pinned is None
+    check_control = donor is not None and (pinned is None or trace_boxes)
     for step, (samples, targets) in enumerate(loader, 1):
         images = [int(target['image_id']) for target in targets]
         if any(i in wanted for i in images):
@@ -115,6 +135,9 @@ def replay(model, dataset, loader, ref, previous, current, limit, threshold, *, 
                 top = checked_top_indices(results[i], ref['candidate'], image, previous, current)
                 if check_control:
                     control_top = checked_top_indices(control_results[i], ref['control'], image, previous, current)
+                if trace_boxes:
+                    early_boxes = early_voc_boxes(output, i, targets[i])
+                    control_early_boxes = early_voc_boxes(control, i, targets[i])
                 for ann in wanted[image]:
                     target_box = np.asarray(ann['voc_bbox'])
                     ious = overlaps(target_box, voc_boxes)
@@ -140,6 +163,18 @@ def replay(model, dataset, loader, ref, previous, current, limit, threshold, *, 
                             raise ValueError(f'Control lost its qualifying Top-50 box: {ann["id"]}')
                         row.update(control_max_iou=float(control_iou.max()),
                                    control_best_top50_same_class_iou=best_selected)
+                        if trace_boxes:
+                            original = pinned[ann['id']]
+                            if (outcome != 'no_compatible_box'
+                                    or not isclose(row['max_iou'], original['max_iou'], abs_tol=1e-7)
+                                    or not isclose(row['control_max_iou'], original['control_max_iou'], abs_tol=1e-7)):
+                                raise ValueError(f'Changed frozen geometry miss: {ann["id"]}')
+                            candidate_ious = [float(overlaps(target_box, b).max(initial=0.)) for b in early_boxes]
+                            control_ious = [float(overlaps(target_box, b).max(initial=0.)) for b in control_early_boxes]
+                            latest = max((j for j, iou in enumerate(candidate_ious) if iou > threshold), default=-1)
+                            row.update(trace_outcome=BOX_TRACE_OUTCOMES[latest + 1],
+                                       candidate_ious=[*candidate_ious, row['max_iou']],
+                                       control_ious=[*control_ious, row['control_max_iou']])
                     elif control_voc is not None:
                         original = pinned[ann['id']]
                         if (outcome != 'outside_top50' or len(compatible) != original['compatible_queries']
@@ -162,7 +197,7 @@ def replay(model, dataset, loader, ref, previous, current, limit, threshold, *, 
     return rows
 
 
-def main(score_components=False, low_iou_boxes=False):
+def main(score_components=False, low_iou_boxes=False, trace_boxes=False):
     if torch.cuda.device_count() != 1 or torch.cuda.get_device_name() != 'NVIDIA GeForce RTX 3090':
         raise ValueError('Use one RTX 3090')
     if low_iou_boxes:
@@ -201,6 +236,16 @@ def main(score_components=False, low_iou_boxes=False):
                     outcomes=list(COMPONENTS), lost_matches=58,
                     decision='One factor must recover at least half of all rank misses in each protocol. '
                              'Per-target replay transfers only the selected class entry of queries with VOC IoU > 0.5 in both arms.')
+    if trace_boxes:
+        output = BOX_TRACE
+        misses = verified(BOX_MISSES / 'comparison.json', BOX_MISSES_SHA)
+        trace_count = sum(counts['no_compatible_box'] for counts in misses['pooled'].values())
+        if (misses['status'] != 'complete' or misses['preferred'] != ['no_compatible_box'] or trace_count != 161):
+            raise ValueError('Expected the completed final-box coverage attribution')
+        plan.update(miss_report_shas=BOX_MISS_REPORTS, misses_sha256=BOX_MISSES_SHA,
+                    outcomes=list(BOX_TRACE_OUTCOMES), lost_matches=trace_count,
+                    iou_order=['active_encoder', *(f'decoder_{layer}' for layer in range(1, 7))],
+                    decision='Prefer a persistent loss stage only if it covers at least half of all cases in each protocol.')
     pin(output / 'plan.json', plan)
     digest = file_sha256(output / 'plan.json')
     results = {}
@@ -228,10 +273,13 @@ def main(score_components=False, low_iou_boxes=False):
             if score_components:
                 previous_report = verified(OUTPUT / marker.name, MISS_REPORTS[label])
                 pinned = {r['annotation']: r for r in previous_report['rows'] if r['outcome'] == 'outside_top50'}
+            elif trace_boxes:
+                previous_report = verified(BOX_MISSES / marker.name, BOX_MISS_REPORTS[label])
+                pinned = {r['annotation']: r for r in previous_report['rows'] if r['outcome'] == 'no_compatible_box'}
             reference = {arm: report[arm][fold] for arm in ('control', 'candidate')}
-            expected = len(pinned) if score_components else source['protocols'][protocol][fold]['top50_voc_matches']['previous']['lost']
+            expected = len(pinned) if pinned is not None else source['protocols'][protocol][fold]['top50_voc_matches']['previous']['lost']
             if low_iou_boxes:
-                lost = match_ids(reference['control']) - match_ids(reference['candidate'])
+                lost = pinned.keys() if trace_boxes else match_ids(reference['control']) - match_ids(reference['candidate'])
                 if len(lost) != expected:
                     raise ValueError(f'Changed lost annotation population: {label}')
             if not marker.exists():
@@ -242,10 +290,13 @@ def main(score_components=False, low_iou_boxes=False):
                 dataset, loader = make_loader(root, released, parent['eval_batch'], 2)
                 rows = replay(model, dataset, loader, reference,
                               job['previous'], job['current'], parent['max_detections'],
-                              manifest['evaluation']['iou_threshold'], donor=donor, pinned=pinned)
+                              manifest['evaluation']['iou_threshold'], donor=donor, pinned=pinned,
+                              trace_boxes=trace_boxes)
                 if score_components:
                     counts = {k: sum(r['recovered'][k] for r in rows) for k in COMPONENTS}
                     counts.update(aligned=sum(r['aligned_queries'] > 0 for r in rows), rank_misses=len(rows))
+                elif trace_boxes:
+                    counts = dict(Counter(r['trace_outcome'] for r in rows))
                 else:
                     counts = dict(Counter(r['outcome'] for r in rows))
                 write_json(marker, dict(plan_sha256=digest, rows=rows, counts=counts))
@@ -255,10 +306,12 @@ def main(score_components=False, low_iou_boxes=False):
             if low_iou_boxes and {target['annotation'] for target in row['rows']} != lost:
                 raise ValueError(f'Changed replayed annotations: {label}')
             results[protocol][fold] = row['counts']
-    outcomes = (*COMPONENTS, 'aligned', 'rank_misses') if score_components else OUTCOMES
+    outcomes = tuple(plan['outcomes'])
+    if score_components:
+        outcomes += ('aligned', 'rank_misses')
     pooled = {protocol: {k: sum(fold.get(k, 0) for fold in folds.values()) for k in outcomes}
               for protocol, folds in results.items()}
-    decision_outcomes = COMPONENTS[:2] if score_components else OUTCOMES
+    decision_outcomes = COMPONENTS[:2] if score_components else outcomes
     preferred = [k for k in decision_outcomes
                  if all(row[k] * 2 >= (row['rank_misses'] if score_components else sum(row.values()))
                         for row in pooled.values())]
@@ -271,5 +324,6 @@ if __name__ == '__main__':
     modes = parser.add_mutually_exclusive_group()
     modes.add_argument('--score-components', action='store_true')
     modes.add_argument('--low-iou-boxes', action='store_true')
+    modes.add_argument('--trace-low-iou-boxes', action='store_true')
     args = parser.parse_args()
-    main(args.score_components, args.low_iou_boxes)
+    main(args.score_components, args.low_iou_boxes or args.trace_low_iou_boxes, args.trace_low_iou_boxes)
