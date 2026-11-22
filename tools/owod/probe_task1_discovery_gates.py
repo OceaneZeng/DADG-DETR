@@ -44,7 +44,7 @@ def measure_boxes(overlap, mask, quota):
                 positive_queries=int(edges.any(1).sum()), one_to_one=matched, same_quota=min(matched, quota))
 
 
-def candidate_batches(model, criterion, ema, loader):
+def candidate_batches(model, criterion, ema, loader, *, include_teacher=False):
     known_ids = torch.tensor(model.known_ids, device='cuda')
     for images_batch, targets in loader:
         samples = images_batch.to('cuda')
@@ -55,10 +55,12 @@ def candidate_batches(model, criterion, ema, loader):
             known.append({k: target[k][released] for k in ('labels', 'boxes')})
         output = model(samples)
         trace = []
+        teacher = ema.forward_teacher(flip_samples(samples))
         mined = mine_candidates(output, known, criterion.matcher(output, known), model.known_ids,
-                                ema.forward_teacher(flip_samples(samples)), criterion.top_k,
+                                teacher, criterion.top_k,
                                 criterion.saliency_threshold, criterion.consistency_threshold, gate_trace=trace)
-        yield targets, output, trace, mined
+        batch = targets, output, trace, mined
+        yield (*batch, teacher) if include_teacher else batch
 
 
 @torch.inference_mode()
