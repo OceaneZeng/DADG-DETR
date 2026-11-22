@@ -39,10 +39,11 @@ def prepare():
     replay = read_json(REPLAY / 'plan.json')
     source = read_json(PARENT / 'plan.json')
     manifest = read_json(MANIFEST)
+    device = os.environ.get('CUDA_VISIBLE_DEVICES', '')
     if (file_sha256(SCORE / 'comparison.json') != SOURCE_SHA256 or score['supported']
             or score['status'] != 'complete' or score['plan_sha256'] != file_sha256(SCORE / 'plan.json')
             or file_sha256(MANIFEST) != replay['manifest_sha256']
-            or os.environ.get('CUDA_VISIBLE_DEVICES') != replay['device'] or torch.cuda.device_count() != 1
+            or not device.isdecimal() or torch.cuda.device_count() != 1
             or torch.cuda.get_device_name() != replay['gpu'] or str(torch.__version__) != replay['torch_version']):
         raise ValueError('Changed score evidence, benchmark or environment')
     control = replay['checkpoints']['control']
@@ -74,9 +75,9 @@ def prepare():
                 raise ValueError(f'Changed frozen reference: {name}')
             cohort.update(reference=str(reference), reference_sha256=file_sha256(reference))
         cohorts[name] = cohort
-    plan = {k: replay[k] for k in ('protocol', 'device', 'gpu', 'batch_size', 'torch_version', 'manifest_sha256')}
+    plan = {k: replay[k] for k in ('protocol', 'gpu', 'batch_size', 'torch_version', 'manifest_sha256')}
     plan.update(commit=subprocess.check_output(['git', 'rev-parse', 'HEAD'], text=True).strip(),
-                seed=SEED, paper_comparable=False, checkpoint=control, cohorts=cohorts,
+                device=device, seed=SEED, paper_comparable=False, checkpoint=control, cohorts=cohorts,
                 source_sha256=SOURCE_SHA256, classes=classes, ridge=RIDGE, min_pairs=MIN_PAIRS,
                 negative_iou=.3, criterion=CRITERION)
     pin(OUTPUT / 'plan.json', plan)
