@@ -1,5 +1,6 @@
 """Test increasing only the leading Current score in each query."""
 
+import argparse
 from pathlib import Path
 import subprocess
 
@@ -21,6 +22,7 @@ from tools.owod.screening_data import write_json
 OUTPUT = SOURCE.with_name('task2-m-s-current-top-class')
 NEAR = SOURCE.with_name('task2-m-s-current-fp-near-target')
 NEAR_RESULT = '8a841a56fb07c60072bbf5c5efe277ee35f05a0bfa3d8767325d327b39e1b72e'
+TOP_RESULT = '62428d324a76a3a711a5efdb601a8d8185167738107f7b3176138505b41634eb'
 
 
 class LeadingCurrentScore(DiscoveryPostProcess):
@@ -51,7 +53,9 @@ def summarize_views(report, prior, shared):
     fp = {name: sum(x['fp'] for x in row['current_class_stats'].values()) for name, row in metrics.items()}
     native = report['views']['native']
     comparisons = {}
-    for name in ('perturbed', 'selective'):
+    for name in report['views']:
+        if name == 'native':
+            continue
         pair = dict(views=dict(native=native, perturbed=report['views'][name]),
                     per_image={key: dict(native=value['native'], perturbed=value[name])
                                for key, value in report['per_image'].items()})
@@ -62,7 +66,7 @@ def summarize_views(report, prior, shared):
                 passed=selected['passed'] and fp['selective'] < fp['perturbed'])
 
 
-def main():
+def main(native_order=False):
     if torch.cuda.device_count() != 1 or torch.cuda.get_device_name() != 'NVIDIA GeForce RTX 3090':
         raise ValueError('Use one RTX 3090')
     previous = verified(FULL / 'comparison.json', OPEN_RESULT)
@@ -77,8 +81,17 @@ def main():
                 parent_plan=previous['plan_sha256'], parent_result=OPEN_RESULT, near_result=NEAR_RESULT,
                 batch_size=base['batch_size'], limit=base['max_detections'], multiplier=MULTIPLIER,
                 ap_tolerance=AP_TOLERANCE, reports=reports, paper_comparable=False)
-    pin(OUTPUT / 'plan.json', plan)
-    digest = file_sha256(OUTPUT / 'plan.json')
+    output = OUTPUT
+    if native_order:
+        top = verified(OUTPUT / 'comparison.json', TOP_RESULT)
+        if top['status'] != 'complete' or top['plan_sha256'] != file_sha256(OUTPUT / 'plan.json'):
+            raise ValueError('Changed selective-score comparison')
+        output = OUTPUT.with_name('task2-m-s-current-native-order')
+        for name, info in reports.items():
+            info['selective_sha256'] = file_sha256(OUTPUT / f'{name}.json')
+        plan.update(selective_plan=top['plan_sha256'], selective_result=TOP_RESULT, minimum_recovery_fraction=.5)
+    pin(output / 'plan.json', plan)
+    digest = file_sha256(output / 'plan.json')
     results = {}
     for protocol, entry in source['protocols'].items():
         manifest_path = MANIFESTS[protocol]
@@ -102,26 +115,47 @@ def main():
             released = SOURCE / annotation['file']
             verified(released, annotation['sha256'])
             pairs = verified(SOURCE / cohort['paired_file'], cohort['paired_sha256'])
-            path = OUTPUT / f'{label}.json'
+            path = output / f'{label}.json'
             if not path.exists():
                 print(f'Evaluating {protocol}/{fold} leading Current scores', flush=True)
                 dataset, loader = make_loader(root, released, plan['batch_size'], 2)
                 spec = dict(manifest['evaluation'], image_source_ids=cohort['order'])
                 post = LeadingCurrentScore(known, entry['current'], plan['limit'])
                 report = measure(model, dataset, loader, known, entry['previous'], entry['current'], spec,
-                                 plan['limit'], evaluation_coco=COCO(str(full)), extra_posts=dict(selective=post))
+                                 plan['limit'], evaluation_coco=COCO(str(full)), extra_posts=dict(selective=post),
+                                 restore_scores_for='selective' if native_order else None)
                 write_json(path, dict(plan_sha256=digest, **report))
             report = read_json(path)
             prior = verified(FULL / path.name, info['reference_sha256'])
             if report['plan_sha256'] != digest or report['per_image'].keys() != prior['per_image'].keys():
                 raise ValueError(f'Changed replay plan or image set: {label}')
             shared = {pair['annotation_ids'][protocol] for pair in pairs}
-            results[protocol][fold] = summarize_views(report, prior, shared)
+            summary = summarize_views(report, prior, shared)
+            if native_order:
+                original = verified(OUTPUT / path.name, info['selective_sha256'])
+                if (original['plan_sha256'] != plan['selective_plan']
+                        or any(report['views'][arm] != view for arm, view in original['views'].items())
+                        or any(any(arms[arm] != count for arm, count in original['per_image'][img].items())
+                               or arms['restored'] != arms['selective']
+                               for img, arms in report['per_image'].items())):
+                    raise ValueError(f'Changed selective score replay: {label}')
+                selective = summary['arms']['selective']['deltas']['current_ap50']
+                restored = summary['arms']['restored']['deltas']['current_ap50']
+                summary['ranking'] = dict(current_ap50_restored_minus_selective=restored-selective,
+                                          recovered_half=selective < 0 and restored-selective >=
+                                          -plan['minimum_recovery_fraction']*selective)
+                summary['passed'] = (summary['arms']['restored']['passed']
+                                     and summary['current_fp']['restored'] < summary['current_fp']['perturbed'])
+            results[protocol][fold] = summary
         del model
     accepted = all(r['passed'] for folds in results.values() for r in folds.values())
-    write_json(OUTPUT / 'comparison.json', dict(status='complete', plan_sha256=digest, protocols=results,
-               accepted=accepted, paper_comparable=False))
+    result = dict(status='complete', plan_sha256=digest, protocols=results, accepted=accepted, paper_comparable=False)
+    if native_order:
+        result['m_ranking_consistent'] = all(fold['ranking']['recovered_half'] for fold in results['m-owodb'].values())
+    write_json(output / 'comparison.json', result)
 
 
 if __name__ == '__main__':
-    main()
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--native-order', action='store_true')
+    main(parser.parse_args().native_order)

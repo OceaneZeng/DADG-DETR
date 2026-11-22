@@ -41,18 +41,25 @@ class CurrentScore(DiscoveryPostProcess):
 
 @torch.inference_mode()
 def measure(model, dataset, loader, known, previous, current, spec, limit, *, evaluation_coco=None,
-            extra_posts=None):
+            extra_posts=None, restore_scores_for=None):
     posts = dict(native=DiscoveryPostProcess(known_ids=known, max_detections=limit, scoring='focal'),
                  perturbed=CurrentScore(known, set(current), limit, MULTIPLIER))
     if extra_posts is not None:
         posts.update(extra_posts)
     predictions = {name: {} for name in posts}
+    if restore_scores_for is not None:
+        predictions['restored'] = {}
     per_image = {}
     for step, (samples, targets) in enumerate(loader, 1):
         output = model(samples.to('cuda'))
         sizes = torch.stack([t['orig_size'] for t in targets]).cuda()
+        if restore_scores_for is not None:
+            native_scores, _, _ = posts['native'].candidate_scores(output)
+            native_scores = native_scores.flatten(1)
         for name, post in posts.items():
-            for target, pred in zip(targets, post(output, sizes), strict=True):
+            restore = name == restore_scores_for
+            selected = post(output, sizes, include_top_indices=restore)
+            for index, (target, pred) in enumerate(zip(targets, selected, strict=True)):
                 image = int(target['image_id'])
                 if image in predictions[name] or len(pred['labels']) != limit:
                     raise ValueError(f'Invalid per-image output budget: {image}/{name}')
@@ -63,6 +70,10 @@ def measure(model, dataset, loader, known, previous, current, spec, limit, *, ev
                 if sum(counts.values()) != limit:
                     raise ValueError(f'Unexpected predicted category: {image}/{name}')
                 per_image.setdefault(image, {})[name] = counts
+                if restore:
+                    scores = native_scores[index].gather(0, pred['top_indices']).cpu()
+                    predictions['restored'][image] = dict(predictions[name][image], scores=scores)
+                    per_image[image]['restored'] = counts.copy()
         if step % 64 == 0 or step == len(loader):
             print(f'Inference {step}/{len(loader)} batches', flush=True)
     views = {}
