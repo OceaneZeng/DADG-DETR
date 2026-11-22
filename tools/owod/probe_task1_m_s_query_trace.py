@@ -24,7 +24,7 @@ SOURCE_PLAN = '8cf9cfb5743c2cec5f1d14712052f0c04f06e59b514e28690d624093ec2ded96'
 SOURCE_RESULT = '3f54c9f6d9b3dc89f88a2ea82f6778c6d72f6316ff67e6a532e77ef0762e5e95'
 
 
-def observe(rows, known, out, detections, targets, objects, cells, assignments):
+def observe(rows, known, out, detections, targets, objects, cells, assignments, *, geometry=None):
     geo = out['geometry']
     layers = [layer['pred_boxes'] for layer in out['aux_outputs']] + [out['pred_boxes']]
     if len(layers) != 6:
@@ -53,6 +53,9 @@ def observe(rows, known, out, detections, targets, objects, cells, assignments):
             reference = selected[j, :2].cpu().numpy() * [w, h]
             center_distance = float(np.linalg.norm((reference + .5 - center) / gt_wh))
             first_box = decoded[0][j]
+            if geometry is not None:
+                geometry[ann_id] = dict(gt=gt.tolist(), encoder=source_boxes[j].tolist(),
+                                        first=first_box.tolist())
             first_distance = float(np.linalg.norm(((first_box[:2] + first_box[2:]) / 2 - center) / gt_wh))
             rows.append(dict(annotation_id=ann_id, image_id=int(targets[i]['image_id']), slot=slot,
                              cell=int(ids[j]), source_iou=start, initial_reference_xy=reference.tolist(),
