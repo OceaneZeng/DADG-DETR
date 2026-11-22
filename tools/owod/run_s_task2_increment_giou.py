@@ -76,7 +76,7 @@ def prepare(output=OUTPUT, *, variant='giou'):
         cmd[cmd.index('--output_dir')+1] = str(output/phase)
         if variant == 'proposal-quality':
             cmd[cmd.index('--graph-localization') + 1] = 'decoder-bbox-increment-quality'
-        elif phase == 'increment' and variant != 'tail-positives':
+        elif phase == 'increment' and variant not in ('tail-positives', 'alternate-images'):
             increment_flags = {'classifier-lr': ['--class_embed_lr_mult', '2'], 'giou': ['--giou_loss_coef', '4'],
                                'no-random-crop': ['--no-random-crop']}
             cmd.extend(increment_flags[variant])
@@ -133,7 +133,12 @@ def prepare(output=OUTPUT, *, variant='giou'):
         plan.update(source_results={f.name:h for f,h in reports.items()},
                     intervention='Increment current-class classifier rows LR x2; finetune head LR x1. '
                                  'Same three-epoch control, GIoU coefficient 2 in both phases.')
+    if variant == 'alternate-images':
+        from tools.owod.s_task2_alternate_images import configure_pool
+        second_pool = configure_pool(plan, output, MANIFEST, SCREEN, screening)
     pin(output/'plan.json', plan)
+    if variant == 'alternate-images':
+        write_json(output/'pool-b.json', second_pool)
     return plan, evidence
 
 
@@ -166,6 +171,8 @@ def evaluate(name, checkpoint, plan, dataset, loader, manifest, order, *, proxie
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     options = parser.add_mutually_exclusive_group()
+    options.add_argument('--alternate-images', dest='variant', action='store_const', const='alternate-images',
+                         help='Use a matched, disjoint pool in increment epoch two at the original step budget')
     options.add_argument('--tail-positives', dest='variant', action='store_const', const='tail-positives',
                          help='Double increment matched focal positives for the bottom frequency quartile')
     options.add_argument('--classifier-lr', dest='variant', action='store_const', const='classifier-lr',
@@ -239,10 +246,7 @@ def main():
     delta = report['phases']['finetune']['delta']
     folds, known_pass, open_pass = paired_gates(views, control, delta)
     report.update(status='complete', proxy_deltas=folds, known_pass=known_pass, open_pass=open_pass, follow_up=known_pass and open_pass)
-    if variant == 'tail-positives':
-        from tools.owod.s_task2_tail_positive import gained_classes
-        tail = plan['tail_class_ids']
-        gained = gained_classes(views['released']['current_class_stats'], control['released']['current_class_stats'], tail)
+    if variant in ('tail-positives', 'alternate-images'):
         ann = Path(plan['independent_annotation'])
         independent_order = [im['owod_source_id'] for im in read_json(ann)['images']]
         if (sha256('\n'.join(independent_order).encode()).hexdigest() != plan['independent_order_sha256']
@@ -259,10 +263,15 @@ def main():
             raise ValueError('Independent control AP did not replay')
         gaps = {k:new['metrics'][k]-ref['metrics'][k] for k in delta}
         folds2, known2, open2 = paired_gates(paired['candidate'], paired['control'], gaps)
-        gained2 = gained_classes(new['current_class_stats'], ref['current_class_stats'], tail)
-        report.update(independent=dict(delta=gaps, proxy_deltas=folds2, known_pass=known2, open_pass=open2),
-                      gained_tail_classes=dict(original=sorted(gained), independent=sorted(gained2), both=sorted(gained & gained2)))
-        report['follow_up'] = report['follow_up'] and known2 and open2 and len(gained & gained2) >= 2
+        report['independent'] = dict(delta=gaps, proxy_deltas=folds2, known_pass=known2, open_pass=open2)
+        report['follow_up'] = report['follow_up'] and known2 and open2
+        if variant == 'tail-positives':
+            from tools.owod.s_task2_tail_positive import gained_classes
+            tail = plan['tail_class_ids']
+            gained = gained_classes(views['released']['current_class_stats'], control['released']['current_class_stats'], tail)
+            gained2 = gained_classes(new['current_class_stats'], ref['current_class_stats'], tail)
+            report['gained_tail_classes'] = dict(original=sorted(gained), independent=sorted(gained2), both=sorted(gained & gained2))
+            report['follow_up'] = report['follow_up'] and len(gained & gained2) >= 2
     if variant == 'no-random-crop':
         report['coverage_pass'] = report['phases']['increment']['delta_raw_hits'] > 0
         report['follow_up'] = report['follow_up'] and report['exposure_pass'] and report['coverage_pass']

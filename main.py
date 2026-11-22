@@ -125,6 +125,8 @@ def get_args_parser():
                         help='Pinned common Task 1 parent for a diagnostic Task 2 comparison only')
     parser.add_argument('--screen-no-distill', action='store_true',
                         help='Disable only old-class output distillation in a shared-parent Task 2 diagnostic')
+    parser.add_argument('--screen-sgd-pool', nargs=2, metavar=('PATH', 'SHA256'),
+                        help='second increment image pool for alternating SGD on the original diagnostic parent')
     parser.add_argument('--screen-exposure', choices=('repeat', 'alternate'), default='',
                         help='Task 2 diagnostic SGD over one registered half or alternating equal halves')
     parser.add_argument('--owod-stage', default=None, type=int,
@@ -616,7 +618,21 @@ def main(args):
             'lora_enabled': args.neighbor_scoped_lora,
         }, sort_keys=True))
 
-    dataset_train = build_dataset(image_set='train', args=args)
+    train_args = args
+    alternate_sgd = bool(getattr(args, 'screen_sgd_pool', None)) and args.owod_phase == 'increment'
+    if alternate_sgd:
+        from tools.owod.protocol import read_json, stage_files
+        from tools.owod.screening_data import source_ids
+        first_pool = source_ids(read_json(Path(args.train_ann)))
+        second_pool = read_json(Path(args.screen_sgd_pool[0]))
+        screen = read_json(Path(args.owod_screening))
+        manifest, official = stage_files(Path(args.owod_manifest), args.owod_stage)
+        reserved = set(screen['heldout_source_ids']) | set(manifest['evaluation']['image_source_ids'])
+        if set(second_pool) & reserved:
+            raise ValueError('Alternate SGD images overlap the evaluation')
+        train_args = copy.copy(args)
+        train_args.train_ann = str(official['increment_train'])
+    dataset_train = build_dataset(image_set='train', args=train_args)
     dataset_val = build_dataset(image_set='val', args=args)
     if args.paper_baseline:
         allowed = set(args.owod_current_class_ids if args.paper_baseline == 'ew-detr'
@@ -656,7 +672,10 @@ def main(args):
         sampler_train = torch.utils.data.RandomSampler(dataset_train)
         sampler_val = torch.utils.data.SequentialSampler(dataset_val)
 
-    if getattr(args, 'screen_exposure', '') and args.owod_phase == 'increment':
+    if alternate_sgd:
+        sampler_train = samplers.ExposureSampler(dataset_train, first_pool, 'alternate', utils.get_world_size(),
+                                                  utils.get_rank(), second_names=second_pool)
+    elif getattr(args, 'screen_exposure', '') and args.owod_phase == 'increment':
         from tools.owod.protocol import read_json
         first = read_json(Path(args.owod_screening))['exposure_first_source_ids']
         sampler_train = samplers.ExposureSampler(dataset_train, first, args.screen_exposure,
@@ -856,6 +875,8 @@ def main(args):
             criterion.epoch = epoch
         if args.distributed or isinstance(sampler_train, samplers.ExposureSampler):
             sampler_train.set_epoch(epoch)
+        if alternate_sgd:
+            print('Increment SGD exposure:', epoch, 'AB'[epoch % 2], 'steps', len(data_loader_train), flush=True)
         with RuntimeProfile(args.output_dir, device,
                 steps=getattr(args, 'profile_runtime_steps', 0) if epoch == args.start_epoch else 0,
                 warmup=getattr(args, 'profile_runtime_warmup', 20), epoch=epoch, rank=utils.get_rank(),

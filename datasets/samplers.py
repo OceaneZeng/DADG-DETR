@@ -75,12 +75,18 @@ class DistributedSampler(Sampler):
 class ExposureSampler(DistributedSampler):
     """Use the original per-epoch shuffle and rank split on one of two fixed pools."""
 
-    def __init__(self, dataset, first_names, mode, num_replicas, rank):
+    def __init__(self, dataset, first_names, mode, num_replicas, rank, second_names=None):
         first = set(first_names)
+        second = None if second_names is None else set(second_names)
+        if second is not None and (second & first or len(second) != len(first) or len(second) != len(second_names)):
+            raise ValueError('Explicit exposure pools must be disjoint and equal in size')
         pools = ([], [])
         for index, image_id in enumerate(dataset.ids):
             name = dataset.coco.imgs[image_id]['owod_source_id']
-            pools[int(name not in first)].append(index)
+            if name in first:
+                pools[0].append(index)
+            elif second is None or name in second:
+                pools[1].append(index)
         size = len(pools[0])
         if not size or size != len(first) or size != len(pools[1]) or size % num_replicas:
             raise ValueError('Expected two complete equal image pools divisible across ranks')

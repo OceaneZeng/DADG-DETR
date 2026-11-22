@@ -21,6 +21,12 @@ def configure_run(args):
             and not args.screen_no_distill and not args.discovery_no_keep):
         raise ValueError('Annotated distillation requires shared-parent Task 2 discovery screening finetuning')
     exposure = getattr(args, 'screen_exposure', '')
+    pool = getattr(args, 'screen_sgd_pool', None)
+    if pool:
+        if (not args.owod_screening or not args.screen_branch_checkpoint or not args.owod_discovery
+                or not args.screen_author_eval or args.owod_stage != 1 or args.cache_mode or args.replay_sampling_fraction
+                or exposure or args.teacher_completion or file_sha256(Path(pool[0])) != pool[1]):
+            raise ValueError('Alternating SGD requires a verified pool in shared-parent Task 2 discovery screening')
     if exposure and not (exposure in ('repeat', 'alternate') and args.owod_stage == 1
                          and args.owod_screening and args.screen_branch_checkpoint and args.screen_author_eval
                          and not args.cache_mode and not args.replay_sampling_fraction):
@@ -263,6 +269,8 @@ def validate_checkpoint(args, checkpoint, resume=False):
                           or not getattr(args, 'graph_routed_adapter', False)):
         raise ValueError('Shared-parent branching is restricted to screening Task 2')
     if not branching:
+        if getattr(saved, 'screen_sgd_pool', None) != getattr(args, 'screen_sgd_pool', None):
+            raise ValueError('Cannot change the SGD exposure pool within a checkpoint chain')
         if getattr(saved, 'screen_exposure', '') != getattr(args, 'screen_exposure', ''):
             raise ValueError('Cannot change the exposure arm within a checkpoint chain')
         if bool(getattr(saved, 'screen_no_distill', False)) != bool(getattr(args, 'screen_no_distill', False)):
