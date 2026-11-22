@@ -22,12 +22,12 @@ from tools.owod.validate_discovery import load_checkpoint_metadata
 OUTPUT = SCALE.with_name('s-instance-task1-proposal-stages')
 
 
-def stage_boxes(out, i):
+def stage_boxes(out, i, shortlist_multiplier=12):
     geo = out['geometry']
     ids = torch.where(geo['valid'][i])[0]
     scores = geo['logits'][i, ids]
     quota = geo['chosen'].shape[1]
-    pool = ids[scores.topk(min(len(ids), quota * 12)).indices]
+    pool = ids[scores.topk(min(len(ids), quota * shortlist_multiplier)).indices]
     selected = geo['chosen'][i, geo['active'][i]]
     if not torch.isin(selected, pool).all():
         raise ValueError('Native selected cells do not belong to the reconstructed shortlist')

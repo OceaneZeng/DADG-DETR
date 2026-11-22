@@ -14,7 +14,7 @@ export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1}"
 export OMP_NUM_THREADS=2
 export PYTHONUNBUFFERED=1
 export PYTHONPATH="$PWD/models/ops:$PWD${PYTHONPATH:+:$PYTHONPATH}"
-if [[ ${1:-} == --s-task2-wi-sources || ${1:-} == --task2-old-only-independent || ${1:-} == --s-task2-current-phase || ${1:-} == --s-task2-increment-giou || ${1:-} == --s-task2-increment-classifier-lr || ${1:-} == --s-task2-current-fp-sources || ${1:-} == --s-task2-current-exposure || ${1:-} == --s-task2-matched-exposure || ${1:-} == --s-task2-unknown-transition || ${1:-} == --s-task2-proposal-stages || ${1:-} == --s-task2-increment-proposal-quality || ${1:-} == --s-task2-finetune-quality-swap || ${1:-} == --s-task2-quality-timing || ${1:-} == --s-task2-finetune-half-lr || ${1:-} == --s-task2-step-classifier || ${1:-} == --s-task2-finetune-offset-rate || ${1:-} == --s-task2-step-box || ${1:-} == --s-task2-finetune-old-box-loss || ${1:-} == --s-task2-old-box-competition || ${1:-} == --s-task2-fixed-score-ranking || ${1:-} == --s-task2-finetune-current-positive || ${1:-} == --s-task2-absent-class-errors || ${1:-} == --s-task2-increment-match-coverage || ${1:-} == --s-task2-increment-no-random-crop || ${1:-} == --s-task2-crop-ap-anchors || ${1:-} == --s-task2-crop-ap-independent || ${1:-} == --s-task2-increment-tail-positives || ${1:-} == --s-task2-tail-query-ranking || ${1:-} == --s-task2-tail-affinity ]]; then
+if [[ ${1:-} == --s-task2-wi-sources || ${1:-} == --task2-old-only-independent || ${1:-} == --s-task2-current-phase || ${1:-} == --s-task2-increment-giou || ${1:-} == --s-task2-increment-classifier-lr || ${1:-} == --s-task2-current-fp-sources || ${1:-} == --s-task2-current-exposure || ${1:-} == --s-task2-matched-exposure || ${1:-} == --s-task2-unknown-transition || ${1:-} == --s-task2-proposal-stages || ${1:-} == --s-task2-increment-proposal-quality || ${1:-} == --s-task2-finetune-quality-swap || ${1:-} == --s-task2-quality-timing || ${1:-} == --s-task2-finetune-half-lr || ${1:-} == --s-task2-step-classifier || ${1:-} == --s-task2-finetune-offset-rate || ${1:-} == --s-task2-step-box || ${1:-} == --s-task2-finetune-old-box-loss || ${1:-} == --s-task2-old-box-competition || ${1:-} == --s-task2-fixed-score-ranking || ${1:-} == --s-task2-finetune-current-positive || ${1:-} == --s-task2-absent-class-errors || ${1:-} == --s-task2-increment-match-coverage || ${1:-} == --s-task2-increment-no-random-crop || ${1:-} == --s-task2-crop-ap-anchors || ${1:-} == --s-task2-crop-ap-independent || ${1:-} == --s-task2-increment-tail-positives || ${1:-} == --s-task2-tail-query-ranking || ${1:-} == --s-task2-tail-affinity || ${1:-} == --s-task2-shortlist-depth ]]; then
   flags=()
   dir=output/s-instance-task2-dedup-wi-sources
   module=tools.owod.probe_s_task2_wi_sources
@@ -59,6 +59,9 @@ if [[ ${1:-} == --s-task2-wi-sources || ${1:-} == --task2-old-only-independent |
     dir=output/s-instance-task2-finetune-old-box-loss
     module=tools.owod.run_s_task2_finetune_half_lr
     flags=(--double-old-boxes)
+  elif [[ $1 == --s-task2-shortlist-depth ]]; then
+    dir=output/s-instance-task2-shortlist-depth
+    module=tools.owod.probe_s_task2_shortlist_depth
   elif [[ $1 == --s-task2-tail-affinity ]]; then
     dir=output/s-instance-task2-tail-affinity
     module=tools.owod.probe_s_task2_tail_query_ranking

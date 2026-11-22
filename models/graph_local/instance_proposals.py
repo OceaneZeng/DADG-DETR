@@ -8,13 +8,15 @@ from torchvision.ops import nms
 from util.box_ops import box_cxcywh_to_xyxy
 
 
-def select_encoder_cells(boxes, valid_ids, scores, quota):
-    pool = valid_ids[scores[valid_ids].topk(min(len(valid_ids), quota * 12)).indices]
+def select_encoder_cells(boxes, valid_ids, scores, quota, shortlist_multiplier=12):
+    pool = valid_ids[scores[valid_ids].topk(min(len(valid_ids), quota * shortlist_multiplier)).indices]
     keep = nms(box_cxcywh_to_xyxy(boxes[pool]).float(), scores[pool].float(), 0.6)[:quota]
     return pool[keep]
 
 
 class InstanceProposals(nn.Module):
+    shortlist_multiplier = 12
+
     def __init__(self, dim):
         super().__init__()
         self.rank_within_level = False
@@ -76,15 +78,15 @@ class InstanceProposals(nn.Module):
                 ids = torch.where(valid[row])[0]
                 quality = logits[row]
                 if self.match_encoder_counts:
-                    global_ids = select_encoder_cells(boxes[row], ids, quality, quota)
+                    global_ids = select_encoder_cells(boxes[row], ids, quality, quota, self.shortlist_multiplier)
                     priority = self.within_level_scores(quality, masks, row)
-                    level_ids = select_encoder_cells(boxes[row], ids, priority, quota)
+                    level_ids = select_encoder_cells(boxes[row], ids, priority, quota, self.shortlist_multiplier)
                     counts = (len(global_ids), len(level_ids))
                     natural_counts.append(counts)
                     chosen = (level_ids if self.rank_within_level else global_ids)[:min(counts)]
                 else:
                     priority = self.within_level_scores(quality, masks, row) if self.rank_within_level else quality
-                    chosen = select_encoder_cells(boxes[row], ids, priority, quota)
+                    chosen = select_encoder_cells(boxes[row], ids, priority, quota, self.shortlist_multiplier)
                 indices.append(F.pad(chosen, (0, quota - len(chosen))))
                 live.append(torch.arange(quota, device=memory.device) < len(chosen))
         index = torch.stack(indices)

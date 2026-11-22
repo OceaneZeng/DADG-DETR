@@ -137,7 +137,7 @@ def prepare(output=OUTPUT, *, variant='giou'):
     return plan, evidence
 
 
-def evaluate_heldout(model, dataset, loader, manifest, order, *, proxies, fp_sources=False):
+def evaluate_heldout(model, dataset, loader, manifest, order, *, proxies, fp_sources=False, rank_observer=None):
     previous, current = (manifest['stages'][i]['classes'] for i in (0, 1))
     variants = {'released': (manifest['stages'][1]['active_classes'], 'focal', 50)}
     if proxies:
@@ -145,7 +145,7 @@ def evaluate_heldout(model, dataset, loader, manifest, order, *, proxies, fp_sou
             variants[fold] = (previous+visible, 'focal', 50)
     spec = dict(manifest['evaluation'], image_source_ids=order, diagnostic_current_fp_sources=fp_sources)
     return evaluate_views(model, loader, dataset.coco, variants, spec, previous, current, 'cuda',
-                          include_current_stats=True, print_freq=64)
+                          include_current_stats=True, print_freq=64, rank_observer=rank_observer)
 
 
 def evaluate(name, checkpoint, plan, dataset, loader, manifest, order, *, proxies, output=OUTPUT, fp_sources=False):
