@@ -42,7 +42,7 @@ if [[ ${1:-} == --task2-m-s-previous-hard-negatives || ${1:-} == --task2-m-s-pre
     module=tools.owod.probe_task2_m_s_previous_hard_negative_misses
     if [[ $1 == --task2-m-s-previous-hard-negative-scores ]]; then
       flags=(--score-components)
-    elif [[ flags=(--score-components) == --task2-m-s-current-low-iou-box-misses ]]; then
+    elif [[ $1 == --task2-m-s-current-low-iou-box-misses ]]; then
       flags=(--low-iou-boxes)
     fi
   fi
