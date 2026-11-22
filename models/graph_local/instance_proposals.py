@@ -142,6 +142,14 @@ class InstanceProposals(nn.Module):
         return self.logits(stacked[row, q, level_ids], boxes)
 
 
+def nearby_anchor_ids(gt, anchors, valid_ids):
+    """Select the anchor cells used for each released target's geometry supervision."""
+    scale = gt[:, 2:].clamp_min(0.01)
+    distance = ((gt[:, None, :2] - anchors[None, :, :2]) / scale[:, None]).abs().sum(-1)
+    distance += 0.5 * (scale.log()[:, None] - anchors[None, :, 2:].log()).abs().sum(-1)
+    return valid_ids[distance[:, valid_ids].topk(min(16, len(valid_ids)), largest=False).indices]
+
+
 def geometry_loss(state, targets):
     # Only released boxes supervise geometry. Sample close and offset anchors for quality.
     loss = state["boxes"].sum() * 0 + state["logits"].sum() * 0
@@ -151,11 +159,8 @@ def geometry_loss(state, targets):
         if not len(gt):
             continue
         anchors = state["anchors"][row]
-        scale = gt[:, 2:].clamp_min(0.01)
-        distance = ((gt[:, None, :2] - anchors[None, :, :2]) / scale[:, None]).abs().sum(-1)
-        distance += 0.5 * (scale.log()[:, None] - anchors[None, :, 2:].log()).abs().sum(-1)
         valid_ids = torch.where(state["valid"][row])[0]
-        near = valid_ids[distance[:, valid_ids].topk(min(16, len(valid_ids)), largest=False).indices]
+        near = nearby_anchor_ids(gt, anchors, valid_ids)
         pred = state["boxes"][row, near]
         a = box_cxcywh_to_xyxy(pred.detach())
         b = box_cxcywh_to_xyxy(gt[:, None])
