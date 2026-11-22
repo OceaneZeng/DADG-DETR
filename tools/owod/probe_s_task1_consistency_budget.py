@@ -30,9 +30,9 @@ SMALL_THRESHOLD = .25
 
 
 @torch.inference_mode()
-def replay(model, criterion, ema, dataset, loader, reference):
-    prior_rows = {row['annotation_id']: row for row in reference['rows']}
-    prior_counts = {row['image_id']: row['queries']['selected'] for row in reference['images']}
+def replay(model, criterion, ema, dataset, loader, reference=None):
+    prior_rows = {row['annotation_id']: row for row in reference['rows']} if reference is not None else None
+    prior_counts = {row['image_id']: row['queries']['selected'] for row in reference['images']} if reference is not None else None
     known = set(model.known_ids)
     rows, images = [], []
     for step, (targets, output, trace, mined) in enumerate(candidate_batches(model, criterion, ema, loader), 1):
@@ -42,7 +42,7 @@ def replay(model, criterion, ema, dataset, loader, reference):
             boxes = output['pred_boxes'][i]
             native = torch.where(mined['pseudo'][i])[0]
             quota = len(native)
-            if quota != prior_counts[image_id]:
+            if prior_counts is not None and quota != prior_counts[image_id]:
                 raise ValueError(f'Changed original budget on image {image_id}')
             gate = trace[i]
             small = boxes[:, 2:].prod(-1) * (height * width) < SMALL_AREA
@@ -73,16 +73,23 @@ def replay(model, criterion, ema, dataset, loader, reference):
                 truth = np.asarray(ann['voc_bbox'])
                 before = bool((overlaps(truth, native_boxes) > .5).any())
                 after = bool((overlaps(truth, candidate_boxes) > .5).any())
-                prior = prior_rows[ann['id']]
                 released = ann['category_id'] in known
                 size = size_group(ann)
-                if (before, released, size) != (prior['coverage']['selected'], prior['released'], prior['size']):
-                    raise ValueError(f'Changed original target coverage for {ann["id"]}')
-                rows.append(dict(annotation_id=ann['id'], released=released, size=size, native=before, candidate=after))
+                if prior_rows is not None:
+                    prior = prior_rows[ann['id']]
+                    if (before, released, size) != (prior['coverage']['selected'], prior['released'], prior['size']):
+                        raise ValueError(f'Changed original target coverage for {ann["id"]}')
+                row = dict(annotation_id=ann['id'], released=released, size=size, native=before, candidate=after)
+                if reference is None:
+                    row['image_id'] = image_id
+                rows.append(row)
         if step % 64 == 0 or step == len(loader):
             print(f'Inference {step}/{len(loader)} batches', flush=True)
-    if ({row['annotation_id'] for row in rows} != set(prior_rows) or len(rows) != len(prior_rows)
-            or {row['image_id'] for row in images} != set(prior_counts) or len(images) != len(prior_counts)):
+    expected_rows = (prior_rows if prior_rows is not None else
+                     {ann['id'] for ann in dataset.coco.anns.values() if not ann.get('difficult')})
+    expected_images = prior_counts if prior_counts is not None else dataset.coco.imgs
+    if ({row['annotation_id'] for row in rows} != set(expected_rows) or len(rows) != len(expected_rows)
+            or {row['image_id'] for row in images} != set(expected_images) or len(images) != len(expected_images)):
         raise ValueError('Incomplete locked replay')
     return dict(rows=rows, images=images)
 

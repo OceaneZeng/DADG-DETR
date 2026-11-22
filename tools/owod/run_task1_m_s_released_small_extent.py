@@ -66,7 +66,7 @@ def size_group(ann):
     return 'under_16_sq' if area < 16**2 else '16_to_32_sq' if area < 32**2 else '32_sq_plus'
 
 
-def cohorts(raw, known, blocked):
+def cohorts(raw, known, blocked, *, seeds=SLICE_SEEDS):
     known = set(known)
     eligible = [im for im in raw['images'] if im['owod_source_id'] not in blocked]
     by_id = {im['id']: im['owod_source_id'] for im in eligible}
@@ -76,7 +76,7 @@ def cohorts(raw, known, blocked):
                      for size in ('under_16_sq', '16_to_32_sq')}
     known_by_class = {c: {by_id[a['image_id']] for a in eligible_annotations if a['category_id'] == c} for c in known}
     selected = set()
-    for name, seed in SLICE_SEEDS.items():
+    for name, seed in seeds.items():
         chosen = set()
         for ids in unknown_small.values():
             pool = dict(images=[im for im in eligible if im['id'] in ids], annotations=[])
