@@ -59,7 +59,7 @@ def measure(model, dataset, loader, known, previous, current, spec, limit, *, ev
             native_scores = native_scores.flatten(1)
         for name, post in posts.items():
             restore = name == restore_scores_for
-            audit = audit_query_counts and name in ('native', 'unique')
+            audit = audit_query_counts and name in ('native', 'unique', 'unknown_refill')
             selected = post(output, sizes, include_top_indices=restore or audit)
             for index, (target, pred) in enumerate(zip(targets, selected, strict=True)):
                 image = int(target['image_id'])

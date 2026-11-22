@@ -24,6 +24,9 @@ NEAR = SOURCE.with_name('task2-m-s-current-fp-near-target')
 NEAR_RESULT = '8a841a56fb07c60072bbf5c5efe277ee35f05a0bfa3d8767325d327b39e1b72e'
 TOP_RESULT = '62428d324a76a3a711a5efdb601a8d8185167738107f7b3176138505b41634eb'
 ORDER_RESULT = 'f9eb597a03348486df77666d7e8dd7ceb9272feeabfa447d52b552708c28d42d'
+UNIQUE_RESULT = '6473786a7a7729eed5419b1d1ac370596d167022d97f1ec57a2a8f2501f2e21f'
+REFILL_MIN_RECALL_GAIN = .001
+REFILL_AP_TOLERANCE = .0005
 
 
 class LeadingCurrentScore(DiscoveryPostProcess):
@@ -46,6 +49,31 @@ class UniqueQueryScore(DiscoveryPostProcess):
         winning_scores, winners = scores.max(dim=-1, keepdim=True)
         unique = torch.full_like(scores, -torch.inf).scatter_(-1, winners, winning_scores)
         return unique, categories, unknown
+
+
+class UnknownRefillScore(DiscoveryPostProcess):
+    def candidate_scores(self, outputs):
+        scores, categories, unknown = super().candidate_scores(outputs)
+        rows, query_count, class_count = scores.shape
+        if len(self.known_ids) + 1 != class_count or int(categories[-1]) != 91:
+            raise ValueError('Expected an active unknown output')
+        native = scores.flatten(1)
+        values, indices = native.topk(self.max_detections, dim=1)
+        queries = indices // class_count
+        positions = torch.arange(self.max_detections, device=scores.device)
+        earlier = positions[:, None] > positions[None, :]
+        repeated = ((queries[..., None] == queries[:, None, :]) & earlier).any(dim=-1)
+        eligible = repeated & (indices % class_count != class_count - 1)
+        drop = torch.where(eligible, positions, -1).max(dim=1).values
+        used = torch.zeros((rows, query_count), dtype=torch.bool, device=scores.device)
+        used.scatter_(1, queries, True)
+        refill_scores, refill_queries = unknown.masked_fill(used, -torch.inf).max(dim=1)
+        refill = drop.ge(0) & refill_scores.isfinite()
+        selected = torch.full_like(native, -torch.inf).scatter_(1, indices, values)
+        batch = torch.arange(rows, device=scores.device)[refill]
+        selected[batch, indices[batch, drop[batch]]] = -torch.inf
+        selected[batch, refill_queries[batch] * class_count + class_count - 1] = refill_scores[batch]
+        return selected.reshape_as(scores), categories, unknown
 
 
 def summarize_views(report, prior, shared):
@@ -75,7 +103,7 @@ def summarize_views(report, prior, shared):
                 passed=selected['passed'] and fp['selective'] < fp['perturbed'])
 
 
-def main(native_order=False, unique_query=False):
+def main(native_order=False, unique_query=False, unknown_refill=False):
     if torch.cuda.device_count() != 1 or torch.cuda.get_device_name() != 'NVIDIA GeForce RTX 3090':
         raise ValueError('Use one RTX 3090')
     previous = verified(FULL / 'comparison.json', OPEN_RESULT)
@@ -107,6 +135,15 @@ def main(native_order=False, unique_query=False):
         output = OUTPUT.with_name('task2-m-s-unique-query')
         plan.update(native_order_plan=order['plan_sha256'], native_order_result=ORDER_RESULT,
                     maximum_outputs_per_query=1)
+    if unknown_refill:
+        unique_path = OUTPUT.with_name('task2-m-s-unique-query')
+        unique = verified(unique_path / 'comparison.json', UNIQUE_RESULT)
+        if unique['status'] != 'complete' or unique['plan_sha256'] != file_sha256(unique_path / 'plan.json'):
+            raise ValueError('Changed distinct-query comparison')
+        output = OUTPUT.with_name('task2-m-s-unknown-refill')
+        plan.update(unique_query_plan=unique['plan_sha256'], unique_query_result=UNIQUE_RESULT,
+                    max_refills_per_image=1, minimum_unknown_recall_gain=REFILL_MIN_RECALL_GAIN,
+                    refill_ap_tolerance=REFILL_AP_TOLERANCE)
     pin(output / 'plan.json', plan)
     digest = file_sha256(output / 'plan.json')
     results = {}
@@ -141,10 +178,13 @@ def main(native_order=False, unique_query=False):
                 extra = dict(selective=post)
                 if unique_query:
                     extra['unique'] = UniqueQueryScore(known_ids=known, max_detections=plan['limit'], scoring='focal')
+                if unknown_refill:
+                    extra['unknown_refill'] = UnknownRefillScore(known_ids=known, max_detections=plan['limit'],
+                                                                scoring='focal')
                 report = measure(model, dataset, loader, known, entry['previous'], entry['current'], spec,
                                  plan['limit'], evaluation_coco=COCO(str(full)), extra_posts=extra,
                                  restore_scores_for='selective' if native_order else None,
-                                 audit_query_counts=unique_query)
+                                 audit_query_counts=unique_query or unknown_refill)
                 write_json(path, dict(plan_sha256=digest, **report))
             report = read_json(path)
             prior = verified(FULL / path.name, info['reference_sha256'])
@@ -180,6 +220,25 @@ def main(native_order=False, unique_query=False):
                 open_metrics = summary['open_metrics']
                 summary['passed'] = (summary['arms']['unique']['passed'] and
                                      open_metrics['unique']['u_recall'] >= open_metrics['native']['u_recall'])
+            if unknown_refill:
+                query_counts = report['queries_per_image']
+                flips = []
+                for img, arms in report['per_image'].items():
+                    new, old = (arms[k] for k in ('unknown_refill', 'native'))
+                    changes = {k: new[k] - old[k] for k in new}
+                    queries = query_counts[img]
+                    added = changes['unknown']
+                    if (added not in (0, 1) or queries['unknown_refill'] - queries['native'] != added
+                            or any(changes[k] > 0 for k in ('previous', 'current'))):
+                        raise ValueError(f'Invalid single unknown refill: {label}/{img}')
+                    flips.append(added)
+                old, new = (summary['open_metrics'][k] for k in ('native', 'unknown_refill'))
+                gain = new['u_recall'] - old['u_recall']
+                deltas = summary['arms']['unknown_refill']['deltas']
+                summary.update(refills=sum(flips), unknown_recall_gain=gain,
+                               passed=gain >= plan['minimum_unknown_recall_gain']
+                               and all(delta >= -plan['refill_ap_tolerance'] for delta in deltas.values())
+                               and new['a_ose'] <= old['a_ose'])
             results[protocol][fold] = summary
         del model
     accepted = all(r['passed'] for folds in results.values() for r in folds.values())
@@ -194,5 +253,6 @@ if __name__ == '__main__':
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument('--native-order', action='store_true')
     mode.add_argument('--unique-query', action='store_true')
+    mode.add_argument('--unknown-refill', action='store_true')
     args = parser.parse_args()
-    main(args.native_order, args.unique_query)
+    main(args.native_order, args.unique_query, args.unknown_refill)
