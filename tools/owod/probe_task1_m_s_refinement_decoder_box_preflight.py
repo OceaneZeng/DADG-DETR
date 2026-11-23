@@ -1,11 +1,13 @@
 """Measure last-two-layer box averaging on released Task 1 training images."""
 
+import argparse
 from collections import Counter
 from pathlib import Path
 import subprocess
 
 import torch
 
+from models.graph_local.instance_proposals import nearby_anchor_ids
 from tools.owod.gnn_calibration import load_detector
 from tools.owod.probe_task1_m_s_refinement_known_dedup import COMPETITION_OUTPUT, CompeteWithEmittedUnknown
 from tools.owod.probe_task1_m_s_refinement_local_saliency import SOURCE_SHA as TRAIN_REPLAY_SHA
@@ -19,7 +21,9 @@ from util.box_ops import box_cxcywh_to_xyxy, box_iou
 
 
 OUTPUT = COMPETITION_OUTPUT.with_name('task1-m-s-refinement-decoder-box-preflight')
+RANK_OUTPUT = COMPETITION_OUTPUT.with_name('task1-m-s-refinement-encoder-rank-preflight')
 COMPETITION_SHA = 'b3801feb4573a0b6d9586d70f5479d8be541acea665678baaf5f76f974570f67'
+DECODER_SHA = 'd16ba04de5eeaa1be2a67fcb5bcf8c514e70a874618339ed5d6b6d10d3561d95'
 
 
 def prepare():
@@ -88,15 +92,76 @@ def measure(model, known, loader, plan):
     return stats
 
 
+@torch.inference_mode()
+def measure_ranks(model, known, loader, plan):
+    groups = {key: Counter() for key in ('under_16_sq', '16_to_32_sq', 'all_small')}
+    miss_rows = []
+    observed = 0
+    multiplier = model.detr.transformer.instance_proposals.shortlist_multiplier
+    for step, (samples, targets) in enumerate(loader, 1):
+        geo = model(samples.to('cuda'))['geometry']
+        for batch, target in enumerate(targets):
+            area = target['source_box_area']
+            small = torch.where(area < plan['small_area'])[0]
+            truth = target['boxes'][small].cuda()
+            if not len(truth):
+                continue
+            if not set(target['labels'].tolist()) <= set(known):
+                raise ValueError('Expected released training categories only')
+            valid = torch.where(geo['valid'][batch])[0]
+            scores = geo['logits'][batch, valid]
+            chosen = geo['chosen'][batch, geo['active'][batch]]
+            shortlist = scores.topk(min(len(scores), geo['chosen'].shape[1] * multiplier)).indices
+            chosen_at = torch.searchsorted(valid, chosen)
+            if not torch.isin(chosen_at, shortlist).all():
+                raise ValueError('Selected cells are outside the reconstructed native shortlist')
+            near = nearby_anchor_ids(truth, geo['anchors'][batch], valid)
+            near_at = torch.searchsorted(valid, near)
+            accurate = box_iou(box_cxcywh_to_xyxy(geo['boxes'][batch, valid]), box_cxcywh_to_xyxy(truth))[0] > .5
+            dense_ok = accurate.any(dim=0)
+            shortlist_ok = accurate[shortlist].any(dim=0)
+            chosen_ok = accurate[chosen_at].any(dim=0)
+            near_ok = accurate.T.gather(1, near_at).any(dim=1)
+            flags = torch.stack((dense_ok, shortlist_ok, chosen_ok, near_ok), dim=1).tolist()
+            for pos, ((dense, pool, keep, near_hit), original) in enumerate(zip(flags, small.tolist(), strict=True)):
+                group = 'under_16_sq' if area[original] < 16**2 else '16_to_32_sq'
+                for name in (group, 'all_small'):
+                    groups[name].update(gt=1, dense=dense, shortlist=pool, selected=keep,
+                                        dense_outside_shortlist=dense and not pool,
+                                        outside_shortlist_near_positive=dense and not pool and near_hit,
+                                        outside_shortlist_without_near_positive=dense and not pool and not near_hit,
+                                        shortlist_lost_at_selection=pool and not keep)
+                if dense and not pool:
+                    high = scores[accurate[:, pos]].max()
+                    miss_rows.append(dict(group=group, near_positive=near_hit,
+                                          first_rank=1+int((scores > high).sum()), native_cut=len(shortlist)))
+        observed += len(targets)
+        if step % 64 == 0 or step == len(loader):
+            print(f'Inference {step}/{len(loader)} batches', flush=True)
+    if observed != plan['images'] or not groups['all_small']['gt']:
+        raise ValueError('Incomplete released small-box ranking replay')
+    return dict(groups=groups, shortlist_misses=miss_rows)
+
+
 def main():
     if torch.cuda.device_count() != 1 or torch.cuda.get_device_name() != 'NVIDIA GeForce RTX 3090':
         raise ValueError('Use one RTX 3090 for the frozen released replay')
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--encoder-ranks', action='store_true')
+    ranks = parser.parse_args().encoder_ranks
+    output = RANK_OUTPUT if ranks else OUTPUT
     plan = prepare()
-    pin(OUTPUT / 'plan.json', plan)
-    digest = file_sha256(OUTPUT / 'plan.json')
+    if ranks:
+        decoder = verified(OUTPUT / 'comparison.json', DECODER_SHA)
+        if decoder['status'] != 'complete' or decoder['passed']:
+            raise ValueError('Expected the completed box-average preflight')
+        plan.update(decoder_preflight_sha256=DECODER_SHA, factor='Trace native encoder scores and exact released near-16 supervision.',
+                    advance='Use the source of actual shortlist misses to choose the next released supervision contrast.')
+    pin(output / 'plan.json', plan)
+    digest = file_sha256(output / 'plan.json')
     protocols = {}
     for protocol, job in plan['jobs'].items():
-        dest = OUTPUT / f'{protocol}.json'
+        dest = output / f'{protocol}.json'
         if not dest.exists():
             path = MANIFESTS[protocol]
             manifest = verified(path, job['manifest_sha256'])
@@ -109,17 +174,22 @@ def main():
                 raise ValueError(f'Changed released replay order: {protocol}')
             model, _ = load_detector(None, checkpoint, torch.device('cuda'))
             model.eval()
-            print(f'Evaluating {protocol} released small-box geometry', flush=True)
-            groups = measure(model, job['classes'], loader, plan)
-            write_json(dest, dict(plan_sha256=digest, order_sha256=order, groups=groups))
+            print(f'Evaluating {protocol} released small-box {"encoder ranks" if ranks else "geometry"}', flush=True)
+            if ranks:
+                report = measure_ranks(model, job['classes'], loader, plan)
+            else:
+                report = dict(groups=measure(model, job['classes'], loader, plan))
+            write_json(dest, dict(plan_sha256=digest, order_sha256=order, **report))
             del model
         report = read_json(dest)
         if report['plan_sha256'] != digest:
             raise ValueError(f'Changed frozen plan: {dest}')
         protocols[protocol] = report['groups']
-    m, s = (protocols[key]['small'] for key in ('m-owodb', 's-owodb'))
-    write_json(OUTPUT / 'comparison.json', dict(status='complete', plan_sha256=digest, protocols=protocols,
-                                               passed=(m['blend'] >= m['final'] and s['blend'] > s['final'])))
+    result = dict(status='complete', plan_sha256=digest, protocols=protocols)
+    if not ranks:
+        m, s = (protocols[key]['small'] for key in ('m-owodb', 's-owodb'))
+        result['passed'] = m['blend'] >= m['final'] and s['blend'] > s['final']
+    write_json(output / 'comparison.json', result)
 
 
 if __name__ == '__main__':
