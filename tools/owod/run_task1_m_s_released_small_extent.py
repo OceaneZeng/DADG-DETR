@@ -201,10 +201,11 @@ def prepare():
 
 
 @torch.inference_mode()
-def measure(model, manifest, image_root, path, batch, max_detections, *, observer=None):
+def measure(model, manifest, image_root, path, batch, max_detections, *, observer=None, postprocessor=None):
     dataset, loader = make_loader(image_root, path, batch, 2)
     known = manifest['stages'][0]['classes']
-    post = DiscoveryPostProcess(known_ids=known, scoring='focal', max_detections=max_detections)
+    post = postprocessor if postprocessor is not None else DiscoveryPostProcess(
+        known_ids=known, scoring='focal', max_detections=max_detections)
     sequence = [im['owod_source_id'] for im in dataset.coco.dataset['images']]
     specification = {**manifest['evaluation'], 'image_source_ids': sequence}
     predictions, coverage = {}, {key: set() for key in STAGES}
