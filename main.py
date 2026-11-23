@@ -216,6 +216,8 @@ def get_args_parser():
                         help='Shared initialization proof for paired bounded Task 1 diagnostics')
     parser.add_argument('--discovery-top-k', type=int, default=5)
     parser.add_argument('--discovery-saliency-threshold', type=float, default=.65)
+    parser.add_argument('--discovery-saliency-top-points', type=int, choices=range(1, 10), default=None,
+                        help='Use the strongest N of nine local samples for the two EMA saliency gates')
     parser.add_argument('--discovery-consistency-threshold', type=float, default=.5)
     parser.add_argument('--lora-rank', default=8, type=int)
     parser.add_argument('--lora-last-decoder-layers', default=2, type=int)
@@ -396,6 +398,7 @@ def main(args):
                        'known_rank_coef': args.discovery_known_rank_coef,
                        'feature_grad_scale': args.discovery_feature_grad_scale,
                        'background_negative': args.discovery_background_negative,
+                       'saliency_top_points': args.discovery_saliency_top_points,
                        'implementation': 'project_research_method', 'paper_baseline': False}
         elif getattr(args, 'control_postprocess_version', None):
             profile = {'method': 'supervised-control', 'unknown_score': 'none; no unknown predictions',

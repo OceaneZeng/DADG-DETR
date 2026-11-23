@@ -331,6 +331,7 @@ def validate_checkpoint(args, checkpoint, resume=False):
                                ('discovery_known_rank_coef', 0.),
                                ('discovery_feature_grad_scale', 1.),
                                ('discovery_background_negative', False),
+                               ('discovery_saliency_top_points', None),
                                ('screen_small_box_extent', False)):
             if getattr(saved, field, default) != getattr(args, field, default):
                 raise ValueError(f'Discovery checkpoint cannot change {field}')

@@ -128,7 +128,8 @@ def select_distinct_boxes(boxes, eligible, scores, limit, *, duplicate_queries=N
 
 @torch.no_grad()
 def mine_candidates(outputs, targets, indices, known_ids, teacher=None, top_k=5,
-                    saliency_threshold=.65, consistency_threshold=.5, *, gate_trace=None):
+                    saliency_threshold=.65, consistency_threshold=.5, *, gate_trace=None,
+                    saliency_top_points=None):
     saliency = saliency_in_boxes(outputs['attention_feature'], outputs['pred_boxes'],
                                 outputs['image_sizes'], outputs['padded_size'])
     known = outputs['pred_logits'][..., known_ids].sigmoid().amax(-1)
@@ -138,10 +139,19 @@ def mine_candidates(outputs, targets, indices, known_ids, teacher=None, top_k=5,
     weights = torch.zeros_like(known)
     maps, consistency, teacher_boxes = (None, torch.zeros_like(known), None)
     teacher_saliency = None
+    gate_saliency, gate_teacher_saliency = saliency, None
     if teacher is not None:
         maps, consistency, teacher_boxes = view_matches(outputs, teacher)
         teacher_saliency = saliency_in_boxes(teacher['attention_feature'], teacher['pred_boxes'],
                                             teacher['image_sizes'], teacher['padded_size'])
+        gate_teacher_saliency = teacher_saliency
+        if saliency_top_points is not None:
+            gate_saliency = saliency_in_boxes(outputs['attention_feature'], outputs['pred_boxes'],
+                                              outputs['image_sizes'], outputs['padded_size'],
+                                              strongest_points=saliency_top_points)
+            gate_teacher_saliency = saliency_in_boxes(teacher['attention_feature'], teacher['pred_boxes'],
+                                                      teacher['image_sizes'], teacher['padded_size'],
+                                                      strongest_points=saliency_top_points)
     for batch, (queries, _) in enumerate(indices):
         box = outputs['pred_boxes'][batch]
         valid = torch.isfinite(box).all(-1) & (box[:, 2:] > .005).all(-1)
@@ -153,11 +163,11 @@ def mine_candidates(outputs, targets, indices, known_ids, teacher=None, top_k=5,
                               box_cxcywh_to_xyxy(targets[batch]['boxes']))[0]
             exclude |= overlap.amax(-1) > .3
         eligible = valid & ~exclude
-        salient = saliency[batch] >= saliency_threshold
+        salient = gate_saliency[batch] >= saliency_threshold
         consistent = consistency[batch] >= consistency_threshold
         confident = eligible & salient & consistent
-        if teacher_saliency is not None:
-            matched_saliency = teacher_saliency[batch, maps[batch].clamp_min(0)]
+        if gate_teacher_saliency is not None:
+            matched_saliency = gate_teacher_saliency[batch, maps[batch].clamp_min(0)]
             other_salient = (maps[batch] >= 0) & (matched_saliency >= saliency_threshold)
             confident &= other_salient
         quality = saliency[batch] * consistency[batch] * semantic[batch]
