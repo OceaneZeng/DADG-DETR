@@ -106,7 +106,7 @@ def view_matches(outputs, teacher):
     return torch.stack(matches), torch.stack(confidence), boxes
 
 
-def select_distinct_boxes(boxes, eligible, scores, limit):
+def select_distinct_boxes(boxes, eligible, scores, limit, *, duplicate_queries=None):
     ranked = torch.where(eligible)[0]
     ranked = ranked[torch.argsort(scores[ranked], descending=True)]
     chosen = []
@@ -117,6 +117,8 @@ def select_distinct_boxes(boxes, eligible, scores, limit):
             overlap = box_iou(box_cxcywh_to_xyxy(boxes[query:query + 1]),
                               box_cxcywh_to_xyxy(boxes[torch.stack(chosen)]))[0]
             if overlap.max() > .7:
+                if duplicate_queries is not None:
+                    duplicate_queries.append(query)
                 continue
         chosen.append(query)
     return torch.stack(chosen) if chosen else ranked[:0]
@@ -156,18 +158,23 @@ def mine_candidates(outputs, targets, indices, known_ids, teacher=None, top_k=5,
             matched_saliency = teacher_saliency[batch, maps[batch].clamp_min(0)]
             other_salient = (maps[batch] >= 0) & (matched_saliency >= saliency_threshold)
             confident &= other_salient
-        if gate_trace is not None:
-            gate_trace.append(dict(valid=valid, eligible=eligible, salient=salient, consistent=consistent,
-                                   other_salient=other_salient if teacher_saliency is not None else torch.ones_like(valid),
-                                   confident=confident,
-                                   matched_saliency=matched_saliency if teacher_saliency is not None else None))
         quality = saliency[batch] * consistency[batch] * semantic[batch]
         if 'geometry_quality' in outputs:
             quality = quality * outputs['geometry_quality'][batch].detach()
-        chosen = select_distinct_boxes(box, confident, quality, top_k)
+        duplicates = [] if gate_trace is not None else None
+        chosen = select_distinct_boxes(box, confident, quality, top_k, duplicate_queries=duplicates)
         if chosen.numel():
             pseudo[batch, chosen] = True
             weights[batch, chosen] = quality[chosen]
+        if gate_trace is not None:
+            deduplicated = torch.zeros_like(valid)
+            if duplicates:
+                deduplicated[torch.stack(duplicates)] = True
+            gate_trace.append(dict(valid=valid, eligible=eligible, excluded=exclude, salient=salient,
+                                   consistent=consistent, deduplicated=deduplicated,
+                                   other_salient=other_salient if teacher_saliency is not None else torch.ones_like(valid),
+                                   confident=confident,
+                                   matched_saliency=matched_saliency if teacher_saliency is not None else None))
         # Lack of a semantic label is insufficient evidence of background.
         background[batch] = eligible & (saliency[batch] < .15)
         if teacher is not None:
