@@ -51,7 +51,7 @@ def prepare():
                 batch_size=prior['batch_size'], paper_comparable=False)
 
 
-def training_loader(checkpoint, path, root, job, plan):
+def training_loader(checkpoint, path, root, job, plan, *, source_box_area=False):
     annotation = verified(path, job['training_sha256'])
     if {row['category_id'] for row in annotation['annotations']} != set(job['classes']):
         raise ValueError('Expected only released Task 1 training annotations')
@@ -60,7 +60,7 @@ def training_loader(checkpoint, path, root, job, plan):
                                       no_augmentation=getattr(args, 'no_augmentation', False),
                                       no_random_crop=getattr(args, 'no_random_crop', False))
     dataset = CocoDetection(root, path, transforms=transforms, return_masks=False,
-                            cache_mode=False, local_rank=0, local_size=1)
+                            cache_mode=False, local_rank=0, local_size=1, source_box_area=source_box_area)
     indices = torch.randperm(len(dataset), generator=torch.Generator().manual_seed(plan['seed']))
     indices = indices[:plan['images']].tolist()
     order = [dataset.coco.imgs[dataset.ids[i]]['owod_source_id'] for i in indices]
