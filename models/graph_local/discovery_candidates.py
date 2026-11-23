@@ -47,7 +47,7 @@ def flip_samples(samples):
 
 
 @torch.no_grad()
-def saliency_in_boxes(feature, boxes, image_sizes, padded_size):
+def saliency_in_boxes(feature, boxes, image_sizes, padded_size, *, strongest_points=None):
     heat = feature.detach().abs().mean(1)
     results = []
     for batch, (height, width) in enumerate(image_sizes):
@@ -62,8 +62,10 @@ def saliency_in_boxes(feature, boxes, image_sizes, padded_size):
         y = xyxy[:, 1, None] + (xyxy[:, 3] - xyxy[:, 1])[:, None] * points
         grid = torch.stack([x[:, None, :].expand(-1, 3, -1),
                             y[:, :, None].expand(-1, -1, 3)], -1).reshape(1, -1, 9, 2) * 2 - 1
-        values = F.grid_sample(normalized[None, None], grid, align_corners=False)
-        results.append(values[0, 0].mean(-1))
+        values = F.grid_sample(normalized[None, None], grid, align_corners=False)[0, 0]
+        if strongest_points is not None:
+            values = values.topk(strongest_points, dim=-1).values
+        results.append(values.mean(-1))
     return torch.stack(results)
 
 
