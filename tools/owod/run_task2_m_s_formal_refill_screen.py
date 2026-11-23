@@ -1,5 +1,7 @@
 """Screen the same-class refill rule on short chains using the formal model settings."""
 
+import argparse
+from copy import deepcopy
 import os
 from pathlib import Path
 import subprocess
@@ -21,11 +23,15 @@ from tools.owod.protocol import file_sha256, read_json, resolve_image_root
 from tools.owod.run_benchmark import build_plan, get_args_parser
 from tools.owod.run_cross_attention_study import pin
 from tools.owod.run_instance_pilot import ROOT, WEIGHTS, run
+from tools.owod.run_stronger_parent_study import run_job
 from tools.owod.screening_data import screening_files, source_ids, write_json
 from tools.owod.strict_setting import configure_run
 
 
 OUTPUT = OVERLAP_OUTPUT.with_name('task2-m-s-formal-refill-screen')
+LONG_OUTPUT = OUTPUT.with_name('task2-m-s-formal-refill-six-epochs')
+SCREEN_RESULT_SHA = '91c2d6b967e198808f66d3dc99b14ff52800aed062d04b5bddf0039286ce4bbc'
+SCREEN_ENDPOINTS_SHA = 'e9e72cc97eeb7fb6e17f0ca6cd1d796414de9c71ad73588999d37c0174e8a480'
 COHORT_ROOT = OVERLAP_OUTPUT / 'cohorts'
 INCREMENT_EPOCHS = 3
 FINETUNE_EPOCHS = 1
@@ -109,7 +115,7 @@ def prepare():
     return plan
 
 
-def evaluate(protocol, job, directory, plan, plan_sha):
+def evaluate(protocol, job, directory, plan, plan_sha, *, output=OUTPUT):
     path = MANIFESTS[protocol]
     manifest = verified(path, job['benchmark']['manifest_sha256'])
     root = resolve_image_root(path, manifest)
@@ -130,7 +136,7 @@ def evaluate(protocol, job, directory, plan, plan_sha):
     summaries = {}
     for fold, entry in job['folds'].items():
         label = f'{protocol}-{fold}'
-        resume = OUTPUT / f'{label}.json'
+        resume = output / f'{label}.json'
         identity = dict(plan_sha256=plan_sha, checkpoint_sha256=checkpoint_sha)
         if not resume.exists():
             released = COHORT_ROOT / entry['released']['file']
@@ -154,7 +160,79 @@ def evaluate(protocol, job, directory, plan, plan_sha):
     return summaries
 
 
+def longer_plan():
+    comparison = verified(OUTPUT / 'comparison.json', SCREEN_RESULT_SHA)
+    original = verified(OUTPUT / 'plan.json', comparison['plan_sha256'])
+    evidence = OUTPUT / 'endpoint-sha256.txt'
+    if comparison['accepted'] or file_sha256(evidence) != SCREEN_ENDPOINTS_SHA:
+        raise ValueError('Expected the completed three-epoch paired comparison and endpoint digests')
+    endpoints = {name: digest for digest, name in
+                 (line.split() for line in evidence.read_text(encoding='utf-8').splitlines())}
+    if (os.environ.get('CUDA_VISIBLE_DEVICES') != original['gpu_ids']
+            or [torch.cuda.get_device_name(i) for i in range(torch.cuda.device_count())] != original['device_names']):
+        raise ValueError('Use the same two GPU devices as the three-epoch screen')
+    jobs = {}
+    for protocol, job in original['jobs'].items():
+        short_plan = job['benchmark']
+        task1, calibration, short_increment, short_finetune = short_plan['runs']
+        parent = Path(task1['output_dir']).resolve() / 'checkpoint.pth'
+        gnn = Path(calibration['output_dir']).resolve() / 'gnn_stage0.pt'
+        if read_json(parent.with_name('training_complete.json'))['last_epoch'] != 2:
+            raise ValueError(f'Expected the completed three-epoch Task 1 parent: {protocol}')
+        parent_shas = {}
+        for label, artifact in (('task1', parent), ('gnn', gnn)):
+            digest = endpoints[artifact.relative_to(OUTPUT.resolve()).as_posix()]
+            if file_sha256(artifact) != digest:
+                raise ValueError(f'Changed {protocol} {label} parent: {artifact}')
+            parent_shas[label] = digest
+
+        runs = deepcopy([short_increment, short_finetune])
+        increment, finetune = runs
+        increment['epochs'] = 6
+        folders = {r['phase']: LONG_OUTPUT.resolve() / protocol / r['phase'] for r in runs}
+        for phase in runs:
+            command = phase['command']
+            folder = folders[phase['phase']]
+            predecessor = parent if phase is increment else folders['increment'] / 'checkpoint.pth'
+            phase['output_dir'] = str(folder)
+            for flag, value in (
+                ('--output_dir', folder), ('--pretrained', predecessor), ('--graph-gnn-checkpoint', gnn)
+            ):
+                command[command.index(flag) + 1] = str(value)
+        for flag in ('--epochs', '--lr_drop', '--eval_interval'):
+            increment['command'][increment['command'].index(flag) + 1] = str(increment['epochs'])
+        jobs[protocol] = dict(folds=job['folds'], previous=job['previous'], current=job['current'],
+                              train_counts=job['train_counts'], parent_shas=parent_shas,
+                              benchmark=dict(short_plan, runs=runs))
+    plan = {key: value for key, value in original.items() if key not in ('commit', 'jobs')}
+    plan.update(commit=subprocess.check_output(['git', 'rev-parse', 'HEAD'], text=True).strip(),
+                jobs=jobs, three_epoch_comparison=SCREEN_RESULT_SHA, endpoints_sha256=SCREEN_ENDPOINTS_SHA)
+    pin(LONG_OUTPUT / 'plan.json', plan)
+    return plan
+
+
+def run_longer():
+    plan = longer_plan()
+    digest = file_sha256(LONG_OUTPUT / 'plan.json')
+    results = {}
+    for protocol, job in plan['jobs'].items():
+        benchmark = job['benchmark']
+        print(f'Training {protocol} six-epoch Task 2 diagnostic', flush=True)
+        for phase in benchmark['runs']:
+            run_job(phase['command'], benchmark['screening_sha256'])
+        directory = Path(benchmark['runs'][-1]['output_dir'])
+        results[protocol] = evaluate(protocol, job, directory, plan, digest, output=LONG_OUTPUT)
+    write_json(LONG_OUTPUT / 'comparison.json',
+               dict(status='complete', plan_sha256=digest, protocols=results,
+                    accepted=all(s['passed'] for folds in results.values() for s in folds.values())))
+
+
 def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--six-epochs', action='store_true', help='Train Task 2 from the previous diagnostic parents')
+    if parser.parse_args().six_epochs:
+        run_longer()
+        return
     plan = prepare()
     plan_sha = file_sha256(OUTPUT / 'plan.json')
     results = {}
