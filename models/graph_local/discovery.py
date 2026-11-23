@@ -314,6 +314,7 @@ class DiscoveryCriterion(nn.Module):
         self.top_k = args.discovery_top_k
         self.saliency_threshold = args.discovery_saliency_threshold
         self.saliency_top_points = getattr(args, 'discovery_saliency_top_points', None)
+        self.saliency_match_count = getattr(args, 'discovery_saliency_match_count', False)
         self.consistency_threshold = args.discovery_consistency_threshold
         self.instance_mode = getattr(args, 'instance_mode', 'legacy')
         self.instance_targets = {}
@@ -351,7 +352,8 @@ class DiscoveryCriterion(nn.Module):
         with scope('candidates'):
             candidates = mine_candidates(outputs, targets, indices, self.known_ids, teacher,
                                          self.top_k, self.saliency_threshold, self.consistency_threshold,
-                                         saliency_top_points=self.saliency_top_points)
+                                         saliency_top_points=self.saliency_top_points,
+                                         saliency_match_count=self.saliency_match_count)
         pseudo, background, confidence = (candidates[k] for k in ('pseudo', 'background', 'weights'))
         positive = torch.zeros_like(pseudo)
         semantic = torch.full_like(pseudo, -1, dtype=torch.long)

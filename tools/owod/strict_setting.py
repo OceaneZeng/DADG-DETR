@@ -114,6 +114,8 @@ def configure_run(args):
             and args.owod_stage == 1 and getattr(args, 'owod_discovery', False)):
         raise ValueError('screen-no-distill requires shared-parent discovery screening Task 2')
     if getattr(args, 'owod_discovery', False):
+        if getattr(args, 'discovery_saliency_match_count', False) and args.discovery_saliency_top_points is None:
+            raise ValueError('Matching the original count requires alternate saliency gates')
         from models.graph_local.discovery import (DISCOVERY_VERSION, DISCOVERY_RAMP_VERSION,
                                                   DISCOVERY_LOSS_VERSION, DISCOVERY_STABILITY_VERSION,
                                                   DISCOVERY_BACKGROUND_VERSION)
@@ -332,6 +334,7 @@ def validate_checkpoint(args, checkpoint, resume=False):
                                ('discovery_feature_grad_scale', 1.),
                                ('discovery_background_negative', False),
                                ('discovery_saliency_top_points', None),
+                               ('discovery_saliency_match_count', False),
                                ('screen_small_box_extent', False)):
             if getattr(saved, field, default) != getattr(args, field, default):
                 raise ValueError(f'Discovery checkpoint cannot change {field}')

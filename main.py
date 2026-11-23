@@ -218,6 +218,8 @@ def get_args_parser():
     parser.add_argument('--discovery-saliency-threshold', type=float, default=.65)
     parser.add_argument('--discovery-saliency-top-points', type=int, choices=range(1, 10), default=None,
                         help='Use the strongest N of nine local samples for the two EMA saliency gates')
+    parser.add_argument('--discovery-saliency-match-count', action='store_true',
+                        help='Use the original nine-point per-image pseudo-label count with the alternate saliency gates')
     parser.add_argument('--discovery-consistency-threshold', type=float, default=.5)
     parser.add_argument('--lora-rank', default=8, type=int)
     parser.add_argument('--lora-last-decoder-layers', default=2, type=int)
@@ -399,6 +401,7 @@ def main(args):
                        'feature_grad_scale': args.discovery_feature_grad_scale,
                        'background_negative': args.discovery_background_negative,
                        'saliency_top_points': args.discovery_saliency_top_points,
+                       'saliency_match_count': args.discovery_saliency_match_count,
                        'implementation': 'project_research_method', 'paper_baseline': False}
         elif getattr(args, 'control_postprocess_version', None):
             profile = {'method': 'supervised-control', 'unknown_score': 'none; no unknown predictions',

@@ -126,10 +126,19 @@ def select_distinct_boxes(boxes, eligible, scores, limit, *, duplicate_queries=N
     return torch.stack(chosen) if chosen else ranked[:0]
 
 
+def select_with_original_count(boxes, eligible, scores, original, *, duplicate_queries=None):
+    """Use the original per-image count even if new overlaps reduce capacity."""
+    count = len(original)
+    selected = select_distinct_boxes(boxes, eligible, scores, count, duplicate_queries=duplicate_queries)
+    if len(selected) != count and duplicate_queries is not None:
+        duplicate_queries.clear()
+    return selected if len(selected) == count else original
+
+
 @torch.no_grad()
 def mine_candidates(outputs, targets, indices, known_ids, teacher=None, top_k=5,
                     saliency_threshold=.65, consistency_threshold=.5, *, gate_trace=None,
-                    saliency_top_points=None):
+                    saliency_top_points=None, saliency_match_count=False):
     saliency = saliency_in_boxes(outputs['attention_feature'], outputs['pred_boxes'],
                                 outputs['image_sizes'], outputs['padded_size'])
     known = outputs['pred_logits'][..., known_ids].sigmoid().amax(-1)
@@ -174,7 +183,13 @@ def mine_candidates(outputs, targets, indices, known_ids, teacher=None, top_k=5,
         if 'geometry_quality' in outputs:
             quality = quality * outputs['geometry_quality'][batch].detach()
         duplicates = [] if gate_trace is not None else None
-        chosen = select_distinct_boxes(box, confident, quality, top_k, duplicate_queries=duplicates)
+        if saliency_match_count and teacher is not None:
+            raw_gate = ((saliency[batch] >= saliency_threshold)
+                        & (teacher_saliency[batch, maps[batch].clamp_min(0)] >= saliency_threshold))
+            original = select_distinct_boxes(box, confident & raw_gate, quality, top_k)
+            chosen = select_with_original_count(box, confident, quality, original, duplicate_queries=duplicates)
+        else:
+            chosen = select_distinct_boxes(box, confident, quality, top_k, duplicate_queries=duplicates)
         if chosen.numel():
             pseudo[batch, chosen] = True
             weights[batch, chosen] = quality[chosen]
