@@ -255,5 +255,6 @@ def build(image_set, args):
                             cache_mode=args.cache_mode, local_rank=get_local_rank(), local_size=get_local_size(),
                             proposal_file=proposal_file,
                             source_objects=getattr(args, "instance_mode", "legacy") != "legacy",
-                            source_box_area=getattr(args, "screen_small_box_extent", False))
+                            source_box_area=(getattr(args, "screen_small_box_extent", False)
+                                             or getattr(args, "screen_small_box_quality_rank", False)))
     return dataset

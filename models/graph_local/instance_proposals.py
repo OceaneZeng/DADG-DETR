@@ -9,6 +9,7 @@ from util.box_ops import box_cxcywh_to_xyxy
 
 
 SMALL_BOX_EXTENT_WEIGHT = 0.1
+SMALL_BOX_QUALITY_WEIGHT = 0.1
 
 
 def select_encoder_cells(boxes, valid_ids, scores, quota, shortlist_multiplier=12):
@@ -175,10 +176,12 @@ def small_box_extent_loss(gt, source_area, anchors, near, pred):
     return F.smooth_l1_loss(observed.log(), expected.log(), reduction="sum")
 
 
-def geometry_losses(state, targets, *, supervise_extent=False):
+def geometry_losses(state, targets, *, supervise_extent=False, supervise_quality=False):
     # Only released boxes supervise geometry. Sample close and offset anchors for quality.
     loss = state["boxes"].sum() * 0 + state["logits"].sum() * 0
     extent_loss = state["boxes"].new_zeros(())
+    quality_loss = state["logits"].sum() * 0 if supervise_quality else None
+    ranked_targets = 0
     count = 0
     for row, target in enumerate(targets):
         gt = target["boxes"]
@@ -205,8 +208,21 @@ def geometry_losses(state, targets, *, supervise_extent=False):
         )
         if supervise_extent:
             extent_loss = extent_loss + small_box_extent_loss(gt, target["source_box_area"], anchors, near, pred)
+        if supervise_quality:
+            accurate = (iou > .5) & (target["source_box_area"] < 32**2)[:, None]
+            eligible = accurate.any(dim=1)
+            if eligible.any():
+                quality = state["logits"][row]
+                candidate_scores = quality[near[eligible]].masked_fill(~accurate[eligible], -torch.inf)
+                best = candidate_scores.amax(dim=1)
+                shortlist_size = state["chosen"].shape[1] * InstanceProposals.shortlist_multiplier
+                cutoff = quality.detach()[valid_ids].topk(min(len(valid_ids), shortlist_size)).values[-1]
+                quality_loss = quality_loss + (cutoff + .1 - best).relu().sum()
+                ranked_targets += len(best)
         count += len(gt)
     losses = {"loss_geometry": loss / max(count, 1)}
     if supervise_extent:
         losses["loss_small_box_extent"] = extent_loss / max(count, 1)
+    if supervise_quality:
+        losses["loss_small_box_quality_rank"] = quality_loss / max(ranked_targets, 1)
     return losses

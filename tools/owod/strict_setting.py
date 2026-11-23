@@ -56,10 +56,12 @@ def configure_run(args):
     instance_mode = getattr(args, 'instance_mode', 'legacy')
     if instance_mode != 'legacy' and not getattr(args, 'owod_discovery', False):
         raise ValueError('Instance transfer requires discovery')
-    if getattr(args, 'screen_small_box_extent', False) and not (
+    small_box_supervision = (getattr(args, 'screen_small_box_extent', False)
+                             or getattr(args, 'screen_small_box_quality_rank', False))
+    if small_box_supervision and not (
             instance_mode != 'legacy' and args.owod_screening and args.owod_manifest
             and args.owod_stage == 0 and args.owod_phase == 'increment' and not args.screen_author_eval):
-        raise ValueError('Neighbor extent supervision requires released-only Task 1 discovery screening')
+        raise ValueError('Small-box supervision requires released-only Task 1 discovery screening')
     if getattr(args, 'screen_author_eval', False) and not getattr(args, 'owod_screening', ''):
         raise ValueError('screen-author-eval requires a verified diagnostic training subset')
     localization = getattr(args, 'graph_localization', 'frozen')
@@ -335,7 +337,8 @@ def validate_checkpoint(args, checkpoint, resume=False):
                                ('discovery_background_negative', False),
                                ('discovery_saliency_top_points', None),
                                ('discovery_saliency_match_count', False),
-                               ('screen_small_box_extent', False)):
+                               ('screen_small_box_extent', False),
+                               ('screen_small_box_quality_rank', False)):
             if getattr(saved, field, default) != getattr(args, field, default):
                 raise ValueError(f'Discovery checkpoint cannot change {field}')
         if (getattr(args, 'discovery_objectness_loss', 'balanced-bce') == 'focal'

@@ -320,6 +320,7 @@ class DiscoveryCriterion(nn.Module):
         self.instance_targets = {}
         self.train_instance_projection = getattr(args, 'owod_stage', 0) == 0
         self.supervise_small_box_extent = getattr(args, 'screen_small_box_extent', False)
+        self.supervise_small_box_quality = getattr(args, 'screen_small_box_quality_rank', False)
         if self.instance_mode != 'legacy':
             from .instance_transfer import SETTINGS
             self.weight_dict.update(loss_geometry=1., loss_instance_class=.2,
@@ -327,6 +328,9 @@ class DiscoveryCriterion(nn.Module):
         if self.supervise_small_box_extent:
             from .instance_proposals import SMALL_BOX_EXTENT_WEIGHT
             self.weight_dict['loss_small_box_extent'] = SMALL_BOX_EXTENT_WEIGHT
+        if self.supervise_small_box_quality:
+            from .instance_proposals import SMALL_BOX_QUALITY_WEIGHT
+            self.weight_dict['loss_small_box_quality_rank'] = SMALL_BOX_QUALITY_WEIGHT
         self.epoch = 0
         self.pseudo_epoch_offset = getattr(args, 'discovery_pseudo_epoch_offset', 0)
         self.evidence = None
@@ -343,7 +347,7 @@ class DiscoveryCriterion(nn.Module):
             filtered = {**target, 'labels': target['labels'][keep], 'boxes': target['boxes'][keep]}
             if 'source_objects' in target:
                 filtered['source_objects'] = target['source_objects'][keep]
-            if self.supervise_small_box_extent:
+            if self.supervise_small_box_extent or self.supervise_small_box_quality:
                 filtered['source_box_area'] = target['source_box_area'][keep]
             released.append(filtered)
         targets = released
@@ -457,7 +461,8 @@ class DiscoveryCriterion(nn.Module):
             losses['loss_instance_class'] = (F.cross_entropy(scores, columns) if len(labels) and self.train_instance_projection
                                              else scores.sum()*0)
             losses.update(geometry_losses(outputs['geometry'], targets,
-                                          supervise_extent=self.supervise_small_box_extent))
+                                          supervise_extent=self.supervise_small_box_extent,
+                                          supervise_quality=self.supervise_small_box_quality and self.training))
             if len(labels):
                 from .instance_transfer import paired_iou
                 gt_boxes = torch.cat([t['boxes'][g] for t, (_,g) in zip(targets, indices)])

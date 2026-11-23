@@ -21,10 +21,15 @@ from tools.owod.screening_data import write_json
 
 OUTPUT = TRAINING.with_name('task1-m-s-refinement-saliency-training')
 MATCHED_COUNT_OUTPUT = TRAINING.with_name('task1-m-s-refinement-saliency-matched-count')
+QUALITY_OUTPUT = TRAINING.with_name('task1-m-s-refinement-small-box-quality')
 PREFLIGHT_SHA = '3be9cf68082bbc19224ce2123d7fea0a0ec808a1226d884fcf9a9c25be5c1056'
 CAP_COMPARISON_SHA = '9a28ed0ade713fec7101ade0070aedb130341bf0b348e5b89f7f3c75b7b012ca'
 GATE_FLAG = '--discovery-saliency-top-points'
 COUNT_FLAG = '--discovery-saliency-match-count'
+QUALITY_FLAG = '--screen-small-box-quality-rank'
+ENCODER_PREFLIGHT_SHA = '4f0f41bab6bfbbc7377d3a64c5bf3482a57f11a5dbed89ff89014238b76f4406'
+COMPETITION_SHA = 'b3801feb4573a0b6d9586d70f5479d8be541acea665678baaf5f76f974570f67'
+MATCHED_COUNT_SHA = '8d8b5817191b7b491f52ff247eb87dbeb41f310b7ceb59ad4ebb45f37d038181'
 
 
 def prepare(output, match_count):
@@ -77,6 +82,30 @@ def prepare(output, match_count):
     return plan
 
 
+def add_quality_arm(plan):
+    from tools.owod.probe_task1_m_s_refinement_known_dedup import COMPETITION_OUTPUT
+
+    preflight = COMPETITION_OUTPUT.with_name('task1-m-s-refinement-encoder-rank-preflight')
+    ranks = verified(preflight / 'comparison.json', ENCODER_PREFLIGHT_SHA)
+    competition = verified(COMPETITION_OUTPUT / 'comparison.json', COMPETITION_SHA)
+    matched = verified(MATCHED_COUNT_OUTPUT / 'comparison.json', MATCHED_COUNT_SHA)
+    matched_plan = verified(MATCHED_COUNT_OUTPUT / 'plan.json', matched['plan_sha256'])
+    if any(row['status'] != 'complete' for row in (ranks, competition, matched)):
+        raise ValueError('Complete source diagnostics are required for the quality-rank arm')
+    for protocol, job in plan['jobs'].items():
+        command = job['command']
+        prior = list(matched_plan['jobs'][protocol]['command'])
+        prior[prior.index('--output_dir') + 1] = command[command.index('--output_dir') + 1]
+        if command != prior:
+            raise ValueError(f'Training command differs from matched-count control: {protocol}')
+        command.append(QUALITY_FLAG)
+        job['competition_reference'] = competition['protocols'][protocol]
+    plan.update(small_box_quality_rank=True, encoder_rank_preflight_sha256=ENCODER_PREFLIGHT_SHA,
+                competition_comparison_sha256=COMPETITION_SHA, matched_count_comparison_sha256=MATCHED_COUNT_SHA,
+                decision='Apply all original gates with the locked known/unknown competition postprocessor. '
+                         'Compare localization and VOC metrics to the matched-count endpoint under the same scoring.')
+
+
 def evaluate(checkpoint, protocol, job, plan, digest, output):
     checkpoint_sha = file_sha256(checkpoint)
     path = MANIFESTS[protocol]
@@ -85,13 +114,17 @@ def evaluate(checkpoint, protocol, job, plan, digest, output):
     control = verified(Path(job['control_report']), job['control_report_sha256'])['folds']
     model, _ = load_detector(None, checkpoint, torch.device('cuda'))
     model.eval()
-    post = TopKnownPerQuery(known_ids=manifest['stages'][0]['classes'], scoring='focal', max_detections=plan['limit'])
+    post_type = TopKnownPerQuery
+    if plan.get('small_box_quality_rank'):
+        from tools.owod.probe_task1_m_s_refinement_known_dedup import CompeteWithEmittedUnknown
+        post_type = CompeteWithEmittedUnknown
+    post = post_type(known_ids=manifest['stages'][0]['classes'], scoring='focal', max_detections=plan['limit'])
     folds = {}
     for fold, entry in job['folds'].items():
         dest = output / f'{protocol}-{fold}.json'
         if not dest.exists():
             annotations = verified_annotation(entry)
-            print(f'Evaluating {protocol}/{fold} saliency training', flush=True)
+            print(f'Evaluating {protocol}/{fold} Task 1 endpoint', flush=True)
             report = measure(model, manifest, root, annotations, plan['batch_size'], plan['limit'], postprocessor=post)
             outcome = compare(control[fold], report, plan['gates'])
             reference = job['refinement_reference'][fold]
@@ -104,6 +137,10 @@ def evaluate(checkpoint, protocol, job, plan, digest, output):
                 cap = job['cap_reference'][fold]
                 outcome['gate_deltas_vs_cap'] = {key: value - cap['deltas'][key]
                                                  for key, value in outcome['deltas'].items()}
+            if 'competition_reference' in job:
+                matched = job['competition_reference'][fold]['deltas']
+                outcome['gate_deltas_vs_same_scoring'] = {key: value - matched[key]
+                                                          for key, value in outcome['deltas'].items()}
             write_json(dest, dict(plan_sha256=digest, checkpoint_sha256=checkpoint_sha, outcome=outcome, report=report))
         data = read_json(dest)
         if data['plan_sha256'] != digest or data['checkpoint_sha256'] != checkpoint_sha:
@@ -121,19 +158,27 @@ def verified_annotation(entry):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--match-count', action='store_true')
-    match_count = parser.parse_args().match_count
+    modes = parser.add_mutually_exclusive_group()
+    modes.add_argument('--match-count', action='store_true')
+    modes.add_argument('--small-box-quality', action='store_true')
+    args = parser.parse_args()
+    match_count = args.match_count or args.small_box_quality
     output = MATCHED_COUNT_OUTPUT if match_count else OUTPUT
+    if args.small_box_quality:
+        output = QUALITY_OUTPUT
     plan = prepare(output, match_count)
+    if args.small_box_quality:
+        add_quality_arm(plan)
     pin(output / 'plan.json', plan)
     digest = file_sha256(output / 'plan.json')
     protocols = {}
     for protocol, job in plan['jobs'].items():
-        print(f'Fitting {protocol} Task 1 local saliency', flush=True)
+        print(f'Fitting {protocol} Task 1 {output.name}', flush=True)
         checkpoint, saved = run_job(job['command'], job['screen_sha256'])
         if (not saved.with_box_refine or saved.backbone_weights_sha256 != job['backbone_sha256']
                 or saved.discovery_saliency_top_points != plan['strongest_points']
-                or getattr(saved, 'discovery_saliency_match_count', False) != match_count):
+                or getattr(saved, 'discovery_saliency_match_count', False) != match_count
+                or getattr(saved, 'screen_small_box_quality_rank', False) != args.small_box_quality):
             raise ValueError(f'Unexpected training endpoint: {protocol}')
         protocols[protocol] = evaluate(checkpoint, protocol, job, plan, digest, output)
     write_json(output / 'comparison.json', dict(status='complete', plan_sha256=digest, protocols=protocols,
