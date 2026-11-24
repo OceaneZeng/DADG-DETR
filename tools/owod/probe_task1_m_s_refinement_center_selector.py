@@ -90,13 +90,22 @@ def fit_selector(examples, labels):
                 bias=bias.detach().item(), positive=int(positive.sum()), negative=int((~positive).sum()))
 
 
-def center_transform(params, known, device):
+def correction_logits(params, known, device):
     mean, scale, weight = (torch.tensor(params[key], device=device) for key in ('mean', 'scale', 'weight'))
+
+    def score(outputs, batch, queries, center, quality):
+        values = features(outputs, batch, queries, center, quality, known)
+        return ((values - mean) / scale) @ weight + params['bias']
+
+    return score
+
+
+def center_transform(params, known, device):
+    score = correction_logits(params, known, device)
 
     def transform(outputs):
         def choose(batch, queries, center, quality):
-            values = features(outputs, batch, queries, center, quality, known)
-            return ((values - mean) / scale) @ weight + params['bias'] > 0
+            return score(outputs, batch, queries, center, quality) > 0
 
         return refine_learned_boxes(outputs, center_only=True, choose_centers=choose)
 
