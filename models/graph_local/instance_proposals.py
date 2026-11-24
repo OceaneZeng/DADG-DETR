@@ -122,7 +122,7 @@ class InstanceProposals(nn.Module):
             state,
         )
 
-    def refined_quality(self, state, boxes):
+    def refined_features(self, state, boxes):
         # Sample the encoder level whose nominal object scale best fits the refined box.
         masks = state["masks"]
         scale = boxes[..., 2:].detach().prod(-1).clamp_min(1e-8).sqrt()
@@ -143,7 +143,10 @@ class InstanceProposals(nn.Module):
         stacked = torch.stack(features, dim=2)
         row = torch.arange(len(boxes), device=boxes.device)[:, None]
         q = torch.arange(boxes.shape[1], device=boxes.device)
-        return self.logits(stacked[row, q, level_ids], boxes)
+        return stacked[row, q, level_ids]
+
+    def refined_quality(self, state, boxes):
+        return self.logits(self.refined_features(state, boxes), boxes)
 
 
 def anchor_distance(gt, anchors):

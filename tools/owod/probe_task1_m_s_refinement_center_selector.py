@@ -24,6 +24,7 @@ QUALITY_OUTPUT = OUTPUT.with_name('task1-m-s-refinement-center-quality-selector'
 TRACE_OUTPUT = OUTPUT.with_name('task1-m-s-refinement-center-selector-trace')
 RANK_OUTPUT = OUTPUT.with_name('task1-m-s-refinement-center-placement')
 GROUP_OUTPUT = OUTPUT.with_name('task1-m-s-refinement-center-query-choice')
+LOCAL_FEATURE_OUTPUT = OUTPUT.with_name('task1-m-s-refinement-center-local-features')
 CANDIDATES_OUTPUT = OUTPUT.with_name('task1-m-s-refinement-center-candidates')
 CENTER_COMPARISON_SHA = '1df8e79d21bc4459dddb8efec1e34fdce1d6e418562cc0dba490a984cf0cc79a'
 SELECTOR_COMPARISON_SHA = '9a32eb2af9fcf9988b341baf6893f1c75feb44b5c373928b5046f67d95d1f6a3'
@@ -31,6 +32,8 @@ TRACE_COMPARISON_SHA = '5885955be7819524332ed13daee33ec243677793cbe6877ae5064451
 CANDIDATE_COMPARISON_SHA = '013497fa1cbfc364003dfd3ffb3a9d9819a627ed29e9a23fdd8787608f893636'
 QUALITY_COMPARISON_SHA = '6db34143914d3cd53ee9361d4ff472633618812942494b443e2510af7f40d573'
 RANK_COMPARISON_SHA = 'd9378b1790da6db41fe49ba6a76c844e9d9374df9ea977303d385359d395909f'
+GROUP_COMPARISON_SHA = 'efd2b2e5a81e94f46d9d6a6838af6b4dbd4a20dd94f3fc345c7b043e0d6708e6'
+GROUP_TRACE_SHA = '4d72b6ac2f56922446c249ef41f9e752d83484d3c5ee0825cd80277f3a80bdaa'
 FEATURES = ('encoder_quality', 'max_known_logit', 'objectness_logit', 'novelty_logit',
             'log_width', 'log_height', 'normalized_abs_dx', 'normalized_abs_dy')
 QUALITY_FEATURE = 'shifted_minus_native_geometry_quality'
@@ -39,7 +42,7 @@ NEGATIVE_COST = 2.
 L2 = .01
 
 
-def features(outputs, batch, queries, center, quality, known, refined_quality=None):
+def features(outputs, batch, queries, center, quality, known, refined_quality=None, local_encoder=None):
     boxes = outputs['pred_boxes'][batch, queries]
     extent = boxes[:, 2:].clamp_min(1e-6)
     displacement = (center - boxes[:, :2]).abs() / extent
@@ -48,7 +51,8 @@ def features(outputs, batch, queries, center, quality, known, refined_quality=No
                           outputs['pred_novelty'][batch, queries]), dim=-1)
     values = torch.cat((scores, extent.log(), displacement), dim=-1).float()
     if refined_quality is not None:
-        delta = values.new_empty((len(queries), 1))
+        width = 1 if local_encoder is None else 1 + outputs['geometry']['memory'].shape[-1]
+        delta = values.new_empty((len(queries), width))
         if len(queries):
             geometry = outputs['geometry']
             state = dict(memory=geometry['memory'][batch:batch+1],
@@ -56,6 +60,10 @@ def features(outputs, batch, queries, center, quality, known, refined_quality=No
             adjusted = torch.cat((center, boxes[:, 2:]), dim=-1)
             shifted_quality = refined_quality(state, adjusted[None]).sigmoid()[0]
             delta[:, 0] = shifted_quality - outputs['geometry_quality'][batch, queries]
+            if local_encoder is not None:
+                paired = local_encoder(state, torch.cat((adjusted, boxes), dim=0)[None])[0]
+                shifted, native = paired.split(len(queries))
+                delta[:, 1:] = shifted - native
         values = torch.cat((values, delta), dim=-1)
     return values
 
@@ -74,7 +82,7 @@ def center_labels(outputs, target, batch, queries, centers, small_area):
 
 @torch.no_grad()
 def fit_examples(model, loader, known, count, small_area, refined_quality=None, *,
-                 all_centers=False, group_queries=False):
+                 all_centers=False, group_queries=False, local_encoder=None):
     examples, labels, eligible = [], [], []
     observed = 0
     for step, (samples, targets) in enumerate(loader, 1):
@@ -82,7 +90,7 @@ def fit_examples(model, loader, known, count, small_area, refined_quality=None, 
 
         def collect(batch, queries, center, quality):
             positive, relevant = center_labels(outputs, targets[batch], batch, queries, center, small_area)
-            rows = features(outputs, batch, queries, center, quality, known, refined_quality)
+            rows = features(outputs, batch, queries, center, quality, known, refined_quality, local_encoder)
             examples.append(rows[relevant].cpu())
             labels.append(positive[relevant].float().cpu())
             return relevant
@@ -103,7 +111,7 @@ def fit_examples(model, loader, known, count, small_area, refined_quality=None, 
             use = selected[rows]
             rows, columns = rows[use], columns[use]
             values = features(outputs, batch, queries[rows], centers[rows, columns],
-                              quality[rows, columns], known, refined_quality)
+                              quality[rows, columns], known, refined_quality, local_encoder)
             groups = values.new_zeros((*quality.shape, values.shape[-1]))
             groups[rows, columns] = values
             examples.append(groups[selected].cpu())
@@ -178,18 +186,18 @@ def fit_query_choice(examples, preferred, eligible):
                 bias=bias.detach().item(), positive=int(use_move.sum()), negative=int((~use_move).sum()))
 
 
-def correction_logits(params, known, device, refined_quality=None):
+def correction_logits(params, known, device, refined_quality=None, local_encoder=None):
     mean, scale, weight = (torch.tensor(params[key], device=device) for key in ('mean', 'scale', 'weight'))
 
     def score(outputs, batch, queries, center, quality):
-        values = features(outputs, batch, queries, center, quality, known, refined_quality)
+        values = features(outputs, batch, queries, center, quality, known, refined_quality, local_encoder)
         return ((values - mean) / scale) @ weight + params['bias']
 
     return score
 
 
-def center_transform(params, known, device, refined_quality=None, *, rank_centers=False):
-    score = correction_logits(params, known, device, refined_quality)
+def center_transform(params, known, device, refined_quality=None, *, rank_centers=False, local_encoder=None):
+    score = correction_logits(params, known, device, refined_quality, local_encoder)
 
     def transform(outputs):
         def choose(batch, queries, center, quality):
@@ -221,10 +229,16 @@ def main():
     modes.add_argument('--quality-delta', action='store_true')
     modes.add_argument('--rank-centers', action='store_true')
     modes.add_argument('--query-choice', action='store_true')
+    modes.add_argument('--local-features', action='store_true')
     args = parser.parse_args()
-    rank_centers = args.rank_centers or args.query_choice
+    group_queries = args.query_choice or args.local_features
+    rank_centers = args.rank_centers or group_queries
     quality_delta = args.quality_delta or rank_centers
-    output = GROUP_OUTPUT if args.query_choice else RANK_OUTPUT if rank_centers else QUALITY_OUTPUT if quality_delta else OUTPUT
+    output = OUTPUT
+    for enabled, directory in ((args.quality_delta, QUALITY_OUTPUT), (args.rank_centers, RANK_OUTPUT),
+                               (args.query_choice, GROUP_OUTPUT), (args.local_features, LOCAL_FEATURE_OUTPUT)):
+        if enabled:
+            output = directory
     if torch.cuda.device_count() != 1 or torch.cuda.get_device_name() != 'NVIDIA GeForce RTX 3090':
         raise ValueError('Use one RTX 3090 for the frozen released replay')
     source = verified(CENTER_OUTPUT / 'comparison.json', CENTER_COMPARISON_SHA)
@@ -270,7 +284,7 @@ def main():
                     quality_comparison_sha256=QUALITY_COMPARISON_SHA,
                     factor='Fit on every eligible midpoint. Use the highest positive decision logit per learned '
                            'query, or preserve the native center. Reuse the same features and loss.')
-    if args.query_choice:
+    if group_queries:
         ranked = verified(RANK_OUTPUT / 'comparison.json', RANK_COMPARISON_SHA)
         ranked_plan = verified(RANK_OUTPUT / 'plan.json', ranked['plan_sha256'])
         if (ranked['status'] != 'complete' or ranked['passed']
@@ -280,6 +294,18 @@ def main():
                     factor='Train per query over all eligible midpoints and a zero-logit native option. '
                            'Maximize probability of the safe improving midpoints, or of the native option '
                            'when there is no safe improving midpoint. Preserve the candidate features and inference.')
+    if args.local_features:
+        grouped = verified(GROUP_OUTPUT / 'comparison.json', GROUP_COMPARISON_SHA)
+        grouped_plan = verified(GROUP_OUTPUT / 'plan.json', grouped['plan_sha256'])
+        trace = verified(GROUP_OUTPUT.with_name('task1-m-s-refinement-center-choice-trace') / 'comparison.json',
+                         GROUP_TRACE_SHA)
+        if (grouped['status'] != 'complete' or not grouped['passed'] or trace['status'] != 'complete'
+                or any(plan[key] != grouped_plan[key] for key in (*comparison_keys, 'baseline_fit_orders'))):
+            raise ValueError('Expected the completed query-level trace on the same sources')
+        plan.update(group_comparison_sha256=GROUP_COMPARISON_SHA, group_trace_sha256=GROUP_TRACE_SHA,
+                    local_feature='shifted_minus_native_encoder_features',
+                    factor='Add the difference of frozen local encoder features sampled at the shifted and '
+                           'native centers. Match the feature level and keep the query choice loss and candidates.')
     pin(output / 'plan.json', plan)
     digest = file_sha256(output / 'plan.json')
     device = torch.device('cuda')
@@ -305,16 +331,22 @@ def main():
             model, _ = load_detector(None, checkpoint, device)
             model.eval()
             known = job['classes']
-            refined_quality = model.detr.transformer.instance_proposals.refined_quality if quality_delta else None
+            proposals = model.detr.transformer.instance_proposals
+            refined_quality = proposals.refined_quality if quality_delta else None
+            local_encoder = proposals.refined_features if args.local_features else None
             print(f'Fitting {protocol} released center selector', flush=True)
             training = fit_examples(model, fit_loader, known, FIT_IMAGES, plan['small_area'], refined_quality,
-                                    all_centers=rank_centers, group_queries=args.query_choice)
-            params = fit_query_choice(*training) if args.query_choice else fit_selector(*training)
+                                    all_centers=rank_centers, group_queries=group_queries, local_encoder=local_encoder)
+            params = fit_query_choice(*training) if group_queries else fit_selector(*training)
             if args.quality_delta and any(params[key] != baseline['protocols'][protocol]['selector'][key]
                                           for key in ('positive', 'negative')):
                 raise ValueError(f'Changed selector fitting labels: {protocol}')
+            if args.local_features and any(params[key] != grouped['protocols'][protocol]['selector'][key]
+                                           for key in ('positive', 'negative')):
+                raise ValueError(f'Changed grouped fitting choices: {protocol}')
             print(f'Evaluating {protocol} frozen center selector', flush=True)
-            transform = center_transform(params, known, device, refined_quality, rank_centers=rank_centers)
+            transform = center_transform(params, known, device, refined_quality, rank_centers=rank_centers,
+                                         local_encoder=local_encoder)
             report = measure(model, known, loader, plan, box_transform=transform)
             for size, row in report['groups'].items():
                 reference = source['protocols'][protocol]['groups'][size]
