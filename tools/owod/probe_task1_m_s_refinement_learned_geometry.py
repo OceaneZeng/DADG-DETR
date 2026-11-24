@@ -6,7 +6,9 @@ from pathlib import Path
 import torch
 
 from tools.owod.gnn_calibration import load_detector
-from tools.owod.probe_task1_m_s_refinement_decoder_box_preflight import EXTENT_OUTPUT, learned_extent, prepare
+from tools.owod.probe_task1_m_s_refinement_decoder_box_preflight import (
+    EXTENT_OUTPUT, GEOMETRY_OUTPUT, prepare, refine_learned_boxes,
+)
 from tools.owod.probe_task1_m_s_refinement_pseudo_scores import training_loader
 from tools.owod.probe_task1_paired_discovery import verified
 from tools.owod.protocol import file_sha256, read_json, resolve_image_root
@@ -16,7 +18,7 @@ from tools.owod.screening_data import write_json
 from util.box_ops import box_cxcywh_to_xyxy, box_iou
 
 
-OUTPUT = EXTENT_OUTPUT.with_name('task1-m-s-refinement-learned-geometry')
+OUTPUT = GEOMETRY_OUTPUT
 PREFLIGHT_SHA = 'a3a7da2fdfb9cc4e92aebd7e2b6b5c3a0f3f88e614ebcc5f8b3196cdd1d24de5'
 IOU_THRESHOLD = .5
 
@@ -56,7 +58,7 @@ def measure(model, loader, plan, reference):
         def capture(batch, queries, peers, overlap):
             neighbors[batch] = (queries, peers, overlap)
 
-        revised = learned_extent(outputs, observe_neighbors=capture)
+        revised = refine_learned_boxes(outputs, observe_neighbors=capture)
         for batch, target in enumerate(targets):
             ids = torch.where(target['source_box_area'] < plan['small_area'])[0]
             truth = target['boxes'][ids].cuda()

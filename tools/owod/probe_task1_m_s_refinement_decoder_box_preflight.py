@@ -23,10 +23,13 @@ from util.box_ops import box_cxcywh_to_xyxy, box_iou
 OUTPUT = COMPETITION_OUTPUT.with_name('task1-m-s-refinement-decoder-box-preflight')
 RANK_OUTPUT = COMPETITION_OUTPUT.with_name('task1-m-s-refinement-encoder-rank-preflight')
 EXTENT_OUTPUT = COMPETITION_OUTPUT.with_name('task1-m-s-refinement-learned-extent-preflight')
+CENTER_OUTPUT = COMPETITION_OUTPUT.with_name('task1-m-s-refinement-learned-center-preflight')
 ATTRIBUTION_OUTPUT = COMPETITION_OUTPUT.with_name('task1-m-s-refinement-final-slot-attribution')
+GEOMETRY_OUTPUT = COMPETITION_OUTPUT.with_name('task1-m-s-refinement-learned-geometry')
 COMPETITION_SHA = 'b3801feb4573a0b6d9586d70f5479d8be541acea665678baaf5f76f974570f67'
 DECODER_SHA = 'd16ba04de5eeaa1be2a67fcb5bcf8c514e70a874618339ed5d6b6d10d3561d95'
 ATTRIBUTION_SHA = '31ed1449712d060261553d2666fad941e8f9e2701d15e357c910498cddd4f917'
+GEOMETRY_SHA = 'e8919659633fdf48a6d0dddd19fb8cccf32c9ae5eab216d751e931777feb9b12'
 
 
 def prepare():
@@ -55,8 +58,8 @@ def prepare():
                         'Report class-correct Top-50 matches and the any-last-two-layer geometry upper bound.')
 
 
-def learned_extent(outputs, *, observe_neighbors=None):
-    """Blend learned-query widths and heights with a matching fine-level box."""
+def refine_learned_boxes(outputs, *, center_only=False, observe_neighbors=None):
+    """Refine one component of a learned query with a nearby fine-level box."""
     final = outputs['pred_boxes']
     geometry = outputs['geometry']
     revised = final.clone()
@@ -71,13 +74,22 @@ def learned_extent(outputs, *, observe_neighbors=None):
         candidate_ids = torch.where(valid & (area <= anchor_area))[0]
         if not len(candidate_ids):
             continue
-        # IoU greater than 0.5 requires the area ratio to be less than two.
+        # Use the same small-query cohort for both component changes.
         learned = torch.ones(len(boxes), dtype=torch.bool, device=boxes.device)
         learned[:active.shape[1]] = ~active[batch]
         queries = torch.where(learned & (boxes[:, 2:].prod(dim=-1) < 2 * anchor_area))[0]
         base = boxes[queries]
         near = nearby_anchor_ids(base, anchors, candidate_ids)
         peers = candidates[near]
+        if center_only:
+            centers = peers[..., :2]
+            inside = ((centers - base[:, None, :2]).abs() <= base[:, None, 2:] * .5).all(dim=-1)
+            scores = geometry['logits'][batch, near].masked_fill(~inside, -torch.inf)
+            best, position = scores.max(dim=1)
+            keep = best.isfinite()
+            selected = candidates[near[keep, position[keep]], :2]
+            revised[batch, queries[keep], :2] = base[keep, :2].lerp(selected, .5)
+            continue
         base_xyxy = box_cxcywh_to_xyxy(base)[:, None]
         peer_xyxy = box_cxcywh_to_xyxy(peers)
         left = torch.maximum(base_xyxy[..., :2], peer_xyxy[..., :2])
@@ -95,7 +107,7 @@ def learned_extent(outputs, *, observe_neighbors=None):
 
 
 @torch.inference_mode()
-def measure(model, known, loader, plan, *, use_learned_extent=False):
+def measure(model, known, loader, plan, *, learned_component=None):
     post = CompeteWithEmittedUnknown(known_ids=known, scoring='focal', max_detections=plan['limit'])
     stats = {key: Counter() for key in ('all', 'small')}
     changes = Counter()
@@ -107,9 +119,12 @@ def measure(model, known, loader, plan, *, use_learned_extent=False):
             raise ValueError('Expected the locked six-layer decoder')
         final = outputs['pred_boxes']
         previous = layers[-1]['pred_boxes']
-        candidate = learned_extent(outputs) if use_learned_extent else final.lerp(previous, .5)
+        if learned_component is None:
+            candidate = final.lerp(previous, .5)
+        else:
+            candidate = refine_learned_boxes(outputs, center_only=learned_component == 'center')
         revised = dict(outputs, pred_boxes=candidate)
-        if use_learned_extent:
+        if learned_component is not None:
             changed = (candidate != final).any(dim=-1)
             changes.update(queries=int(changed.sum()), images=int(changed.any(dim=1).sum()))
         unit = final.new_ones((len(targets), 2))
@@ -128,7 +143,7 @@ def measure(model, known, loader, plan, *, use_learned_extent=False):
                 stats[name].update(gt=int(mask.sum()), final=int(original.sum()),
                                    gained=int((updated & ~original).sum()), lost=int((original & ~updated).sum()),
                                    native_known_tp=int(native_tp.sum()))
-                if use_learned_extent:
+                if learned_component is not None:
                     stats[name].update(revised=int(updated.sum()), revised_known_tp=int(updated_tp.sum()))
                 else:
                     stats[name].update(penultimate=int(penultimate.sum()), blend=int(updated.sum()),
@@ -138,7 +153,7 @@ def measure(model, known, loader, plan, *, use_learned_extent=False):
             print(f'Inference {step}/{len(loader)} batches', flush=True)
     if observed != plan['images'] or stats['small']['gt'] <= 0:
         raise ValueError('Incomplete released replay or missing small targets')
-    return dict(groups=stats, changes=changes) if use_learned_extent else stats
+    return dict(groups=stats, changes=changes) if learned_component is not None else stats
 
 
 @torch.inference_mode()
@@ -199,8 +214,12 @@ def main():
     modes = parser.add_mutually_exclusive_group()
     modes.add_argument('--encoder-ranks', action='store_true')
     modes.add_argument('--learned-extent', action='store_true')
+    modes.add_argument('--learned-center', action='store_true')
     args = parser.parse_args()
     output = EXTENT_OUTPUT if args.learned_extent else RANK_OUTPUT if args.encoder_ranks else OUTPUT
+    if args.learned_center:
+        output = CENTER_OUTPUT
+    learned_component = 'center' if args.learned_center else 'extent' if args.learned_extent else None
     plan = prepare()
     if args.encoder_ranks:
         decoder = verified(OUTPUT / 'comparison.json', DECODER_SHA)
@@ -216,9 +235,19 @@ def main():
                     factor='For a learned query, find the best IoU among the 16 nearest valid finest anchors '
                            'whose encoder box area does not exceed the finest anchor area. At IoU > 0.5, '
                            'take the geometric mean of the decoder and encoder widths and heights, keeping '
-                           'the decoder center and logits.',
-                    advance='Improve released-small dense coverage in S with no drop in M. Require no drop '
-                            'in class-correct small or all Top-50 matches on either protocol.')
+                           'the decoder center and logits.')
+    if args.learned_center:
+        geometry = verified(GEOMETRY_OUTPUT / 'comparison.json', GEOMETRY_SHA)
+        source_plan = verified(GEOMETRY_OUTPUT / 'plan.json', geometry['plan_sha256'])
+        if geometry['status'] != 'complete' or any(plan[key] != source_plan[key] for key in ('jobs', 'seed', 'images')):
+            raise ValueError('Expected the completed released component diagnosis on the same sources')
+        plan.update(geometry_comparison_sha256=GEOMETRY_SHA,
+                    factor='For a small learned query, take the highest frozen encoder quality score among '
+                           'the same 16 nearby eligible fine-level candidates whose centers lie within the '
+                           'decoder box. Move halfway toward that center, keeping decoder extent and logits.')
+    if learned_component is not None:
+        plan['advance'] = ('Improve released-small dense coverage in S with no drop in M. Require no drop '
+                           'in class-correct small or all Top-50 matches on either protocol.')
     pin(output / 'plan.json', plan)
     digest = file_sha256(output / 'plan.json')
     protocols = {}
@@ -239,8 +268,8 @@ def main():
             print(f'Evaluating {protocol} released images in {output.name}', flush=True)
             if args.encoder_ranks:
                 report = measure_ranks(model, job['classes'], loader, plan)
-            elif args.learned_extent:
-                report = measure(model, job['classes'], loader, plan, use_learned_extent=True)
+            elif learned_component is not None:
+                report = measure(model, job['classes'], loader, plan, learned_component=learned_component)
             else:
                 report = dict(groups=measure(model, job['classes'], loader, plan))
             write_json(dest, dict(plan_sha256=digest, order_sha256=order, **report))
@@ -249,10 +278,10 @@ def main():
         if report['plan_sha256'] != digest:
             raise ValueError(f'Changed frozen plan: {dest}')
         protocols[protocol] = report['groups']
-        if args.learned_extent:
+        if learned_component is not None:
             protocols[protocol] = dict(groups=report['groups'], changes=report['changes'])
     result = dict(status='complete', plan_sha256=digest, protocols=protocols)
-    if args.learned_extent:
+    if learned_component is not None:
         for protocol, report in protocols.items():
             small = report['groups']['small']
             report['passed'] = (small['revised'] - small['final'] >= int(protocol == 's-owodb')
