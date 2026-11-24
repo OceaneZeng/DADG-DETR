@@ -1,5 +1,7 @@
 """Fit a bounded residual for released Task 1 learned-query centers."""
 
+import argparse
+from collections import Counter
 from pathlib import Path
 
 import torch
@@ -7,6 +9,7 @@ import torch
 from tools.owod.gnn_calibration import load_detector
 from tools.owod.probe_task1_m_s_refinement_center_selector import FIT_IMAGES, LOCAL_FEATURE_OUTPUT, source_ids
 from tools.owod.probe_task1_m_s_refinement_decoder_box_preflight import measure, prepare
+from tools.owod.probe_task1_m_s_refinement_known_dedup import CompeteWithEmittedUnknown
 from tools.owod.probe_task1_m_s_refinement_pseudo_scores import training_loader
 from tools.owod.probe_task1_paired_discovery import verified
 from tools.owod.protocol import file_sha256, read_json, resolve_image_root
@@ -17,7 +20,10 @@ from util.box_ops import box_cxcywh_to_xyxy, box_iou
 
 
 OUTPUT = LOCAL_FEATURE_OUTPUT.with_name('task1-m-s-refinement-center-residual')
+PROTECTED_FIT_OUTPUT = OUTPUT.with_name('task1-m-s-refinement-protected-center-fit')
+RANGE_OUTPUT = OUTPUT.with_name('task1-m-s-refinement-center-range')
 LOCAL_SHA = '448222b0494130f1bd6e65198440d667355166c761a423517127241d25bf0263'
+RANGE_SHA = '39fe7dd79bcde92006f0a04d2400198d9fed7a9c7550392c0ddb92ec2ad0505f'
 MOVE_LIMIT = .25
 NEAR_IOU = .1
 KEEP_COST = 2.
@@ -45,15 +51,18 @@ def local_inputs(outputs, sampler, batch):
 
 
 @torch.no_grad()
-def training_rows(model, sampler, loader, plan):
+def training_rows(model, sampler, loader, plan, *, protect_post=None, known_columns=None):
     rows, residuals, movements = [], [], []
     observed = 0
     for step, (samples, targets) in enumerate(loader, 1):
         outputs = model(samples.to('cuda'))
+        if protect_post is not None:
+            unit = outputs['pred_boxes'].new_ones((len(targets), 2))
+            scored = protect_post(outputs, unit, include_top_indices=True)
         for batch, target in enumerate(targets):
             if not len(target['boxes']):
                 continue
-            _, boxes, features = local_inputs(outputs, sampler, batch)
+            queries, boxes, features = local_inputs(outputs, sampler, batch)
             truth = target['boxes'].cuda()
             truth_xyxy = box_cxcywh_to_xyxy(truth)
             native_iou = box_iou(box_cxcywh_to_xyxy(boxes), truth_xyxy)[0]
@@ -71,6 +80,10 @@ def training_rows(model, sampler, loader, plan):
             union = shifted[:, 2:].prod(dim=1) + paired[:, 2:].prod(dim=1) - intersection
             movable = (overlap >= NEAR_IOU) & (best_iou <= .5) & (intersection > .5 * union)
             keep = best_iou >= NEAR_IOU
+            if protect_post is not None:
+                row = scored[batch]
+                protected = row['top_indices'][row['labels'] != 91] // (known_columns + 1)
+                keep &= ~torch.isin(queries, protected)
             rows.append(features[keep].cpu())
             residuals.append(torch.where(movable[:, None], target_offset, 0.)[keep].cpu())
             movements.append(movable[keep].cpu())
@@ -113,6 +126,9 @@ def residual_transform(params, sampler, device):
 
 
 def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--protected-fit', action='store_true')
+    protected_fit = parser.parse_args().protected_fit
     if torch.cuda.device_count() != 1 or torch.cuda.get_device_name() != 'NVIDIA GeForce RTX 3090':
         raise ValueError('Use one RTX 3090 for the released center residual')
     source = verified(LOCAL_FEATURE_OUTPUT / 'comparison.json', LOCAL_SHA)
@@ -127,12 +143,28 @@ def main():
                        'Use a clipped supervised center move only when a small released hit can be gained; '
                        'nearby queries that preserve their native center supervise zero displacement.',
                 advance=prior['advance'])
-    pin(OUTPUT / 'plan.json', plan)
-    digest = file_sha256(OUTPUT / 'plan.json')
+    output = OUTPUT
+    if protected_fit:
+        from tools.owod.probe_task1_m_s_refinement_protected_residual import OUTPUT as PROTECTED_OUTPUT, protect_known
+
+        protected_sha = 'ae7af8fdfce6ad0977fa732fb0917162d2047d3b5149240bf4d94b6d4f474a13'
+        protected = verified(PROTECTED_OUTPUT / 'comparison.json', protected_sha)
+        protected_plan = verified(PROTECTED_OUTPUT / 'plan.json', protected['plan_sha256'])
+        evidence = verified(RANGE_OUTPUT / 'comparison.json', RANGE_SHA)
+        fixed = (*keys, 'fit_images', 'fit_order_sha256', 'move_limit', 'near_iou', 'keep_cost', 'ridge')
+        if (protected['status'] != 'complete' or not protected['passed'] or evidence['status'] != 'complete'
+                or any(plan[key] != protected_plan[key] for key in fixed)):
+            raise ValueError('Expected the protected residual and fixed-fit range replay')
+        output = PROTECTED_FIT_OUTPUT
+        plan.update(protected_comparison_sha256=protected_sha, range_comparison_sha256=RANGE_SHA,
+                    factor='Exclude native emitted known Top-50 queries from residual fit examples. '
+                           'Use the same fit sources, feature inputs, displacement limit and inference protection.')
+    pin(output / 'plan.json', plan)
+    digest = file_sha256(output / 'plan.json')
     device = torch.device('cuda')
     protocols = {}
     for protocol, job in plan['jobs'].items():
-        dest = OUTPUT / f'{protocol}.json'
+        dest = output / f'{protocol}.json'
         if not dest.exists():
             manifest_path = MANIFESTS[protocol]
             manifest = verified(manifest_path, job['manifest_sha256'])
@@ -149,10 +181,20 @@ def main():
             model, _ = load_detector(None, checkpoint, device)
             model.eval()
             sampler = model.detr.transformer.instance_proposals.refined_features
+            known = job['classes']
+            post = (CompeteWithEmittedUnknown(known_ids=known, scoring='focal', max_detections=plan['limit'])
+                    if protected_fit else None)
             print(f'Fitting {protocol} released continuous center residual', flush=True)
-            params = fit_residual(*training_rows(model, sampler, fit_loader, plan))
+            rows = training_rows(model, sampler, fit_loader, plan, protect_post=post, known_columns=len(known))
+            params = fit_residual(*rows)
             print(f'Evaluating {protocol} frozen center residual', flush=True)
-            report = measure(model, job['classes'], loader, plan, box_transform=residual_transform(params, sampler, device))
+            transform = residual_transform(params, sampler, device)
+            protection = Counter(restored_known_queries=0, reverted_images=0)
+            if protected_fit:
+                transform = protect_known(transform, post, known, protection)
+            report = measure(model, known, loader, plan, box_transform=transform)
+            if protected_fit:
+                report['protection'] = protection
             for group, row in report['groups'].items():
                 reference = source['protocols'][protocol]['groups'][group]
                 if any(row[key] != reference[key] for key in ('gt', 'final', 'native_known_tp')):
@@ -167,7 +209,9 @@ def main():
         if report['plan_sha256'] != digest:
             raise ValueError(f'Changed frozen center residual plan: {dest}')
         protocols[protocol] = {key: report[key] for key in ('residual', 'groups', 'changes', 'passed')}
-    write_json(OUTPUT / 'comparison.json', dict(status='complete', plan_sha256=digest, protocols=protocols,
+        if protected_fit:
+            protocols[protocol]['protection'] = report['protection']
+    write_json(output / 'comparison.json', dict(status='complete', plan_sha256=digest, protocols=protocols,
                                                passed=all(row['passed'] for row in protocols.values())))
 
 
