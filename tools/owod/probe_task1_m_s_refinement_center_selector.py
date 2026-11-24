@@ -1,5 +1,6 @@
 """Fit a selector for the frozen Task 1 small learned-query center candidate."""
 
+import argparse
 from pathlib import Path
 
 import torch
@@ -19,26 +20,42 @@ from util.box_ops import box_cxcywh_to_xyxy, box_iou
 
 
 OUTPUT = CENTER_OUTPUT.with_name('task1-m-s-refinement-center-selector')
+QUALITY_OUTPUT = OUTPUT.with_name('task1-m-s-refinement-center-quality-selector')
+TRACE_OUTPUT = OUTPUT.with_name('task1-m-s-refinement-center-selector-trace')
 CENTER_COMPARISON_SHA = '1df8e79d21bc4459dddb8efec1e34fdce1d6e418562cc0dba490a984cf0cc79a'
+SELECTOR_COMPARISON_SHA = '9a32eb2af9fcf9988b341baf6893f1c75feb44b5c373928b5046f67d95d1f6a3'
+TRACE_COMPARISON_SHA = '5885955be7819524332ed13daee33ec243677793cbe6877ae5064451f3274e34'
 FEATURES = ('encoder_quality', 'max_known_logit', 'objectness_logit', 'novelty_logit',
             'log_width', 'log_height', 'normalized_abs_dx', 'normalized_abs_dy')
+QUALITY_FEATURE = 'shifted_minus_native_geometry_quality'
 FIT_IMAGES = 1536
 NEGATIVE_COST = 2.
 L2 = .01
 
 
-def features(outputs, batch, queries, center, quality, known):
+def features(outputs, batch, queries, center, quality, known, refined_quality=None):
     boxes = outputs['pred_boxes'][batch, queries]
     extent = boxes[:, 2:].clamp_min(1e-6)
     displacement = (center - boxes[:, :2]).abs() / extent
     known_max = outputs['pred_logits'][batch, queries][:, known].amax(dim=-1)
     scores = torch.stack((quality, known_max, outputs['pred_objectness'][batch, queries],
                           outputs['pred_novelty'][batch, queries]), dim=-1)
-    return torch.cat((scores, extent.log(), displacement), dim=-1).float()
+    values = torch.cat((scores, extent.log(), displacement), dim=-1).float()
+    if refined_quality is not None:
+        delta = values.new_empty((len(queries), 1))
+        if len(queries):
+            geometry = outputs['geometry']
+            state = dict(memory=geometry['memory'][batch:batch+1],
+                         masks=[mask[batch:batch+1] for mask in geometry['masks']])
+            adjusted = torch.cat((center, boxes[:, 2:]), dim=-1)
+            shifted_quality = refined_quality(state, adjusted[None]).sigmoid()[0]
+            delta[:, 0] = shifted_quality - outputs['geometry_quality'][batch, queries]
+        values = torch.cat((values, delta), dim=-1)
+    return values
 
 
 @torch.no_grad()
-def fit_examples(model, loader, known, count, small_area):
+def fit_examples(model, loader, known, count, small_area, refined_quality=None):
     examples, labels = [], []
     observed = 0
     for step, (samples, targets) in enumerate(loader, 1):
@@ -55,7 +72,8 @@ def fit_examples(model, loader, known, count, small_area):
             gained = (new_hit & ~old_hit & small).any(dim=1)
             lost = (old_hit & ~new_hit).any(dim=1)
             relevant = gained | lost
-            examples.append(features(outputs, batch, queries, center, quality, known)[relevant].cpu())
+            rows = features(outputs, batch, queries, center, quality, known, refined_quality)
+            examples.append(rows[relevant].cpu())
             labels.append((gained & ~lost)[relevant].float().cpu())
             return relevant
 
@@ -90,18 +108,18 @@ def fit_selector(examples, labels):
                 bias=bias.detach().item(), positive=int(positive.sum()), negative=int((~positive).sum()))
 
 
-def correction_logits(params, known, device):
+def correction_logits(params, known, device, refined_quality=None):
     mean, scale, weight = (torch.tensor(params[key], device=device) for key in ('mean', 'scale', 'weight'))
 
     def score(outputs, batch, queries, center, quality):
-        values = features(outputs, batch, queries, center, quality, known)
+        values = features(outputs, batch, queries, center, quality, known, refined_quality)
         return ((values - mean) / scale) @ weight + params['bias']
 
     return score
 
 
-def center_transform(params, known, device):
-    score = correction_logits(params, known, device)
+def center_transform(params, known, device, refined_quality=None):
+    score = correction_logits(params, known, device, refined_quality)
 
     def transform(outputs):
         def choose(batch, queries, center, quality):
@@ -119,6 +137,10 @@ def source_ids(loader):
 
 
 def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--quality-delta', action='store_true')
+    quality_delta = parser.parse_args().quality_delta
+    output = QUALITY_OUTPUT if quality_delta else OUTPUT
     if torch.cuda.device_count() != 1 or torch.cuda.get_device_name() != 'NVIDIA GeForce RTX 3090':
         raise ValueError('Use one RTX 3090 for the frozen released replay')
     source = verified(CENTER_OUTPUT / 'comparison.json', CENTER_COMPARISON_SHA)
@@ -134,12 +156,31 @@ def main():
                 factor='Fit one standardized logistic selector per protocol on the next released images in the '
                        'locked replay permutation. Accept only a positive logit. A positive fitting example adds '
                        'a strict small-target localization hit without losing any existing hit of that query.')
-    pin(OUTPUT / 'plan.json', plan)
-    digest = file_sha256(OUTPUT / 'plan.json')
+    baseline_orders = {}
+    if quality_delta:
+        baseline = verified(OUTPUT / 'comparison.json', SELECTOR_COMPARISON_SHA)
+        trace = verified(TRACE_OUTPUT / 'comparison.json', TRACE_COMPARISON_SHA)
+        baseline_plan = verified(OUTPUT / 'plan.json', baseline['plan_sha256'])
+        comparison_keys = (*reference_keys, 'fit_images', 'features', 'negative_cost', 'l2')
+        if (baseline['status'] != 'complete' or baseline['passed'] or trace['status'] != 'complete'
+                or any(plan[key] != baseline_plan[key] for key in comparison_keys)):
+            raise ValueError('Expected the stopped frozen selector and its matched trace')
+        for protocol, report in baseline['protocols'].items():
+            endpoint = read_json(OUTPUT / f'{protocol}.json')
+            if endpoint['plan_sha256'] != baseline['plan_sha256'] or endpoint['selector'] != report['selector']:
+                raise ValueError(f'Changed frozen selector fitting source: {protocol}')
+            baseline_orders[protocol] = endpoint['fit_order_sha256']
+        plan.update(features=[*FEATURES, QUALITY_FEATURE], baseline_fit_orders=baseline_orders,
+                    selector_comparison_sha256=SELECTOR_COMPARISON_SHA,
+                    selector_trace_sha256=TRACE_COMPARISON_SHA,
+                    factor='Add the frozen geometry head score difference for the shifted and native boxes. '
+                           'Preserve data, candidate construction, fit labels, and logistic decision.')
+    pin(output / 'plan.json', plan)
+    digest = file_sha256(output / 'plan.json')
     device = torch.device('cuda')
     protocols = {}
     for protocol, job in plan['jobs'].items():
-        dest = OUTPUT / f'{protocol}.json'
+        dest = output / f'{protocol}.json'
         if not dest.exists():
             manifest_path = MANIFESTS[protocol]
             manifest = verified(manifest_path, job['manifest_sha256'])
@@ -154,14 +195,21 @@ def main():
             if (order != job['expected_order'] or len(set(fit_ids)) != FIT_IMAGES
                     or len(set(replay_ids)) != plan['images'] or set(fit_ids) & set(replay_ids)):
                 raise ValueError(f'Invalid released source identity separation: {protocol}')
+            if quality_delta and fit_order != baseline_orders[protocol]:
+                raise ValueError(f'Changed selector fitting order: {protocol}')
             model, _ = load_detector(None, checkpoint, device)
             model.eval()
             known = job['classes']
+            refined_quality = model.detr.transformer.instance_proposals.refined_quality if quality_delta else None
             print(f'Fitting {protocol} released center selector', flush=True)
-            training = fit_examples(model, fit_loader, known, FIT_IMAGES, plan['small_area'])
+            training = fit_examples(model, fit_loader, known, FIT_IMAGES, plan['small_area'], refined_quality)
             params = fit_selector(*training)
+            if quality_delta and any(params[key] != baseline['protocols'][protocol]['selector'][key]
+                                     for key in ('positive', 'negative')):
+                raise ValueError(f'Changed selector fitting labels: {protocol}')
             print(f'Evaluating {protocol} frozen center selector', flush=True)
-            report = measure(model, known, loader, plan, box_transform=center_transform(params, known, device))
+            transform = center_transform(params, known, device, refined_quality)
+            report = measure(model, known, loader, plan, box_transform=transform)
             for size, row in report['groups'].items():
                 reference = source['protocols'][protocol]['groups'][size]
                 if any(row[key] != reference[key] for key in ('gt', 'final', 'native_known_tp')):
@@ -176,7 +224,7 @@ def main():
         if report['plan_sha256'] != digest:
             raise ValueError(f'Changed released selector plan: {dest}')
         protocols[protocol] = {key: report[key] for key in ('selector', 'groups', 'changes', 'passed')}
-    write_json(OUTPUT / 'comparison.json', dict(status='complete', plan_sha256=digest, protocols=protocols,
+    write_json(output / 'comparison.json', dict(status='complete', plan_sha256=digest, protocols=protocols,
                                                passed=all(report['passed'] for report in protocols.values())))
 
 
