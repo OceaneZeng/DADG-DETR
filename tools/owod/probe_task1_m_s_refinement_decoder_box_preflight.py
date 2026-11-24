@@ -58,7 +58,8 @@ def prepare():
                         'Report class-correct Top-50 matches and the any-last-two-layer geometry upper bound.')
 
 
-def refine_learned_boxes(outputs, *, center_only=False, observe_neighbors=None, choose_centers=None):
+def refine_learned_boxes(outputs, *, center_only=False, observe_neighbors=None, choose_centers=None,
+                         observe_centers=None):
     """Refine one component of a learned query with a nearby fine-level box."""
     final = outputs['pred_boxes']
     geometry = outputs['geometry']
@@ -85,6 +86,8 @@ def refine_learned_boxes(outputs, *, center_only=False, observe_neighbors=None, 
             centers = peers[..., :2]
             inside = ((centers - base[:, None, :2]).abs() <= base[:, None, 2:] * .5).all(dim=-1)
             scores = geometry['logits'][batch, near].masked_fill(~inside, -torch.inf)
+            if observe_centers is not None:
+                observe_centers(batch, queries, base[:, None, :2].lerp(centers, .5), scores)
             best, position = scores.max(dim=1)
             keep = best.isfinite()
             selected = candidates[near[keep, position[keep]], :2]
