@@ -1,5 +1,6 @@
 """Trace selected encoder proposal slots through the fixed Task 1 decoder endpoints."""
 
+import argparse
 from collections import Counter
 from pathlib import Path
 import subprocess
@@ -20,6 +21,8 @@ from tools.owod.screening_data import write_json
 
 
 OUTPUT = QUALITY_OUTPUT.with_name('task1-m-s-refinement-selected-slot-trace')
+ATTRIBUTION_OUTPUT = OUTPUT.with_name('task1-m-s-refinement-final-slot-attribution')
+TRACE_COMPARISON_SHA = '789ca52079fe7bd80a5590fb9c96933d34fc32ec30fbaefa7dc61e68b442152e'
 ARMS = {
     'matched_count': (MATCHED_COUNT_OUTPUT, '8d8b5817191b7b491f52ff247eb87dbeb41f310b7ceb59ad4ebb45f37d038181'),
     'quality': (QUALITY_OUTPUT, '8ac23ca0c1eb44c2b71ef8f73fd31f7f400585e5db13be76848ccd2182516292'),
@@ -57,7 +60,7 @@ def prepare():
 
 
 @torch.inference_mode()
-def trace(model, dataset, loader, known, cohort, reference, threshold):
+def trace(model, dataset, loader, known, cohort, reference, threshold, attribute_final=False):
     rows = []
     observed = set()
     for step, (samples, targets) in enumerate(loader, 1):
@@ -80,24 +83,41 @@ def trace(model, dataset, loader, known, cohort, reference, threshold):
                 seed = voc_coords(geo['boxes'][batch, cells], width, height)
                 boxes = [voc_coords(stage[batch], width, height) for stage in layers]
                 slot_ids, cell_ids = slots.tolist(), cells.tolist()
+                seed_index = {query: i for i, query in enumerate(slot_ids)}
                 for ann in anns:
                     released = ann['category_id'] in known
                     if not (ann['id'] in cohort or released and not ann.get('difficult')
                             and size_group(ann) != '32_sq_plus'):
                         continue
                     truth = np.asarray(ann['voc_bbox'])
-                    seed_hits = np.flatnonzero(overlaps(truth, seed) > threshold)
-                    layer_hits = [set(np.flatnonzero(overlaps(truth, stage) > threshold).tolist()) for stage in boxes]
+                    seed_iou = overlaps(truth, seed)
+                    seed_hits = np.flatnonzero(seed_iou > threshold)
+                    layer_iou = [overlaps(truth, stage) for stage in boxes]
+                    layer_hits = [set(np.flatnonzero(iou > threshold).tolist()) for iou in layer_iou]
                     ann_id = ann['id']
                     if not released:
                         observed.add(ann_id)
                         if bool(len(seed_hits)) != (ann_id in reference['selected']) or bool(layer_hits[-1]) != (ann_id in reference['final']):
                             raise ValueError(f'Native coverage differs at annotation {ann_id}')
-                    rows.append(dict(annotation=ann_id, image=int(target['image_id']), released=released,
-                                     seed_slots=[dict(query=slot_ids[i], cell=cell_ids[i],
-                                                      covered=[slot_ids[i] in hits for hits in layer_hits])
-                                                 for i in seed_hits],
-                                     any_final=bool(layer_hits[-1])))
+                    row = dict(annotation=ann_id, image=int(target['image_id']), released=released,
+                               seed_slots=[dict(query=slot_ids[i], cell=cell_ids[i],
+                                                covered=[slot_ids[i] in hits for hits in layer_hits])
+                                           for i in seed_hits],
+                               any_final=bool(layer_hits[-1]))
+                    if attribute_final:
+                        final_hits = []
+                        for query in sorted(layer_hits[-1]):
+                            index = seed_index.get(query)
+                            hit = dict(query=query, final_iou=float(layer_iou[-1][query]))
+                            if index is None:
+                                hit.update(source='learned', cell=None, seed_iou=None)
+                            else:
+                                iou = float(seed_iou[index])
+                                source = 'injected_qualified' if iou > threshold else 'injected_unqualified'
+                                hit.update(source=source, cell=cell_ids[index], seed_iou=iou)
+                            final_hits.append(hit)
+                        row['final_hits'] = final_hits
+                    rows.append(row)
         if step % 64 == 0 or step == len(loader):
             print(f'Inference {step}/{len(loader)} batches', flush=True)
     if observed != cohort:
@@ -124,12 +144,50 @@ def summarize(rows):
     return groups
 
 
+def pair_final_hits(evidence):
+    def by_target(rows):
+        return {(row['image'], row['annotation'], row['released']): row for row in rows}
+
+    matched = by_target(evidence['matched_count'])
+    quality = by_target(evidence['quality'])
+    if (matched.keys() != quality.keys() or len(matched) != len(evidence['matched_count'])
+            or len(quality) != len(evidence['quality'])):
+        raise ValueError('Final slot attribution requires unique paired targets')
+    summary, pairs = {}, []
+    for key in sorted(matched):
+        image, annotation, released = key
+        before = sorted({hit['source'] for hit in matched[key]['final_hits']})
+        after = sorted({hit['source'] for hit in quality[key]['final_hits']})
+        if before:
+            change = 'retained' if after else 'lost'
+        else:
+            change = 'gained' if after else 'uncovered'
+        group = summary.setdefault('released' if released else 'withheld', {})
+        transition = f'{"+".join(before) or "none"} -> {"+".join(after) or "none"}'
+        group.setdefault(change, Counter())[transition] += 1
+        pairs.append(dict(image=image, annotation=annotation, released=released, change=change,
+                          matched_count_sources=before, quality_sources=after))
+    return summary, pairs
+
+
 def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--final-slot-attribution', action='store_true')
+    attribute_final = parser.parse_args().final_slot_attribution
     if torch.cuda.device_count() != 1 or torch.cuda.get_device_name() != 'NVIDIA GeForce RTX 3090':
         raise ValueError('Use one RTX 3090 for the frozen replay')
     plan = prepare()
-    pin(OUTPUT / 'plan.json', plan)
-    digest = file_sha256(OUTPUT / 'plan.json')
+    output = ATTRIBUTION_OUTPUT if attribute_final else OUTPUT
+    if attribute_final:
+        parent = verified(OUTPUT / 'comparison.json', TRACE_COMPARISON_SHA)
+        parent_plan = verified(OUTPUT / 'plan.json', parent['plan_sha256'])
+        if any(plan[key] != parent_plan[key] for key in ('jobs', 'batch_size', 'cohort')):
+            raise ValueError('Changed frozen selected-slot trace inputs')
+        plan.update(trace_comparison_sha256=TRACE_COMPARISON_SHA,
+                    attribution='Every strict final-layer VOC IoU hit, paired by image and annotation. '
+                                'Retain all slot sources if more than one hits the same target.')
+    pin(output / 'plan.json', plan)
+    digest = file_sha256(output / 'plan.json')
     results = {}
     for protocol, job in plan['jobs'].items():
         manifest_path = MANIFESTS[protocol]
@@ -137,7 +195,7 @@ def main():
         root = resolve_image_root(manifest_path, manifest)
         protocol_results = {}
         for fold, spec in job['folds'].items():
-            dest = OUTPUT / f'{protocol}-{fold}.json'
+            dest = output / f'{protocol}-{fold}.json'
             if not dest.exists():
                 annotations = Path(spec['path'])
                 payload = verified(annotations, spec['sha256'])
@@ -154,18 +212,25 @@ def main():
                     model.eval()
                     dataset, loader = make_loader(root, annotations, plan['batch_size'], 2)
                     reference = {key: set(archive[arm]['coverage'][key]) for key in ('selected', 'final')}
-                    print(f'Evaluating {protocol}/{fold}/{arm} selected query slots', flush=True)
+                    print(f'Evaluating {protocol}/{fold}/{arm} query slots', flush=True)
                     rows = trace(model, dataset, loader, set(manifest['stages'][0]['classes']),
-                                 cohort, reference, manifest['evaluation']['iou_threshold'])
+                                 cohort, reference, manifest['evaluation']['iou_threshold'], attribute_final)
                     evidence[arm], summaries[arm] = rows, summarize(rows)
                     del model
-                write_json(dest, dict(plan_sha256=digest, targets=len(cohort), summaries=summaries, events=evidence))
+                result = dict(plan_sha256=digest, targets=len(cohort), summaries=summaries, events=evidence)
+                if attribute_final:
+                    if summaries != parent['protocols'][protocol][fold]:
+                        raise ValueError(f'Selected-slot coverage differs on {protocol}/{fold}')
+                    result['attribution'], result['pairs'] = pair_final_hits(evidence)
+                write_json(dest, result)
             result = read_json(dest)
             if result['plan_sha256'] != digest:
                 raise ValueError(f'Changed frozen replay plan: {dest}')
             protocol_results[fold] = result['summaries']
+            if attribute_final:
+                protocol_results[fold] = dict(arms=result['summaries'], attribution=result['attribution'])
         results[protocol] = protocol_results
-    write_json(OUTPUT / 'comparison.json', dict(status='complete', plan_sha256=digest, protocols=results))
+    write_json(output / 'comparison.json', dict(status='complete', plan_sha256=digest, protocols=results))
 
 
 if __name__ == '__main__':
