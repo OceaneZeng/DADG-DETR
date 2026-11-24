@@ -24,14 +24,18 @@ KEEP_COST = 2.
 RIDGE = .1
 
 
-def local_inputs(outputs, sampler, batch):
-    state = outputs['geometry']
-    final = outputs['pred_boxes'][batch]
+def learned_query_ids(final, state, batch):
     active = state['active'][batch]
     learned = torch.ones(len(final), dtype=torch.bool, device=final.device)
     learned[:len(active)] = ~active
     anchor_area = state['anchors'][batch, 0, 2:].prod()
-    queries = torch.where(learned & (final[:, 2:].prod(dim=1) < 2 * anchor_area))[0]
+    return torch.where(learned & (final[:, 2:].prod(dim=1) < 2 * anchor_area))[0]
+
+
+def local_inputs(outputs, sampler, batch):
+    state = outputs['geometry']
+    final = outputs['pred_boxes'][batch]
+    queries = learned_query_ids(final, state, batch)
     boxes = final[queries]
     row_state = dict(memory=state['memory'][batch:batch+1], masks=[mask[batch:batch+1] for mask in state['masks']])
     local = sampler(row_state, boxes[None])[0]
