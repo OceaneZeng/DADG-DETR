@@ -1,4 +1,4 @@
-"""Measure last-two-layer box averaging on released Task 1 training images."""
+"""Measure frozen Task 1 box changes on released training images."""
 
 import argparse
 from collections import Counter
@@ -22,8 +22,11 @@ from util.box_ops import box_cxcywh_to_xyxy, box_iou
 
 OUTPUT = COMPETITION_OUTPUT.with_name('task1-m-s-refinement-decoder-box-preflight')
 RANK_OUTPUT = COMPETITION_OUTPUT.with_name('task1-m-s-refinement-encoder-rank-preflight')
+EXTENT_OUTPUT = COMPETITION_OUTPUT.with_name('task1-m-s-refinement-learned-extent-preflight')
+ATTRIBUTION_OUTPUT = COMPETITION_OUTPUT.with_name('task1-m-s-refinement-final-slot-attribution')
 COMPETITION_SHA = 'b3801feb4573a0b6d9586d70f5479d8be541acea665678baaf5f76f974570f67'
 DECODER_SHA = 'd16ba04de5eeaa1be2a67fcb5bcf8c514e70a874618339ed5d6b6d10d3561d95'
+ATTRIBUTION_SHA = '31ed1449712d060261553d2666fad941e8f9e2701d15e357c910498cddd4f917'
 
 
 def prepare():
@@ -52,10 +55,47 @@ def prepare():
                         'Report class-correct Top-50 matches and the any-last-two-layer geometry upper bound.')
 
 
+def learned_extent(outputs):
+    """Blend learned-query widths and heights with a matching fine-level box."""
+    final = outputs['pred_boxes']
+    geometry = outputs['geometry']
+    revised = final.clone()
+    finest_cells = geometry['masks'][0][0].numel()
+    active = geometry['active']
+    for batch, boxes in enumerate(final):
+        anchors = geometry['anchors'][batch, :finest_cells]
+        candidates = geometry['boxes'][batch, :finest_cells]
+        valid = geometry['valid'][batch, :finest_cells]
+        anchor_area = anchors[0, 2:].prod()
+        area = candidates[:, 2:].prod(dim=-1)
+        candidate_ids = torch.where(valid & (area <= anchor_area))[0]
+        if not len(candidate_ids):
+            continue
+        # IoU greater than 0.5 requires the area ratio to be less than two.
+        learned = torch.ones(len(boxes), dtype=torch.bool, device=boxes.device)
+        learned[:active.shape[1]] = ~active[batch]
+        queries = torch.where(learned & (boxes[:, 2:].prod(dim=-1) < 2 * anchor_area))[0]
+        base = boxes[queries]
+        near = nearby_anchor_ids(base, anchors, candidate_ids)
+        peers = candidates[near]
+        base_xyxy = box_cxcywh_to_xyxy(base)[:, None]
+        peer_xyxy = box_cxcywh_to_xyxy(peers)
+        left = torch.maximum(base_xyxy[..., :2], peer_xyxy[..., :2])
+        right = torch.minimum(base_xyxy[..., 2:], peer_xyxy[..., 2:])
+        intersection = (right - left).clamp_min(0).prod(dim=-1)
+        union = base[:, None, 2:].prod(dim=-1) + area[near] - intersection
+        best, position = (intersection / union.clamp_min(1e-8)).max(dim=1)
+        keep = best > .5
+        peer_extent = candidates[near[keep, position[keep]], 2:]
+        revised[batch, queries[keep], 2:] = (base[keep, 2:] * peer_extent).sqrt()
+    return revised
+
+
 @torch.inference_mode()
-def measure(model, known, loader, plan):
+def measure(model, known, loader, plan, *, use_learned_extent=False):
     post = CompeteWithEmittedUnknown(known_ids=known, scoring='focal', max_detections=plan['limit'])
     stats = {key: Counter() for key in ('all', 'small')}
+    changes = Counter()
     observed = 0
     for step, (samples, targets) in enumerate(loader, 1):
         outputs = model(samples.to('cuda'))
@@ -64,32 +104,38 @@ def measure(model, known, loader, plan):
             raise ValueError('Expected the locked six-layer decoder')
         final = outputs['pred_boxes']
         previous = layers[-1]['pred_boxes']
-        blend = final.lerp(previous, .5)
-        revised = dict(outputs, pred_boxes=blend)
+        candidate = learned_extent(outputs) if use_learned_extent else final.lerp(previous, .5)
+        revised = dict(outputs, pred_boxes=candidate)
+        if use_learned_extent:
+            changed = (candidate != final).any(dim=-1)
+            changes.update(queries=int(changed.sum()), images=int(changed.any(dim=1).sum()))
         unit = final.new_ones((len(targets), 2))
-        native, blended = post(outputs, unit), post(revised, unit)
+        native, changed_outputs = post(outputs, unit), post(revised, unit)
         for batch, target in enumerate(targets):
             labels = target['labels'].cuda()
             truth = box_cxcywh_to_xyxy(target['boxes'].cuda())
             small = target['source_box_area'].cuda() < plan['small_area']
             dense = [(box_iou(box_cxcywh_to_xyxy(boxes[batch]), truth)[0] > .5).any(dim=0)
-                     for boxes in (final, previous, blend)]
+                     for boxes in (final, previous, candidate)]
             matches = [((box_iou(row['boxes'], truth)[0] > .5) & (row['labels'][:, None] == labels)).any(dim=0)
-                       for row in (native[batch], blended[batch])]
+                       for row in (native[batch], changed_outputs[batch])]
             for name, mask in (('all', torch.ones_like(small)), ('small', small)):
-                original, penultimate, averaged = (x[mask] for x in dense)
-                native_tp, blend_tp = (x[mask] for x in matches)
+                original, penultimate, updated = (x[mask] for x in dense)
+                native_tp, updated_tp = (x[mask] for x in matches)
                 stats[name].update(gt=int(mask.sum()), final=int(original.sum()),
-                                   penultimate=int(penultimate.sum()), blend=int(averaged.sum()),
-                                   either=int((original | penultimate).sum()), gained=int((averaged & ~original).sum()),
-                                   lost=int((original & ~averaged).sum()), native_known_tp=int(native_tp.sum()),
-                                   blend_known_tp=int(blend_tp.sum()))
+                                   gained=int((updated & ~original).sum()), lost=int((original & ~updated).sum()),
+                                   native_known_tp=int(native_tp.sum()))
+                if use_learned_extent:
+                    stats[name].update(revised=int(updated.sum()), revised_known_tp=int(updated_tp.sum()))
+                else:
+                    stats[name].update(penultimate=int(penultimate.sum()), blend=int(updated.sum()),
+                                       either=int((original | penultimate).sum()), blend_known_tp=int(updated_tp.sum()))
         observed += len(targets)
         if step % 64 == 0 or step == len(loader):
             print(f'Inference {step}/{len(loader)} batches', flush=True)
     if observed != plan['images'] or stats['small']['gt'] <= 0:
         raise ValueError('Incomplete released replay or missing small targets')
-    return stats
+    return dict(groups=stats, changes=changes) if use_learned_extent else stats
 
 
 @torch.inference_mode()
@@ -147,16 +193,29 @@ def main():
     if torch.cuda.device_count() != 1 or torch.cuda.get_device_name() != 'NVIDIA GeForce RTX 3090':
         raise ValueError('Use one RTX 3090 for the frozen released replay')
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--encoder-ranks', action='store_true')
-    ranks = parser.parse_args().encoder_ranks
-    output = RANK_OUTPUT if ranks else OUTPUT
+    modes = parser.add_mutually_exclusive_group()
+    modes.add_argument('--encoder-ranks', action='store_true')
+    modes.add_argument('--learned-extent', action='store_true')
+    args = parser.parse_args()
+    output = EXTENT_OUTPUT if args.learned_extent else RANK_OUTPUT if args.encoder_ranks else OUTPUT
     plan = prepare()
-    if ranks:
+    if args.encoder_ranks:
         decoder = verified(OUTPUT / 'comparison.json', DECODER_SHA)
         if decoder['status'] != 'complete' or decoder['passed']:
             raise ValueError('Expected the completed box-average preflight')
         plan.update(decoder_preflight_sha256=DECODER_SHA, factor='Trace native encoder scores and exact released near-16 supervision.',
                     advance='Use the source of actual shortlist misses to choose the next released supervision contrast.')
+    if args.learned_extent:
+        attribution = verified(ATTRIBUTION_OUTPUT / 'comparison.json', ATTRIBUTION_SHA)
+        if attribution['status'] != 'complete':
+            raise ValueError('Expected the completed final-query source trace')
+        plan.update(attribution_comparison_sha256=ATTRIBUTION_SHA,
+                    factor='For a learned query, find the best IoU among the 16 nearest valid finest anchors '
+                           'whose encoder box area does not exceed the finest anchor area. At IoU > 0.5, '
+                           'take the geometric mean of the decoder and encoder widths and heights, keeping '
+                           'the decoder center and logits.',
+                    advance='Improve released-small dense coverage in S with no drop in M. Require no drop '
+                            'in class-correct small or all Top-50 matches on either protocol.')
     pin(output / 'plan.json', plan)
     digest = file_sha256(output / 'plan.json')
     protocols = {}
@@ -174,9 +233,11 @@ def main():
                 raise ValueError(f'Changed released replay order: {protocol}')
             model, _ = load_detector(None, checkpoint, torch.device('cuda'))
             model.eval()
-            print(f'Evaluating {protocol} released small-box {"encoder ranks" if ranks else "geometry"}', flush=True)
-            if ranks:
+            print(f'Evaluating {protocol} released images in {output.name}', flush=True)
+            if args.encoder_ranks:
                 report = measure_ranks(model, job['classes'], loader, plan)
+            elif args.learned_extent:
+                report = measure(model, job['classes'], loader, plan, use_learned_extent=True)
             else:
                 report = dict(groups=measure(model, job['classes'], loader, plan))
             write_json(dest, dict(plan_sha256=digest, order_sha256=order, **report))
@@ -185,8 +246,17 @@ def main():
         if report['plan_sha256'] != digest:
             raise ValueError(f'Changed frozen plan: {dest}')
         protocols[protocol] = report['groups']
+        if args.learned_extent:
+            protocols[protocol] = dict(groups=report['groups'], changes=report['changes'])
     result = dict(status='complete', plan_sha256=digest, protocols=protocols)
-    if not ranks:
+    if args.learned_extent:
+        for protocol, report in protocols.items():
+            small = report['groups']['small']
+            report['passed'] = (small['revised'] - small['final'] >= int(protocol == 's-owodb')
+                                and all(row['revised_known_tp'] >= row['native_known_tp']
+                                        for row in report['groups'].values()))
+        result['passed'] = all(report['passed'] for report in protocols.values())
+    elif not args.encoder_ranks:
         m, s = (protocols[key]['small'] for key in ('m-owodb', 's-owodb'))
         result['passed'] = m['blend'] >= m['final'] and s['blend'] > s['final']
     write_json(output / 'comparison.json', result)
