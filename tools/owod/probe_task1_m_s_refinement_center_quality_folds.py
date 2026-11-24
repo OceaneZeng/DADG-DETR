@@ -1,12 +1,13 @@
 """Evaluate the frozen center selector on the four locked Task 1 folds."""
 
+import argparse
 from pathlib import Path
 import subprocess
 
 import torch
 
 from tools.owod.gnn_calibration import load_detector
-from tools.owod.probe_task1_m_s_refinement_center_selector import QUALITY_OUTPUT, center_transform
+from tools.owod.probe_task1_m_s_refinement_center_selector import GROUP_OUTPUT, QUALITY_OUTPUT, center_transform
 from tools.owod.probe_task1_m_s_refinement_decoder_box_preflight import COMPETITION_OUTPUT, COMPETITION_SHA
 from tools.owod.probe_task1_m_s_refinement_known_dedup import CompeteWithEmittedUnknown
 from tools.owod.probe_task1_paired_discovery import verified
@@ -19,12 +20,16 @@ from tools.owod.screening_data import write_json
 
 
 OUTPUT = QUALITY_OUTPUT.with_name('task1-m-s-refinement-center-quality-folds')
+GROUP_FOLD_OUTPUT = OUTPUT.with_name('task1-m-s-refinement-center-query-choice-folds')
 PREFLIGHT_SHA = '6db34143914d3cd53ee9361d4ff472633618812942494b443e2510af7f40d573'
+GROUP_PREFLIGHT_SHA = 'efd2b2e5a81e94f46d9d6a6838af6b4dbd4a20dd94f3fc345c7b043e0d6708e6'
 
 
-def prepare():
-    released = verified(QUALITY_OUTPUT / 'comparison.json', PREFLIGHT_SHA)
-    released_plan = verified(QUALITY_OUTPUT / 'plan.json', released['plan_sha256'])
+def prepare(query_choice=False):
+    source = GROUP_OUTPUT if query_choice else QUALITY_OUTPUT
+    preflight_sha = GROUP_PREFLIGHT_SHA if query_choice else PREFLIGHT_SHA
+    released = verified(source / 'comparison.json', preflight_sha)
+    released_plan = verified(source / 'plan.json', released['plan_sha256'])
     reference = verified(COMPETITION_OUTPUT / 'comparison.json', COMPETITION_SHA)
     plan = verified(COMPETITION_OUTPUT / 'plan.json', reference['plan_sha256'])
     if released['status'] != 'complete' or not released['passed'] or reference['status'] != 'complete':
@@ -36,21 +41,24 @@ def prepare():
             raise ValueError(f'Changed released endpoint: {protocol}')
         job['selector'] = released['protocols'][protocol]['selector']
     plan.update(commit=subprocess.check_output(['git', 'rev-parse', 'HEAD'], text=True).strip(),
-                preflight_sha256=PREFLIGHT_SHA, competition_sha256=COMPETITION_SHA,
+                preflight_sha256=preflight_sha, competition_sha256=COMPETITION_SHA,
                 factor='Use the frozen released selector to move accepted learned query centers after decoding. '
                        'Keep the locked known/unknown competition and original joint VOC gates.')
+    if query_choice:
+        plan['query_choice'] = True
     return plan, reference
 
 
 @torch.inference_mode()
-def evaluate(ref, model, protocol, job, plan, digest):
+def evaluate(ref, model, protocol, job, plan, digest, output):
     manifest_path = MANIFESTS[protocol]
     manifest = verified(manifest_path, job['manifest_sha256'])
     image_root = resolve_image_root(manifest_path, manifest)
     control = verified(Path(job['control_report']), job['control_report_sha256'])['folds']
     known = manifest['stages'][0]['classes']
     quality = model.detr.transformer.instance_proposals.refined_quality
-    transform = center_transform(job['selector'], known, torch.device('cuda'), quality)
+    transform = center_transform(job['selector'], known, torch.device('cuda'), quality,
+                                 rank_centers=plan.get('query_choice', False))
     post = CompeteWithEmittedUnknown(known_ids=known, scoring='focal', max_detections=plan['limit'])
 
     def predict(samples):
@@ -59,7 +67,7 @@ def evaluate(ref, model, protocol, job, plan, digest):
 
     folds = {}
     for fold, entry in job['folds'].items():
-        dest = OUTPUT / f'{protocol}-{fold}.json'
+        dest = output / f'{protocol}-{fold}.json'
         if not dest.exists():
             annotations = verified_annotation(entry)
             print(f'Evaluating {protocol}/{fold} frozen center selector', flush=True)
@@ -89,11 +97,15 @@ def evaluate(ref, model, protocol, job, plan, digest):
 
 
 def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--query-choice', action='store_true')
+    query_choice = parser.parse_args().query_choice
     if torch.cuda.device_count() != 1 or torch.cuda.get_device_name() != 'NVIDIA GeForce RTX 3090':
         raise ValueError('Use one RTX 3090 for the locked Task 1 replay')
-    plan, reference = prepare()
-    pin(OUTPUT / 'plan.json', plan)
-    digest = file_sha256(OUTPUT / 'plan.json')
+    output = GROUP_FOLD_OUTPUT if query_choice else OUTPUT
+    plan, reference = prepare(query_choice)
+    pin(output / 'plan.json', plan)
+    digest = file_sha256(output / 'plan.json')
     protocols = {}
     for protocol, job in plan['jobs'].items():
         checkpoint = Path(job['checkpoint'])
@@ -101,9 +113,9 @@ def main():
             raise ValueError(f'Changed matched-count endpoint: {protocol}')
         model, _ = load_detector(None, checkpoint, torch.device('cuda'))
         model.eval()
-        protocols[protocol] = evaluate(reference['protocols'][protocol], model, protocol, job, plan, digest)
+        protocols[protocol] = evaluate(reference['protocols'][protocol], model, protocol, job, plan, digest, output)
         del model
-    write_json(OUTPUT / 'comparison.json', dict(status='complete', plan_sha256=digest, protocols=protocols,
+    write_json(output / 'comparison.json', dict(status='complete', plan_sha256=digest, protocols=protocols,
                                                passed=all(row['passed'] for folds in protocols.values()
                                                           for row in folds.values())))
 
