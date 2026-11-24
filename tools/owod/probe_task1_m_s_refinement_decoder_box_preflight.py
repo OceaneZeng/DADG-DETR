@@ -55,7 +55,7 @@ def prepare():
                         'Report class-correct Top-50 matches and the any-last-two-layer geometry upper bound.')
 
 
-def learned_extent(outputs):
+def learned_extent(outputs, *, observe_neighbors=None):
     """Blend learned-query widths and heights with a matching fine-level box."""
     final = outputs['pred_boxes']
     geometry = outputs['geometry']
@@ -84,7 +84,10 @@ def learned_extent(outputs):
         right = torch.minimum(base_xyxy[..., 2:], peer_xyxy[..., 2:])
         intersection = (right - left).clamp_min(0).prod(dim=-1)
         union = base[:, None, 2:].prod(dim=-1) + area[near] - intersection
-        best, position = (intersection / union.clamp_min(1e-8)).max(dim=1)
+        overlaps = intersection / union.clamp_min(1e-8)
+        if observe_neighbors is not None:
+            observe_neighbors(batch, queries, peers, overlaps)
+        best, position = overlaps.max(dim=1)
         keep = best > .5
         peer_extent = candidates[near[keep, position[keep]], 2:]
         revised[batch, queries[keep], 2:] = (base[keep, 2:] * peer_extent).sqrt()
