@@ -21,9 +21,12 @@ from util.box_ops import box_cxcywh_to_xyxy, box_iou
 
 OUTPUT = LOCAL_FEATURE_OUTPUT.with_name('task1-m-s-refinement-center-residual')
 PROTECTED_FIT_OUTPUT = OUTPUT.with_name('task1-m-s-refinement-protected-center-fit')
+HALF_RANGE_OUTPUT = OUTPUT.with_name('task1-m-s-refinement-protected-center-half-range')
+FIT_FOLDS_OUTPUT = PROTECTED_FIT_OUTPUT.with_name('task1-m-s-refinement-protected-center-fit-folds')
 RANGE_OUTPUT = OUTPUT.with_name('task1-m-s-refinement-center-range')
 LOCAL_SHA = '448222b0494130f1bd6e65198440d667355166c761a423517127241d25bf0263'
 RANGE_SHA = '39fe7dd79bcde92006f0a04d2400198d9fed7a9c7550392c0ddb92ec2ad0505f'
+FIT_FOLDS_SHA = '8c7b498aa9c142805eeb647746339cdca770866f97b0af5bffc9f0f2b0eb25aa'
 MOVE_LIMIT = .25
 NEAR_IOU = .1
 KEEP_COST = 2.
@@ -54,6 +57,7 @@ def local_inputs(outputs, sampler, batch):
 def training_rows(model, sampler, loader, plan, *, protect_post=None, known_columns=None):
     rows, residuals, movements = [], [], []
     observed = 0
+    move_limit = plan['move_limit']
     for step, (samples, targets) in enumerate(loader, 1):
         outputs = model(samples.to('cuda'))
         if protect_post is not None:
@@ -71,7 +75,7 @@ def training_rows(model, sampler, loader, plan, *, protect_post=None, known_colu
             overlap, index = native_iou.masked_fill(~small[None], -1.).max(dim=1)
             paired = truth[index]
             target_offset = ((paired[:, :2] - boxes[:, :2]) / boxes[:, 2:].clamp_min(1e-6)).clamp(
-                -MOVE_LIMIT, MOVE_LIMIT)
+                -move_limit, move_limit)
             shifted = torch.cat(((boxes[:, :2] + target_offset * boxes[:, 2:]).clamp(0, 1), boxes[:, 2:]), dim=1)
             predicted = box_cxcywh_to_xyxy(shifted)
             expected = truth_xyxy[index]
@@ -111,14 +115,14 @@ def fit_residual(rows, targets, move):
                 bias=solution[-1].tolist(), move=int(move.sum()), keep=int((~move).sum()))
 
 
-def residual_transform(params, sampler, device):
+def residual_transform(params, sampler, device, *, move_limit=MOVE_LIMIT):
     mean, scale, weights, bias = (torch.tensor(params[key], device=device) for key in ('mean', 'scale', 'weights', 'bias'))
 
     def transform(outputs):
         out = outputs['pred_boxes'].clone()
         for batch in range(len(out)):
             queries, boxes, features = local_inputs(outputs, sampler, batch)
-            residual = (((features - mean) / scale) @ weights + bias).clamp(-MOVE_LIMIT, MOVE_LIMIT)
+            residual = (((features - mean) / scale) @ weights + bias).clamp(-move_limit, move_limit)
             out[batch, queries, :2] = (boxes[:, :2] + residual * boxes[:, 2:]).clamp(0, 1)
         return out
 
@@ -127,8 +131,11 @@ def residual_transform(params, sampler, device):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--protected-fit', action='store_true')
-    protected_fit = parser.parse_args().protected_fit
+    modes = parser.add_mutually_exclusive_group()
+    modes.add_argument('--protected-fit', action='store_true')
+    modes.add_argument('--half-range', action='store_true')
+    args = parser.parse_args()
+    protected_fit = args.protected_fit or args.half_range
     if torch.cuda.device_count() != 1 or torch.cuda.get_device_name() != 'NVIDIA GeForce RTX 3090':
         raise ValueError('Use one RTX 3090 for the released center residual')
     source = verified(LOCAL_FEATURE_OUTPUT / 'comparison.json', LOCAL_SHA)
@@ -159,6 +166,19 @@ def main():
         plan.update(protected_comparison_sha256=protected_sha, range_comparison_sha256=RANGE_SHA,
                     factor='Exclude native emitted known Top-50 queries from residual fit examples. '
                            'Use the same fit sources, feature inputs, displacement limit and inference protection.')
+    if args.half_range:
+        folds = verified(FIT_FOLDS_OUTPUT / 'comparison.json', FIT_FOLDS_SHA)
+        baseline = verified(PROTECTED_FIT_OUTPUT / 'comparison.json',
+                            '99732ddbfcb08e8c5d4ff9a7a3393c4704663d1df856789a2e3d27bcbfa9b619')
+        baseline_plan = verified(PROTECTED_FIT_OUTPUT / 'plan.json', baseline['plan_sha256'])
+        if (folds['status'] != 'complete' or folds['passed'] or baseline['status'] != 'complete'
+                or not baseline['passed'] or any(plan[key] != baseline_plan[key] for key in fixed)):
+            raise ValueError('Expected the completed quarter-range fit and its fold replay')
+        output = HALF_RANGE_OUTPUT
+        plan.update(move_limit=.5, fit_folds_sha256=FIT_FOLDS_SHA,
+                    quarter_fit_sha256=file_sha256(PROTECTED_FIT_OUTPUT / 'comparison.json'),
+                    factor='Increase the protected fit center cap from a quarter to a half of the native extent. '
+                           'Use the same features, query filter and protection.')
     pin(output / 'plan.json', plan)
     digest = file_sha256(output / 'plan.json')
     device = torch.device('cuda')
@@ -188,7 +208,7 @@ def main():
             rows = training_rows(model, sampler, fit_loader, plan, protect_post=post, known_columns=len(known))
             params = fit_residual(*rows)
             print(f'Evaluating {protocol} frozen center residual', flush=True)
-            transform = residual_transform(params, sampler, device)
+            transform = residual_transform(params, sampler, device, move_limit=plan['move_limit'])
             protection = Counter(restored_known_queries=0, reverted_images=0)
             if protected_fit:
                 transform = protect_known(transform, post, known, protection)
