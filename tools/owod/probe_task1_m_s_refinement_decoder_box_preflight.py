@@ -58,7 +58,7 @@ def prepare():
                         'Report class-correct Top-50 matches and the any-last-two-layer geometry upper bound.')
 
 
-def refine_learned_boxes(outputs, *, center_only=False, observe_neighbors=None):
+def refine_learned_boxes(outputs, *, center_only=False, observe_neighbors=None, choose_centers=None):
     """Refine one component of a learned query with a nearby fine-level box."""
     final = outputs['pred_boxes']
     geometry = outputs['geometry']
@@ -88,7 +88,12 @@ def refine_learned_boxes(outputs, *, center_only=False, observe_neighbors=None):
             best, position = scores.max(dim=1)
             keep = best.isfinite()
             selected = candidates[near[keep, position[keep]], :2]
-            revised[batch, queries[keep], :2] = base[keep, :2].lerp(selected, .5)
+            query_ids = queries[keep]
+            center = base[keep, :2].lerp(selected, .5)
+            if choose_centers is not None:
+                accept = choose_centers(batch, query_ids, center, best[keep])
+                query_ids, center = query_ids[accept], center[accept]
+            revised[batch, query_ids, :2] = center
             continue
         base_xyxy = box_cxcywh_to_xyxy(base)[:, None]
         peer_xyxy = box_cxcywh_to_xyxy(peers)
@@ -107,11 +112,12 @@ def refine_learned_boxes(outputs, *, center_only=False, observe_neighbors=None):
 
 
 @torch.inference_mode()
-def measure(model, known, loader, plan, *, learned_component=None):
+def measure(model, known, loader, plan, *, learned_component=None, box_transform=None):
     post = CompeteWithEmittedUnknown(known_ids=known, scoring='focal', max_detections=plan['limit'])
     stats = {key: Counter() for key in ('all', 'small')}
     changes = Counter()
     observed = 0
+    measures_revision = learned_component is not None or box_transform is not None
     for step, (samples, targets) in enumerate(loader, 1):
         outputs = model(samples.to('cuda'))
         layers = outputs['aux_outputs']
@@ -119,12 +125,14 @@ def measure(model, known, loader, plan, *, learned_component=None):
             raise ValueError('Expected the locked six-layer decoder')
         final = outputs['pred_boxes']
         previous = layers[-1]['pred_boxes']
-        if learned_component is None:
+        if box_transform is not None:
+            candidate = box_transform(outputs)
+        elif learned_component is None:
             candidate = final.lerp(previous, .5)
         else:
             candidate = refine_learned_boxes(outputs, center_only=learned_component == 'center')
         revised = dict(outputs, pred_boxes=candidate)
-        if learned_component is not None:
+        if measures_revision:
             changed = (candidate != final).any(dim=-1)
             changes.update(queries=int(changed.sum()), images=int(changed.any(dim=1).sum()))
         unit = final.new_ones((len(targets), 2))
@@ -143,7 +151,7 @@ def measure(model, known, loader, plan, *, learned_component=None):
                 stats[name].update(gt=int(mask.sum()), final=int(original.sum()),
                                    gained=int((updated & ~original).sum()), lost=int((original & ~updated).sum()),
                                    native_known_tp=int(native_tp.sum()))
-                if learned_component is not None:
+                if measures_revision:
                     stats[name].update(revised=int(updated.sum()), revised_known_tp=int(updated_tp.sum()))
                 else:
                     stats[name].update(penultimate=int(penultimate.sum()), blend=int(updated.sum()),
@@ -153,7 +161,7 @@ def measure(model, known, loader, plan, *, learned_component=None):
             print(f'Inference {step}/{len(loader)} batches', flush=True)
     if observed != plan['images'] or stats['small']['gt'] <= 0:
         raise ValueError('Incomplete released replay or missing small targets')
-    return dict(groups=stats, changes=changes) if learned_component is not None else stats
+    return dict(groups=stats, changes=changes) if measures_revision else stats
 
 
 @torch.inference_mode()
