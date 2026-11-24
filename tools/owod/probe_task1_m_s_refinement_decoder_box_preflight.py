@@ -59,7 +59,7 @@ def prepare():
 
 
 def refine_learned_boxes(outputs, *, center_only=False, observe_neighbors=None, choose_centers=None,
-                         observe_centers=None):
+                         observe_centers=None, rank_centers=None):
     """Refine one component of a learned query with a nearby fine-level box."""
     final = outputs['pred_boxes']
     geometry = outputs['geometry']
@@ -86,8 +86,12 @@ def refine_learned_boxes(outputs, *, center_only=False, observe_neighbors=None, 
             centers = peers[..., :2]
             inside = ((centers - base[:, None, :2]).abs() <= base[:, None, 2:] * .5).all(dim=-1)
             scores = geometry['logits'][batch, near].masked_fill(~inside, -torch.inf)
-            if observe_centers is not None:
-                observe_centers(batch, queries, base[:, None, :2].lerp(centers, .5), scores)
+            if observe_centers is not None or rank_centers is not None:
+                midpoints = base[:, None, :2].lerp(centers, .5)
+                if observe_centers is not None:
+                    observe_centers(batch, queries, midpoints, scores)
+                if rank_centers is not None:
+                    scores = rank_centers(batch, queries, midpoints, scores)
             best, position = scores.max(dim=1)
             keep = best.isfinite()
             selected = candidates[near[keep, position[keep]], :2]
