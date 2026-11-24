@@ -221,10 +221,10 @@ def main():
             checkpoint = Path(job['checkpoint'])
             if file_sha256(checkpoint) != job['checkpoint_sha256']:
                 raise ValueError(f'Changed matched-count endpoint: {protocol}')
-            args = (checkpoint, Path(job['training']), resolve_image_root(manifest_path, manifest), job)
-            fit_loader, fit_order = training_loader(*args, dict(plan, images=FIT_IMAGES), source_box_area=True,
+            loader_args = (checkpoint, Path(job['training']), resolve_image_root(manifest_path, manifest), job)
+            fit_loader, fit_order = training_loader(*loader_args, dict(plan, images=FIT_IMAGES), source_box_area=True,
                                                     offset=plan['images'])
-            loader, order = training_loader(*args, plan, source_box_area=True)
+            loader, order = training_loader(*loader_args, plan, source_box_area=True)
             fit_ids, replay_ids = source_ids(fit_loader), source_ids(loader)
             if (order != job['expected_order'] or len(set(fit_ids)) != FIT_IMAGES
                     or len(set(replay_ids)) != plan['images'] or set(fit_ids) & set(replay_ids)):
