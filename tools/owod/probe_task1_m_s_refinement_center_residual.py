@@ -22,11 +22,13 @@ from util.box_ops import box_cxcywh_to_xyxy, box_iou
 OUTPUT = LOCAL_FEATURE_OUTPUT.with_name('task1-m-s-refinement-center-residual')
 PROTECTED_FIT_OUTPUT = OUTPUT.with_name('task1-m-s-refinement-protected-center-fit')
 HALF_RANGE_OUTPUT = OUTPUT.with_name('task1-m-s-refinement-protected-center-half-range')
+ASSIGNMENT_OUTPUT = OUTPUT.with_name('task1-m-s-refinement-center-fit-assignment')
 FIT_FOLDS_OUTPUT = PROTECTED_FIT_OUTPUT.with_name('task1-m-s-refinement-protected-center-fit-folds')
 RANGE_OUTPUT = OUTPUT.with_name('task1-m-s-refinement-center-range')
 LOCAL_SHA = '448222b0494130f1bd6e65198440d667355166c761a423517127241d25bf0263'
 RANGE_SHA = '39fe7dd79bcde92006f0a04d2400198d9fed7a9c7550392c0ddb92ec2ad0505f'
 FIT_FOLDS_SHA = '8c7b498aa9c142805eeb647746339cdca770866f97b0af5bffc9f0f2b0eb25aa'
+QUARTER_FIT_SHA = '99732ddbfcb08e8c5d4ff9a7a3393c4704663d1df856789a2e3d27bcbfa9b619'
 MOVE_LIMIT = .25
 NEAR_IOU = .1
 KEEP_COST = 2.
@@ -54,7 +56,7 @@ def local_inputs(outputs, sampler, batch):
 
 
 @torch.no_grad()
-def training_rows(model, sampler, loader, plan, *, protect_post=None, known_columns=None):
+def training_rows(model, sampler, loader, plan, *, protect_post=None, known_columns=None, assignment=None):
     rows, residuals, movements = [], [], []
     observed = 0
     move_limit = plan['move_limit']
@@ -88,6 +90,12 @@ def training_rows(model, sampler, loader, plan, *, protect_post=None, known_colu
                 row = scored[batch]
                 protected = row['top_indices'][row['labels'] != 91] // (known_columns + 1)
                 keep &= ~torch.isin(queries, protected)
+            if assignment is not None:
+                final = outputs['pred_boxes'][batch]
+                covered = (box_iou(box_cxcywh_to_xyxy(final), truth_xyxy)[0] > .5).any(dim=0)
+                per_target = torch.bincount(index[movable & keep], minlength=len(truth))
+                assignment['missed'].update(per_target[small & ~covered].tolist())
+                assignment['covered'].update(per_target[small & covered].tolist())
             rows.append(features[keep].cpu())
             residuals.append(torch.where(movable[:, None], target_offset, 0.)[keep].cpu())
             movements.append(movable[keep].cpu())
@@ -134,8 +142,9 @@ def main():
     modes = parser.add_mutually_exclusive_group()
     modes.add_argument('--protected-fit', action='store_true')
     modes.add_argument('--half-range', action='store_true')
+    modes.add_argument('--fit-assignment', action='store_true')
     args = parser.parse_args()
-    protected_fit = args.protected_fit or args.half_range
+    protected_fit = args.protected_fit or args.half_range or args.fit_assignment
     if torch.cuda.device_count() != 1 or torch.cuda.get_device_name() != 'NVIDIA GeForce RTX 3090':
         raise ValueError('Use one RTX 3090 for the released center residual')
     source = verified(LOCAL_FEATURE_OUTPUT / 'comparison.json', LOCAL_SHA)
@@ -166,19 +175,23 @@ def main():
         plan.update(protected_comparison_sha256=protected_sha, range_comparison_sha256=RANGE_SHA,
                     factor='Exclude native emitted known Top-50 queries from residual fit examples. '
                            'Use the same fit sources, feature inputs, displacement limit and inference protection.')
-    if args.half_range:
+    if args.half_range or args.fit_assignment:
         folds = verified(FIT_FOLDS_OUTPUT / 'comparison.json', FIT_FOLDS_SHA)
-        baseline = verified(PROTECTED_FIT_OUTPUT / 'comparison.json',
-                            '99732ddbfcb08e8c5d4ff9a7a3393c4704663d1df856789a2e3d27bcbfa9b619')
+        baseline = verified(PROTECTED_FIT_OUTPUT / 'comparison.json', QUARTER_FIT_SHA)
         baseline_plan = verified(PROTECTED_FIT_OUTPUT / 'plan.json', baseline['plan_sha256'])
         if (folds['status'] != 'complete' or folds['passed'] or baseline['status'] != 'complete'
                 or not baseline['passed'] or any(plan[key] != baseline_plan[key] for key in fixed)):
             raise ValueError('Expected the completed quarter-range fit and its fold replay')
+        plan.update(fit_folds_sha256=FIT_FOLDS_SHA, quarter_fit_sha256=QUARTER_FIT_SHA)
+    if args.half_range:
         output = HALF_RANGE_OUTPUT
-        plan.update(move_limit=.5, fit_folds_sha256=FIT_FOLDS_SHA,
-                    quarter_fit_sha256=file_sha256(PROTECTED_FIT_OUTPUT / 'comparison.json'),
+        plan.update(move_limit=.5,
                     factor='Increase the protected fit center cap from a quarter to a half of the native extent. '
                            'Use the same features, query filter and protection.')
+    if args.fit_assignment:
+        output = ASSIGNMENT_OUTPUT
+        plan.update(factor='Count quarter-range protected fit positives per released small target.',
+                    advance='Assess repeated positive moves among small targets missed by every native query.')
     pin(output / 'plan.json', plan)
     digest = file_sha256(output / 'plan.json')
     device = torch.device('cuda')
@@ -204,8 +217,23 @@ def main():
             known = job['classes']
             post = (CompeteWithEmittedUnknown(known_ids=known, scoring='focal', max_detections=plan['limit'])
                     if protected_fit else None)
-            print(f'Fitting {protocol} released continuous center residual', flush=True)
-            rows = training_rows(model, sampler, fit_loader, plan, protect_post=post, known_columns=len(known))
+            assignment = {'missed': Counter(), 'covered': Counter()} if args.fit_assignment else None
+            print(f'Replaying {protocol} released fit sources' if args.fit_assignment
+                  else f'Fitting {protocol} released continuous center residual', flush=True)
+            rows = training_rows(model, sampler, fit_loader, plan, protect_post=post, known_columns=len(known),
+                                 assignment=assignment)
+            if args.fit_assignment:
+                move = int(rows[2].sum())
+                keep = len(rows[2]) - move
+                expected = baseline['protocols'][protocol]['residual']
+                audited_moves = sum(count * targets for group in assignment.values() for count, targets in group.items())
+                if move != expected['move'] or keep != expected['keep'] or audited_moves != move:
+                    raise ValueError(f'Changed quarter-range fit assignments: {protocol}')
+                result = dict(move=move, keep=keep, targets_by_positive_count=assignment)
+                write_json(dest, dict(plan_sha256=digest, order_sha256=order, fit_order_sha256=fit_order, **result))
+                protocols[protocol] = result
+                del model
+                continue
             params = fit_residual(*rows)
             print(f'Evaluating {protocol} frozen center residual', flush=True)
             transform = residual_transform(params, sampler, device, move_limit=plan['move_limit'])
@@ -228,11 +256,17 @@ def main():
         report = read_json(dest)
         if report['plan_sha256'] != digest:
             raise ValueError(f'Changed frozen center residual plan: {dest}')
+        if args.fit_assignment:
+            protocols[protocol] = {key: report[key] for key in ('move', 'keep', 'targets_by_positive_count')}
+            continue
         protocols[protocol] = {key: report[key] for key in ('residual', 'groups', 'changes', 'passed')}
         if protected_fit:
             protocols[protocol]['protection'] = report['protection']
-    write_json(output / 'comparison.json', dict(status='complete', plan_sha256=digest, protocols=protocols,
-                                               passed=all(row['passed'] for row in protocols.values())))
+    if args.fit_assignment:
+        write_json(output / 'comparison.json', dict(status='complete', plan_sha256=digest, protocols=protocols))
+    else:
+        write_json(output / 'comparison.json', dict(status='complete', plan_sha256=digest, protocols=protocols,
+                                                   passed=all(row['passed'] for row in protocols.values())))
 
 
 if __name__ == '__main__':
