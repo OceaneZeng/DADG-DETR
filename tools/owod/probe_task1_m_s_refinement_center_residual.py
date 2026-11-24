@@ -23,12 +23,14 @@ OUTPUT = LOCAL_FEATURE_OUTPUT.with_name('task1-m-s-refinement-center-residual')
 PROTECTED_FIT_OUTPUT = OUTPUT.with_name('task1-m-s-refinement-protected-center-fit')
 HALF_RANGE_OUTPUT = OUTPUT.with_name('task1-m-s-refinement-protected-center-half-range')
 ASSIGNMENT_OUTPUT = OUTPUT.with_name('task1-m-s-refinement-center-fit-assignment')
+ONE_PER_MISS_OUTPUT = OUTPUT.with_name('task1-m-s-refinement-protected-center-one-per-miss')
 FIT_FOLDS_OUTPUT = PROTECTED_FIT_OUTPUT.with_name('task1-m-s-refinement-protected-center-fit-folds')
 RANGE_OUTPUT = OUTPUT.with_name('task1-m-s-refinement-center-range')
 LOCAL_SHA = '448222b0494130f1bd6e65198440d667355166c761a423517127241d25bf0263'
 RANGE_SHA = '39fe7dd79bcde92006f0a04d2400198d9fed7a9c7550392c0ddb92ec2ad0505f'
 FIT_FOLDS_SHA = '8c7b498aa9c142805eeb647746339cdca770866f97b0af5bffc9f0f2b0eb25aa'
 QUARTER_FIT_SHA = '99732ddbfcb08e8c5d4ff9a7a3393c4704663d1df856789a2e3d27bcbfa9b619'
+ASSIGNMENT_SHA = 'b25288c1692449611fdb17332ddb04b2da40b39fd08200f46c954a0c1e80485f'
 MOVE_LIMIT = .25
 NEAR_IOU = .1
 KEEP_COST = 2.
@@ -93,9 +95,17 @@ def training_rows(model, sampler, loader, plan, *, protect_post=None, known_colu
             if assignment is not None:
                 final = outputs['pred_boxes'][batch]
                 covered = (box_iou(box_cxcywh_to_xyxy(final), truth_xyxy)[0] > .5).any(dim=0)
-                per_target = torch.bincount(index[movable & keep], minlength=len(truth))
-                assignment['missed'].update(per_target[small & ~covered].tolist())
+                positive = movable & keep
+                per_target = torch.bincount(index[positive], minlength=len(truth))
+                missed = small & ~covered
+                assignment['missed'].update(per_target[missed].tolist())
                 assignment['covered'].update(per_target[small & covered].tolist())
+                if plan.get('one_move_per_miss'):
+                    for target_id in torch.where(missed & (per_target > 1))[0].tolist():
+                        candidates = torch.where(positive & (index == target_id))[0]
+                        distance = target_offset[candidates].square().sum(dim=1)
+                        keep[candidates] = False
+                        keep[candidates[distance.argmin()]] = True
             rows.append(features[keep].cpu())
             residuals.append(torch.where(movable[:, None], target_offset, 0.)[keep].cpu())
             movements.append(movable[keep].cpu())
@@ -143,8 +153,10 @@ def main():
     modes.add_argument('--protected-fit', action='store_true')
     modes.add_argument('--half-range', action='store_true')
     modes.add_argument('--fit-assignment', action='store_true')
+    modes.add_argument('--one-move-per-miss', action='store_true')
     args = parser.parse_args()
-    protected_fit = args.protected_fit or args.half_range or args.fit_assignment
+    count_assignments = args.fit_assignment or args.one_move_per_miss
+    protected_fit = args.protected_fit or args.half_range or count_assignments
     if torch.cuda.device_count() != 1 or torch.cuda.get_device_name() != 'NVIDIA GeForce RTX 3090':
         raise ValueError('Use one RTX 3090 for the released center residual')
     source = verified(LOCAL_FEATURE_OUTPUT / 'comparison.json', LOCAL_SHA)
@@ -175,7 +187,7 @@ def main():
         plan.update(protected_comparison_sha256=protected_sha, range_comparison_sha256=RANGE_SHA,
                     factor='Exclude native emitted known Top-50 queries from residual fit examples. '
                            'Use the same fit sources, feature inputs, displacement limit and inference protection.')
-    if args.half_range or args.fit_assignment:
+    if args.half_range or count_assignments:
         folds = verified(FIT_FOLDS_OUTPUT / 'comparison.json', FIT_FOLDS_SHA)
         baseline = verified(PROTECTED_FIT_OUTPUT / 'comparison.json', QUARTER_FIT_SHA)
         baseline_plan = verified(PROTECTED_FIT_OUTPUT / 'plan.json', baseline['plan_sha256'])
@@ -192,6 +204,17 @@ def main():
         output = ASSIGNMENT_OUTPUT
         plan.update(factor='Count quarter-range protected fit positives per released small target.',
                     advance='Assess repeated positive moves among small targets missed by every native query.')
+    if args.one_move_per_miss:
+        assignment_source = verified(ASSIGNMENT_OUTPUT / 'comparison.json', ASSIGNMENT_SHA)
+        assignment_plan = verified(ASSIGNMENT_OUTPUT / 'plan.json', assignment_source['plan_sha256'])
+        if (assignment_source['status'] != 'complete'
+                or any(plan[key] != assignment_plan[key] for key in (*fixed, 'quarter_fit_sha256'))):
+            raise ValueError('Expected the quarter-range assignment audit on the same fit sources')
+        output = ONE_PER_MISS_OUTPUT
+        plan.update(one_move_per_miss=True, assignment_sha256=ASSIGNMENT_SHA,
+                    factor='Keep one eligible positive per natively missed released small target. '
+                           'Choose the shortest normalized move, breaking ties by query index. '
+                           'Leave all other fit rows and scoring rules as in the protected quarter-range fit.')
     pin(output / 'plan.json', plan)
     digest = file_sha256(output / 'plan.json')
     device = torch.device('cuda')
@@ -217,7 +240,7 @@ def main():
             known = job['classes']
             post = (CompeteWithEmittedUnknown(known_ids=known, scoring='focal', max_detections=plan['limit'])
                     if protected_fit else None)
-            assignment = {'missed': Counter(), 'covered': Counter()} if args.fit_assignment else None
+            assignment = {'missed': Counter(), 'covered': Counter()} if count_assignments else None
             print(f'Replaying {protocol} released fit sources' if args.fit_assignment
                   else f'Fitting {protocol} released continuous center residual', flush=True)
             rows = training_rows(model, sampler, fit_loader, plan, protect_post=post, known_columns=len(known),
@@ -235,6 +258,14 @@ def main():
                 del model
                 continue
             params = fit_residual(*rows)
+            if args.one_move_per_miss:
+                audit = assignment_source['protocols'][protocol]
+                assigned = {group: {str(count): targets for count, targets in histogram.items()}
+                            for group, histogram in assignment.items()}
+                removed = sum((count - 1) * targets for count, targets in assignment['missed'].items() if count > 1)
+                if (assigned != audit['targets_by_positive_count'] or params['keep'] != audit['keep']
+                        or params['move'] != audit['move'] - removed):
+                    raise ValueError(f'Changed quarter-range fit assignments: {protocol}')
             print(f'Evaluating {protocol} frozen center residual', flush=True)
             transform = residual_transform(params, sampler, device, move_limit=plan['move_limit'])
             protection = Counter(restored_known_queries=0, reverted_images=0)
@@ -243,6 +274,8 @@ def main():
             report = measure(model, known, loader, plan, box_transform=transform)
             if protected_fit:
                 report['protection'] = protection
+            if args.one_move_per_miss:
+                report['assignment'] = dict(removed=removed, quarter_fit_groups=baseline['protocols'][protocol]['groups'])
             for group, row in report['groups'].items():
                 reference = source['protocols'][protocol]['groups'][group]
                 if any(row[key] != reference[key] for key in ('gt', 'final', 'native_known_tp')):
@@ -262,6 +295,8 @@ def main():
         protocols[protocol] = {key: report[key] for key in ('residual', 'groups', 'changes', 'passed')}
         if protected_fit:
             protocols[protocol]['protection'] = report['protection']
+        if args.one_move_per_miss:
+            protocols[protocol]['assignment'] = report['assignment']
     if args.fit_assignment:
         write_json(output / 'comparison.json', dict(status='complete', plan_sha256=digest, protocols=protocols))
     else:
