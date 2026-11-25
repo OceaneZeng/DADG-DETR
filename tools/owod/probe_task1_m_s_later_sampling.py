@@ -31,7 +31,7 @@ MODES = ('native', 'first_center', 'encoder_box')
 GAIN = .05
 
 
-def sampler_hook(stack, slots, boxes, valid_ratios, use_extent):
+def sampler_hook(stack, slots, boxes, valid_ratios, use_extent, *, keep_center=False):
     """Apply later sampling changes only at the injected query positions."""
     def change_layer(_layer, inputs):
         refs, shapes = inputs[2], inputs[4]
@@ -53,6 +53,8 @@ def sampler_hook(stack, slots, boxes, valid_ratios, use_extent):
                 return offsets.reshape_as(output)
 
             stack.enter_context(_layer.cross_attn.sampling_offsets.register_forward_hook(rescale))
+        if keep_center:
+            return
         # The layer sees references already scaled by valid image ratios.
         changed = refs.clone()
         changed[slots] = boxes[:, None, :2] * ratios

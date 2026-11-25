@@ -119,26 +119,31 @@ def refine_learned_boxes(outputs, *, center_only=False, observe_neighbors=None, 
 
 
 @torch.inference_mode()
-def measure(model, known, loader, plan, *, learned_component=None, box_transform=None):
+def measure(model, known, loader, plan, *, learned_component=None, box_transform=None, replay=None):
     post = CompeteWithEmittedUnknown(known_ids=known, scoring='focal', max_detections=plan['limit'])
     stats = {key: Counter() for key in ('all', 'small')}
     changes = Counter()
     observed = 0
-    measures_revision = learned_component is not None or box_transform is not None
+    measures_revision = learned_component is not None or box_transform is not None or replay is not None
     for step, (samples, targets) in enumerate(loader, 1):
-        outputs = model(samples.to('cuda'))
+        samples = samples.to('cuda')
+        outputs = model(samples)
         layers = outputs['aux_outputs']
         if len(layers) != 5:
             raise ValueError('Expected the locked six-layer decoder')
         final = outputs['pred_boxes']
         previous = layers[-1]['pred_boxes']
-        if box_transform is not None:
+        if replay is not None:
+            revised = replay(samples, outputs, targets)
+            candidate = revised['pred_boxes']
+        elif box_transform is not None:
             candidate = box_transform(outputs)
         elif learned_component is None:
             candidate = final.lerp(previous, .5)
         else:
             candidate = refine_learned_boxes(outputs, center_only=learned_component == 'center')
-        revised = dict(outputs, pred_boxes=candidate)
+        if replay is None:
+            revised = dict(outputs, pred_boxes=candidate)
         if measures_revision:
             changed = (candidate != final).any(dim=-1)
             changes.update(queries=int(changed.sum()), images=int(changed.any(dim=1).sum()))
