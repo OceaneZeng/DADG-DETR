@@ -40,6 +40,23 @@ def matched_targets(edges):
     return int(values[queries, targets].sum())
 
 
+def eligible_queries(native_hits, scored, columns):
+    queries = torch.arange(len(native_hits), device=native_hits.device)
+    emitted_queries = scored['top_indices'] // columns
+    emitted_unknown = scored['labels'] == 91
+    eligible = ~native_hits.any(dim=1) & ~torch.isin(queries, emitted_queries[~emitted_unknown])
+    return eligible, eligible & torch.isin(queries, emitted_queries[emitted_unknown])
+
+
+def near_dense_cells(final, geometry, batch, valid):
+    boxes = geometry['boxes'][batch]
+    anchors = geometry['anchors'][batch]
+    anchor_area = anchors[0, 2:].prod()
+    finest = geometry['masks'][0][batch].numel()
+    fine_cells = valid[(valid < finest) & (boxes[valid, 2:].prod(dim=1) <= anchor_area)]
+    return nearby_anchor_ids(final, anchors, fine_cells)
+
+
 def dense_image(final, geometry, batch, target, scored, columns, small_area, groups, coverage, multiplier):
     truth = box_cxcywh_to_xyxy(target['boxes'].cuda())
     source_area = target['source_box_area'].cuda()
@@ -51,7 +68,6 @@ def dense_image(final, geometry, batch, target, scored, columns, small_area, gro
     if not misses.any():
         return
     boxes = geometry['boxes'][batch]
-    anchors = geometry['anchors'][batch]
     valid = torch.where(geometry['valid'][batch])[0]
     scores = geometry['logits'][batch, valid]
     shortlist = scores.topk(min(len(scores), geometry['chosen'].shape[1] * multiplier)).indices
@@ -61,15 +77,8 @@ def dense_image(final, geometry, batch, target, scored, columns, small_area, gro
         raise ValueError('Selected cells are outside the reconstructed native shortlist')
     accurate = hits(boxes[valid], truth[misses])
 
-    queries = torch.arange(len(final), device=final.device)
-    emitted_queries = scored['top_indices'] // columns
-    emitted_unknown = scored['labels'] == 91
-    eligible = ~native.any(dim=1) & ~torch.isin(queries, emitted_queries[~emitted_unknown])
-    eligible_unknown = eligible & torch.isin(queries, emitted_queries[emitted_unknown])
-    anchor_area = anchors[0, 2:].prod()
-    finest = geometry['masks'][0][batch].numel()
-    fine_cells = valid[(valid < finest) & (boxes[valid, 2:].prod(dim=1) <= anchor_area)]
-    near = nearby_anchor_ids(final[eligible], anchors, fine_cells)
+    eligible, eligible_unknown = eligible_queries(native, scored, columns)
+    near = near_dense_cells(final[eligible], geometry, batch, valid)
     local = accurate[torch.searchsorted(valid, near)].any(dim=1)
 
     for name, mask in zip(GROUPS, (source_area < 16**2, source_area >= 16**2, small), strict=True):
@@ -191,6 +200,11 @@ def main():
                     advance='Compare global and local geometry capacity. Local matching can reuse encoder cells, '
                             'and both bounds precede the output postprocessor.')
         output = CAPACITY_OUTPUT
+    run_released_probe(output, plan, quarter, lambda model, loader, known, plan: measure(
+        model, loader, known, plan, dense_capacity=args.dense_capacity))
+
+
+def run_released_probe(output, plan, quarter, measure_probe):
     pin(output / 'plan.json', plan)
     digest = file_sha256(output / 'plan.json')
     protocols = {}
@@ -209,9 +223,8 @@ def main():
                 raise ValueError(f'Changed released replay order: {protocol}')
             model, _ = load_detector(None, checkpoint, device)
             model.eval()
-            print(f'Tracing {protocol} released ' + ('dense query capacity' if args.dense_capacity else 'decoder geometry'),
-                  flush=True)
-            report = measure(model, loader, job['classes'], plan, dense_capacity=args.dense_capacity)
+            print(f'Evaluating {protocol} in {output.name}', flush=True)
+            report = measure_probe(model, loader, job['classes'], plan)
             reference = quarter['protocols'][protocol]['groups']['small']
             if any(report['coverage'][key] != reference[key] for key in ('gt', 'final')):
                 raise ValueError(f'Changed native small box geometry: {protocol}')
