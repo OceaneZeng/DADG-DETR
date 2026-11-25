@@ -47,7 +47,8 @@ def validate_plan_arguments(run, saved):
                    'screen_double_old_box_loss': False, 'screen_double_current_positives': False,
                    'screen_double_previous_hard_negatives': False,
                    'screen_double_current_low_iou_boxes': False,
-                   'screen_small_box_extent': False}.get(field)
+                   'screen_small_box_extent': False, 'screen_small_box_quality_rank': False,
+                   'screen_detach_rank_features': False}.get(field)
         if getattr(saved, field, default) != value:
             raise ValueError(f'Saved checkpoint differs from launch arguments: {field}')
     world_size = int(command[command.index('--nproc_per_node') + 1]) if '--nproc_per_node' in command else 1

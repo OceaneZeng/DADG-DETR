@@ -1,27 +1,38 @@
 """Train the single local-saliency change on the locked Task 1 screen."""
 
 import argparse
+from collections import Counter
+import os
 from pathlib import Path
 import subprocess
 
 import torch
+import numpy as np
 
 from tools.owod.gnn_calibration import load_detector
 from tools.owod.probe_task1_m_s_refinement_local_saliency import OUTPUT as PREFLIGHT
 from tools.owod.probe_task1_m_s_refinement_pseudo_scores import TOP_KNOWN_SHA
 from tools.owod.probe_task1_m_s_refinement_top_known import OUTPUT as REFERENCE, TopKnownPerQuery
-from tools.owod.probe_task1_paired_discovery import verified
+from tools.owod.probe_task1_paired_discovery import verified, voc_coords
+from models.owod_benchmark_eval import overlaps
 from tools.owod.protocol import file_sha256, read_json, resolve_image_root
 from tools.owod.run_cross_attention_study import pin
 from tools.owod.run_stronger_parent_study import run_job
 from tools.owod.run_task1_m_s_iterative_refinement import MANIFESTS, OUTPUT as TRAINING, compare, prepare as prepare_refinement
-from tools.owod.run_task1_m_s_released_small_extent import measure
+from tools.owod.run_task1_m_s_released_small_extent import measure, size_group
 from tools.owod.screening_data import write_json
 
 
 OUTPUT = TRAINING.with_name('task1-m-s-refinement-saliency-training')
 MATCHED_COUNT_OUTPUT = TRAINING.with_name('task1-m-s-refinement-saliency-matched-count')
 QUALITY_OUTPUT = TRAINING.with_name('task1-m-s-refinement-small-box-quality')
+DETACHED_OUTPUT = TRAINING.with_name('task1-m-s-refinement-detached-rank')
+QUALITY_SHA = '8ac23ca0c1eb44c2b71ef8f73fd31f7f400585e5db13be76848ccd2182516292'
+HOLDOUT_SHA = '15d7e2827d896d94d189e6655ed616d8f89fc3f8176d60bbb47865d181c149c1'
+QUALITY_CHECKPOINTS = {
+    'm-owodb': '9d5fe319f71c9ae8ecc445b024dca309293b2e45e2c10b6829e52b85581a6a04',
+    's-owodb': '1cb87265dac80851d17f22d0e3cd4e92d170c686f7fa1f59a0f79c2c69de211f',
+}
 PREFLIGHT_SHA = '3be9cf68082bbc19224ce2123d7fea0a0ec808a1226d884fcf9a9c25be5c1056'
 CAP_COMPARISON_SHA = '9a28ed0ade713fec7101ade0070aedb130341bf0b348e5b89f7f3c75b7b012ca'
 GATE_FLAG = '--discovery-saliency-top-points'
@@ -106,6 +117,68 @@ def add_quality_arm(plan):
                          'Compare localization and VOC metrics to the matched-count endpoint under the same scoring.')
 
 
+def prepare_detached():
+    from tools.owod.screening_data import screening_files
+
+    control = verified(QUALITY_OUTPUT / 'comparison.json', QUALITY_SHA)
+    plan = verified(QUALITY_OUTPUT / 'plan.json', control['plan_sha256'])
+    holdout = verified(TRAINING.with_name('task1-m-s-refinement-mined-seed-holdout') / 'comparison.json', HOLDOUT_SHA)
+    devices = [torch.cuda.get_device_name(i) for i in range(torch.cuda.device_count())]
+    if (control['status'] != 'complete' or holdout['status'] != 'complete' or holdout['passed']
+            or not plan['small_box_quality_rank'] or devices != plan['devices']):
+        raise ValueError('Expected the original quality-rank control, stopped frozen holdout and matched GPUs')
+    for protocol, job in plan['jobs'].items():
+        command = job['command']
+        if QUALITY_FLAG not in command or '--pretrained' in command or '--resume' in command:
+            raise ValueError(f'Expected a fresh quality-rank control: {protocol}')
+        manifest = MANIFESTS[protocol]
+        screen = Path(command[command.index('--owod-screening') + 1])
+        backbone = Path(command[command.index('--backbone-weights') + 1])
+        if (file_sha256(manifest) != job['manifest_sha256'] or file_sha256(screen) != job['screen_sha256']
+                or file_sha256(backbone) != job['backbone_sha256']):
+            raise ValueError(f'Changed paired training inputs: {protocol}')
+        screening_files(manifest, screen, 0)
+        checkpoint = QUALITY_OUTPUT / protocol / 'increment' / 'checkpoint.pth'
+        if file_sha256(checkpoint) != QUALITY_CHECKPOINTS[protocol]:
+            raise ValueError(f'Changed paired quality checkpoint: {protocol}')
+        job['quality_reference_ap50'] = {fold: row['metrics']['known_ap50']
+                                         for fold, row in control['protocols'][protocol].items()}
+        job['quality_reference_sha256'] = QUALITY_CHECKPOINTS[protocol]
+        for fold in job['folds'].values():
+            verified_annotation(fold)
+        command[command.index('--output_dir') + 1] = str((DETACHED_OUTPUT / protocol / 'increment').resolve())
+        command.append('--screen-detach-rank-features')
+    plan.update(commit=subprocess.check_output(['git', 'rev-parse', 'HEAD'], text=True).strip(),
+                device_ids=os.environ['CUDA_VISIBLE_DEVICES'], detached_rank_features=True,
+                quality_comparison_sha256=QUALITY_SHA, holdout_comparison_sha256=HOLDOUT_SHA,
+                factor='Stop the auxiliary small-box ranking gradient at encoder memory. Retain the same quality '
+                       'head and ranking loss. Native localization, quality and decoder supervision train jointly.',
+                decision='Use fixed final checkpoints. Compare known AP50 and released small learned-query coverage '
+                         'to the quality-rank control on each locked fold. Require nondecreasing Known AP50 '
+                         'and learned-slot coverage on every fold, with a coverage gain on at least one fold '
+                         'per protocol. Report withheld metrics and the original '
+                         'four-fold gates as diagnostics. No label-guided reservation at inference.')
+    return plan
+
+
+def released_slot_observer(control, known, threshold, counts):
+    def observe(dataset, samples, targets, candidate, detections, sizes, post):
+        reference = control(samples.to('cuda'))
+        for batch, target in enumerate(targets):
+            height, width = target['orig_size'].tolist()
+            truths = [np.asarray(a['voc_bbox']) for a in dataset.coco.imgToAnns[int(target['image_id'])]
+                      if a['category_id'] in known and not a.get('difficult') and size_group(a) != '32_sq_plus']
+            counts['released_small'] += len(truths)
+            for name, outputs in (('control', reference), ('candidate', candidate)):
+                boxes = outputs['pred_boxes'][batch]
+                learned = torch.ones(len(boxes), dtype=torch.bool, device=boxes.device)
+                active = outputs['geometry']['active'][batch]
+                learned[:len(active)] = ~active
+                coords = voc_coords(boxes[learned], width, height)
+                counts[name] += sum((overlaps(truth, coords) > threshold).any().item() for truth in truths)
+    return observe
+
+
 def evaluate(checkpoint, protocol, job, plan, digest, output):
     checkpoint_sha = file_sha256(checkpoint)
     path = MANIFESTS[protocol]
@@ -119,14 +192,32 @@ def evaluate(checkpoint, protocol, job, plan, digest, output):
         from tools.owod.probe_task1_m_s_refinement_known_dedup import CompeteWithEmittedUnknown
         post_type = CompeteWithEmittedUnknown
     post = post_type(known_ids=manifest['stages'][0]['classes'], scoring='focal', max_detections=plan['limit'])
+    quality_control = None
+    if plan.get('detached_rank_features'):
+        quality_control, _ = load_detector(None, QUALITY_OUTPUT / protocol / 'increment' / 'checkpoint.pth',
+                                           torch.device('cuda'))
+        quality_control.eval()
     folds = {}
     for fold, entry in job['folds'].items():
         dest = output / f'{protocol}-{fold}.json'
         if not dest.exists():
             annotations = verified_annotation(entry)
             print(f'Evaluating {protocol}/{fold} Task 1 endpoint', flush=True)
-            report = measure(model, manifest, root, annotations, plan['batch_size'], plan['limit'], postprocessor=post)
+            counts = Counter()
+            observer = (released_slot_observer(quality_control, manifest['stages'][0]['classes'],
+                                               manifest['evaluation']['iou_threshold'], counts)
+                        if quality_control is not None else None)
+            report = measure(model, manifest, root, annotations, plan['batch_size'], plan['limit'],
+                             observer=observer, postprocessor=post)
             outcome = compare(control[fold], report, plan['gates'])
+            if observer is not None:
+                reference_ap = job['quality_reference_ap50'][fold]
+                if counts['released_small'] == 0:
+                    raise ValueError(f'No released small targets: {protocol}/{fold}')
+                outcome['released_check'] = dict(**counts, control_known_ap50=reference_ap,
+                                                 candidate_known_ap50=report['metrics']['known_ap50'],
+                                                 passed=counts['candidate'] >= counts['control']
+                                                 and report['metrics']['known_ap50'] >= reference_ap)
             reference = job['refinement_reference'][fold]
             outcome.update(metrics=report['metrics'],
                            deltas_vs_refinement={key: report['metrics'][key] - before
@@ -161,14 +252,20 @@ def main():
     modes = parser.add_mutually_exclusive_group()
     modes.add_argument('--match-count', action='store_true')
     modes.add_argument('--small-box-quality', action='store_true')
+    modes.add_argument('--detached-rank', action='store_true')
     args = parser.parse_args()
-    match_count = args.match_count or args.small_box_quality
+    quality = args.small_box_quality or args.detached_rank
+    match_count = args.match_count or quality
     output = MATCHED_COUNT_OUTPUT if match_count else OUTPUT
     if args.small_box_quality:
         output = QUALITY_OUTPUT
-    plan = prepare(output, match_count)
-    if args.small_box_quality:
-        add_quality_arm(plan)
+    if args.detached_rank:
+        output = DETACHED_OUTPUT
+        plan = prepare_detached()
+    else:
+        plan = prepare(output, match_count)
+        if quality:
+            add_quality_arm(plan)
     pin(output / 'plan.json', plan)
     digest = file_sha256(output / 'plan.json')
     protocols = {}
@@ -178,11 +275,18 @@ def main():
         if (not saved.with_box_refine or saved.backbone_weights_sha256 != job['backbone_sha256']
                 or saved.discovery_saliency_top_points != plan['strongest_points']
                 or getattr(saved, 'discovery_saliency_match_count', False) != match_count
-                or getattr(saved, 'screen_small_box_quality_rank', False) != args.small_box_quality):
+                or getattr(saved, 'screen_small_box_quality_rank', False) != quality
+                or getattr(saved, 'screen_detach_rank_features', False) != args.detached_rank):
             raise ValueError(f'Unexpected training endpoint: {protocol}')
         protocols[protocol] = evaluate(checkpoint, protocol, job, plan, digest, output)
-    write_json(output / 'comparison.json', dict(status='complete', plan_sha256=digest, protocols=protocols,
-                                               passed=all(row['passed'] for folds in protocols.values() for row in folds.values())))
+    passed = all(row['passed'] for folds in protocols.values() for row in folds.values())
+    result = dict(status='complete', plan_sha256=digest, protocols=protocols, passed=passed)
+    if args.detached_rank:
+        result['diagnostic_four_fold_passed'] = passed
+        checks = [[row['released_check'] for row in folds.values()] for folds in protocols.values()]
+        result['passed'] = all(all(row['passed'] for row in pair)
+                               and any(row['candidate'] > row['control'] for row in pair) for pair in checks)
+    write_json(output / 'comparison.json', result)
 
 
 if __name__ == '__main__':

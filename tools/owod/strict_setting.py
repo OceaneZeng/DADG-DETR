@@ -58,6 +58,8 @@ def configure_run(args):
         raise ValueError('Instance transfer requires discovery')
     small_box_supervision = (getattr(args, 'screen_small_box_extent', False)
                              or getattr(args, 'screen_small_box_quality_rank', False))
+    if getattr(args, 'screen_detach_rank_features', False) and not getattr(args, 'screen_small_box_quality_rank', False):
+        raise ValueError('Detached rank features require the auxiliary small-box ranking loss')
     if small_box_supervision and not (
             instance_mode != 'legacy' and args.owod_screening and args.owod_manifest
             and args.owod_stage == 0 and args.owod_phase == 'increment' and not args.screen_author_eval):
@@ -338,7 +340,8 @@ def validate_checkpoint(args, checkpoint, resume=False):
                                ('discovery_saliency_top_points', None),
                                ('discovery_saliency_match_count', False),
                                ('screen_small_box_extent', False),
-                               ('screen_small_box_quality_rank', False)):
+                               ('screen_small_box_quality_rank', False),
+                               ('screen_detach_rank_features', False)):
             if getattr(saved, field, default) != getattr(args, field, default):
                 raise ValueError(f'Discovery checkpoint cannot change {field}')
         if (getattr(args, 'discovery_objectness_loss', 'balanced-bce') == 'focal'

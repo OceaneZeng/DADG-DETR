@@ -100,7 +100,8 @@ class DiscoveryDetector(nn.Module):
                 raise ValueError('Mixed instance proposals require one-stage decoder queries')
             # Isolate initialization so common detector and discovery parameters start identically.
             with torch.random.fork_rng(devices=[]):
-                detector.transformer.instance_proposals = InstanceProposals(args.hidden_dim)
+                detector.transformer.instance_proposals = InstanceProposals(
+                    args.hidden_dim, detach_rank_features=getattr(args, 'screen_detach_rank_features', False))
                 self.instance_projection = nn.Linear(args.hidden_dim, SETTINGS['projection_dim'])
                 self.instance_classes = nn.Linear(SETTINGS['projection_dim'], args.num_classes)
             self.transfer_enabled = False

@@ -21,8 +21,9 @@ def select_encoder_cells(boxes, valid_ids, scores, quota, shortlist_multiplier=1
 class InstanceProposals(nn.Module):
     shortlist_multiplier = 12
 
-    def __init__(self, dim):
+    def __init__(self, dim, *, detach_rank_features=False):
         super().__init__()
+        self.detach_rank_features = detach_rank_features
         self.rank_within_level = False
         self.match_encoder_counts = False
         self.finest_anchor_size = 0.05
@@ -113,6 +114,8 @@ class InstanceProposals(nn.Module):
             chosen=index,
             active=active.squeeze(-1),
         )
+        if self.training and self.detach_rank_features:
+            state["rank_logits"] = self.logits(memory.detach(), boxes)
         if self.match_encoder_counts:
             state["natural_counts"] = natural_counts
         return (
@@ -215,7 +218,7 @@ def geometry_losses(state, targets, *, supervise_extent=False, supervise_quality
             accurate = (iou > .5) & (target["source_box_area"] < 32**2)[:, None]
             eligible = accurate.any(dim=1)
             if eligible.any():
-                quality = state["logits"][row]
+                quality = state.get("rank_logits", state["logits"])[row]
                 candidate_scores = quality[near[eligible]].masked_fill(~accurate[eligible], -torch.inf)
                 best = candidate_scores.amax(dim=1)
                 shortlist_size = state["chosen"].shape[1] * InstanceProposals.shortlist_multiplier
