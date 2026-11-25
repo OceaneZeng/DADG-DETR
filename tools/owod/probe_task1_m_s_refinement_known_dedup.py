@@ -43,15 +43,19 @@ class DeduplicateKnown(TopKnownPerQuery):
 
 
 class CompeteWithEmittedUnknown(DeduplicateKnown):
-    def __init__(self, *args, same_query=False, **kwargs):
+    def __init__(self, *args, same_query=False, require_anchor_evidence=False, **kwargs):
         super().__init__(*args, **kwargs)
         self.same_query = same_query
+        self.require_anchor_evidence = require_anchor_evidence
 
     def candidate_scores(self, outputs):
         scores, categories, unknown = super().candidate_scores(outputs)
         known_columns = len(self.known_ids)
         positions = scores.flatten(1).topk(self.max_detections, dim=1).indices
         boxes = box_cxcywh_to_xyxy(outputs['pred_boxes'])
+        if self.require_anchor_evidence:
+            # Both scores share objectness. Compare the logits before suppression.
+            prefers_unknown = outputs['pred_novelty'] > outputs['pred_logits'][..., self.known_ids].amax(-1)
         for batch, ranks in enumerate(positions):
             anchors = ranks[ranks % len(categories) == known_columns] // len(categories)
             if not len(anchors):
@@ -59,9 +63,13 @@ class CompeteWithEmittedUnknown(DeduplicateKnown):
             known = scores[batch, :, :known_columns]
             overlaps = box_iou(boxes[batch].float(), boxes[batch, anchors].float())[0]
             eligible = overlaps > OVERLAP
-            if self.same_query:
+            if self.same_query or self.require_anchor_evidence:
                 queries = torch.arange(len(known), device=anchors.device)
-                eligible = eligible & (queries[:, None] == anchors)
+                same = queries[:, None] == anchors
+                if self.same_query:
+                    eligible = eligible & same
+                else:
+                    eligible = eligible & (same | prefers_unknown[batch, anchors][None])
             precedes = unknown[batch, anchors][None] > known.amax(-1)[:, None]
             suppressed = (eligible & precedes).any(dim=1)
             known.masked_fill_(suppressed[:, None], -torch.inf)
