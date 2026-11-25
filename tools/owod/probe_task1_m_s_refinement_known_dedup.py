@@ -48,8 +48,11 @@ class CompeteWithEmittedUnknown(DeduplicateKnown):
         self.same_query = same_query
         self.require_anchor_evidence = require_anchor_evidence
 
+    def scores_before_competition(self, outputs):
+        return super().candidate_scores(outputs)
+
     def candidate_scores(self, outputs):
-        scores, categories, unknown = super().candidate_scores(outputs)
+        scores, categories, unknown = self.scores_before_competition(outputs)
         known_columns = len(self.known_ids)
         positions = scores.flatten(1).topk(self.max_detections, dim=1).indices
         boxes = box_cxcywh_to_xyxy(outputs['pred_boxes'])

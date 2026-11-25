@@ -77,11 +77,13 @@ class TransferredNoveltyPostprocess(CompeteWithEmittedUnknown):
         return super().candidate_scores(dict(outputs, pred_novelty=outputs['transferred_novelty']))
 
 
-def main():
+def require_one_gpu():
     if torch.cuda.device_count() != 1 or torch.cuda.get_device_name() != 'NVIDIA GeForce RTX 3090':
         raise ValueError('Use one RTX 3090 for the frozen novelty-head comparison')
-    plan = prepare()
-    digest = file_sha256(OUTPUT / 'plan.json')
+
+
+def run(plan, output, processor_type, *, variant='transferred', score_checks=None):
+    digest = file_sha256(output / 'plan.json')
     control, donor = (plan['arms'][key] for key in ('control', 'candidate'))
     binding = dict(plan_sha256=digest, checkpoint_sha256=control['sha256'], donor_sha256=donor['sha256'])
     manifest = verified(MANIFESTS[PROTOCOL], plan['manifest_sha256'])
@@ -93,55 +95,70 @@ def main():
                       native_bias=head.bias.item(), donor_bias=model.donor.bias.item())
     known = manifest['stages'][0]['classes']
     settings = dict(known_ids=known, scoring='focal', max_detections=plan['limit'])
-    grafted = TransferredNoveltyPostprocess(**settings)
+    alternate = processor_type(**settings)
+
+    def save_report(dest, report):
+        if score_checks is not None:
+            report['score_checks'] = score_checks(alternate)
+        write_json(dest, dict(**binding, report=report))
+
     released = Path(plan['holdout'])
     if file_sha256(released) != plan['holdout_sha256']:
         raise ValueError('Changed released-only holdout')
-    dest = OUTPUT / 'released.json'
+    dest = output / 'released.json'
     if not dest.is_file():
-        print('Evaluating frozen S novelty transfer on the released-only holdout', flush=True)
-        report = evaluate_released(model, manifest, released, plan, extra_postprocessors={'transferred': grafted})
-        write_json(dest, dict(**binding, report=report))
+        print(f'Evaluating frozen S novelty {variant} on the released-only holdout', flush=True)
+        report = evaluate_released(model, manifest, released, plan, extra_postprocessors={variant: alternate})
+        save_report(dest, report)
     report = verified_endpoint(dest, binding)
     before = report['emitted']['metrics']['known_ap50']
-    after = report['transferred']['metrics']['known_ap50']
+    after = report[variant]['metrics']['known_ap50']
     small = report['released_small_learned_query_coverage']
     if (before != control['expected_ap'] or small != control['expected_small']
             or report['raw_current_box_recall_iou50'] != control['expected_raw']):
         raise ValueError('Native half-gradient released holdout did not reproduce')
-    released_result = dict(native=before, transferred=after, delta=after - before, small=small,
+    released_result = dict(native=before, **{variant: after}, delta=after - before, small=small,
                            passed=after > plan['min_known_ap50'])
+    if score_checks is not None:
+        released_result['score_checks'] = report['score_checks']
 
     root = resolve_image_root(MANIFESTS[PROTOCOL], manifest)
-    processors = dict(native=CompeteWithEmittedUnknown(**settings), transferred=grafted)
+    processors = {'native': CompeteWithEmittedUnknown(**settings), variant: alternate}
     views = {key: (known, 'focal', plan['limit']) for key in processors}
     folds = {}
     for name, entry in plan['folds'].items():
         path = Path(entry['path'])
         if file_sha256(path) != entry['sha256']:
             raise ValueError(f'Changed S {name} fold')
-        dest = OUTPUT / f'{name}.json'
+        dest = output / f'{name}.json'
         if not dest.is_file():
-            print(f'Evaluating frozen S novelty transfer on the {name} fold', flush=True)
+            print(f'Evaluating frozen S novelty {variant} on the {name} fold', flush=True)
             dataset, loader = make_loader(root, path, plan['batch_size'], 2)
             spec = dict(manifest['evaluation'],
                         image_source_ids=[row['owod_source_id'] for row in dataset.coco.dataset['images']])
             report = evaluate_views(model, loader, dataset.coco, views, spec, [], known, device,
                                     include_current_stats=True, postprocessors=processors, print_freq=128)
-            write_json(dest, dict(**binding, report=report))
+            save_report(dest, report)
         report = verified_endpoint(dest, binding)
         metrics = {view: {key: report[view]['metrics'][key] for key in METRICS} for view in views}
         native = metrics['native']
         if native != plan['fold_native'][name]:
             raise ValueError(f'Native half-gradient metrics did not reproduce on {name}')
-        delta = {key: metrics['transferred'][key] - native[key] for key in METRICS}
+        delta = {key: metrics[variant][key] - native[key] for key in METRICS}
         gates = dict(known_ap50=delta['known_ap50'] >= 0., u_recall=delta['u_recall'] >= 0.,
                      wi=delta['wi'] <= plan['max_wi_increase'],
                      a_ose=delta['a_ose'] <= max(1., plan['max_aose_fraction'] * native['a_ose']))
         folds[name] = dict(metrics=metrics, delta=delta, gates=gates, passed=all(gates.values()))
-    write_json(OUTPUT / 'comparison.json', dict(status='complete', **binding, released=released_result,
+        if score_checks is not None:
+            folds[name]['score_checks'] = report['score_checks']
+    write_json(output / 'comparison.json', dict(status='complete', **binding, released=released_result,
                                                folds=folds, head_stats=head_stats,
                                                passed=released_result['passed'] and all(f['passed'] for f in folds.values())))
+
+
+def main():
+    require_one_gpu()
+    run(prepare(), OUTPUT, TransferredNoveltyPostprocess)
 
 
 if __name__ == '__main__':
