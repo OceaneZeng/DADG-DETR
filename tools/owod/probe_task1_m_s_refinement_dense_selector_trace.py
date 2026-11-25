@@ -6,16 +6,14 @@ import subprocess
 import torch
 
 from tools.owod.probe_task1_m_s_refinement_center_residual import PROTECTED_FIT_OUTPUT, QUARTER_FIT_SHA
-from tools.owod.probe_task1_m_s_refinement_dense_selector import OUTPUT as SELECTOR_OUTPUT, selector_transform
+from tools.owod.probe_task1_m_s_refinement_dense_selector import (
+    OUTPUT as SELECTOR_OUTPUT, SELECTOR_SHA, TRACE_OUTPUT, selector_transform,
+)
 from tools.owod.probe_task1_m_s_refinement_known_dedup import CompeteWithEmittedUnknown
 from tools.owod.probe_task1_m_s_refinement_protected_residual import protect_known
 from tools.owod.probe_task1_m_s_refinement_trajectory import hits, run_released_probe
 from tools.owod.probe_task1_paired_discovery import verified
 from util.box_ops import box_cxcywh_to_xyxy
-
-
-OUTPUT = SELECTOR_OUTPUT.with_name('task1-m-s-refinement-dense-local-selector-trace')
-SELECTOR_SHA = '09094733deb92dce19aca40d1f51237e28c2ca5c3c19923358702a47b3afcd6f'
 
 
 def trace_image(outputs, revised, target, batch, trace, small_area, stats):
@@ -119,7 +117,7 @@ def main():
             raise ValueError(f'Changed frozen released small geometry: {protocol}')
         return result
 
-    run_released_probe(OUTPUT, plan, quarter, verify_measure)
+    run_released_probe(TRACE_OUTPUT, plan, quarter, verify_measure)
 
 
 if __name__ == '__main__':

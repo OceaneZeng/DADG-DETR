@@ -1,11 +1,12 @@
 """Fit a keep-or-replace selector for local full encoder boxes on released images."""
 
+import argparse
 from collections import Counter
 from pathlib import Path
 import subprocess
 
 import torch
-from torch.nn.functional import pad
+from torch.nn.functional import normalize, pad
 
 from tools.owod.gnn_calibration import load_detector
 from tools.owod.probe_task1_m_s_refinement_center_residual import PROTECTED_FIT_OUTPUT, QUARTER_FIT_SHA
@@ -25,7 +26,11 @@ from util.box_ops import box_cxcywh_to_xyxy, box_iou
 
 
 OUTPUT = ORACLE_OUTPUT.with_name('task1-m-s-refinement-dense-local-selector')
+INTERACTION_OUTPUT = OUTPUT.with_name('task1-m-s-refinement-dense-local-interaction')
+TRACE_OUTPUT = OUTPUT.with_name('task1-m-s-refinement-dense-local-selector-trace')
 ORACLE_SHA = 'a1006fe51faa25998a625a0b1361670eb0e39a2f445e997da80d0efafe3fb6db'
+SELECTOR_SHA = '09094733deb92dce19aca40d1f51237e28c2ca5c3c19923358702a47b3afcd6f'
+TRACE_SHA = 'cbc7d7808f8e338b8150a6589cf7b94473f940e2f8975415fa14f55060eb642e'
 
 
 def candidate_cells(outputs, batch, row, known):
@@ -38,7 +43,7 @@ def candidate_cells(outputs, batch, row, known):
     return queries, near
 
 
-def features(outputs, batch, queries, cells, known):
+def features(outputs, batch, queries, cells, known, *, interaction=False):
     native = outputs['pred_boxes'][batch, queries, None]
     geometry = outputs['geometry']
     candidate = geometry['boxes'][batch, cells]
@@ -49,11 +54,14 @@ def features(outputs, batch, queries, cells, known):
     score = torch.stack((outputs['pred_logits'][batch, queries][:, known].amax(dim=1),
                          outputs['pred_objectness'][batch, queries], outputs['pred_novelty'][batch, queries],
                          outputs['geometry_quality'][batch, queries]), dim=1)
-    return torch.cat((query, encoder, geometry['logits'][batch, cells, None],
-                      score[:, None].expand(-1, cells.shape[1], -1),
-                      native_extent.log().expand_as(candidate_extent),
-                      (candidate_extent / native_extent).log(),
-                      (candidate[..., :2] - native[..., :2]) / native_extent), dim=-1).float()
+    values = [query, encoder, geometry['logits'][batch, cells, None],
+              score[:, None].expand(-1, cells.shape[1], -1),
+              native_extent.log().expand_as(candidate_extent),
+              (candidate_extent / native_extent).log(),
+              (candidate[..., :2] - native[..., :2]) / native_extent]
+    if interaction:
+        values.append(normalize(query.float(), dim=-1) * normalize(encoder.float(), dim=-1))
+    return torch.cat(values, dim=-1).float()
 
 
 @torch.no_grad()
@@ -88,7 +96,8 @@ def fit_examples(model, loader, post, known, plan, device):
                 keep = torch.cat((keep[hard].reshape(1), keep[sample[sample != hard][:1]]))
             fit = torch.cat((torch.where(learned)[0], keep))
             padding = (0, 16 - cells.shape[1])
-            examples.append(pad(features(outputs, batch, queries[fit], cells[fit], known), (0, 0, *padding)).cpu())
+            values = features(outputs, batch, queries[fit], cells[fit], known, interaction=plan.get('interaction', False))
+            examples.append(pad(values, (0, 0, *padding)).cpu())
             preferred.append(pad(moves[fit], padding).cpu())
             eligible.append(pad(torch.ones_like(moves[fit]), padding).cpu())
         fit_count += len(targets)
@@ -110,7 +119,8 @@ def selector_transform(params, post, known, device, *, observe=None):
             queries, cells = candidate_cells(outputs, batch, row, known)
             if not cells.numel():
                 continue
-            values = (features(outputs, batch, queries, cells, known) - mean) / scale
+            values = features(outputs, batch, queries, cells, known, interaction=params.get('interaction', False))
+            values = (values - mean) / scale
             logits = values @ weight + params['bias']
             best, candidate = logits.max(dim=1)
             if observe is not None:
@@ -124,6 +134,9 @@ def selector_transform(params, post, known, device, *, observe=None):
 
 
 def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--interaction', action='store_true')
+    args = parser.parse_args()
     if torch.cuda.device_count() != 1 or torch.cuda.get_device_name() != 'NVIDIA GeForce RTX 3090':
         raise ValueError('Use one RTX 3090 for the released dense local chooser')
     oracle = verified(ORACLE_OUTPUT / 'comparison.json', ORACLE_SHA)
@@ -141,12 +154,26 @@ def main():
                        'Include all positive query groups and two keep groups per image if available.',
                 selector_negative_cost=NEGATIVE_COST, selector_l2=L2,
                 advance='Use the locked joint released dense and known Top-50 gates on the disjoint replay.')
-    pin(OUTPUT / 'plan.json', plan)
-    digest = file_sha256(OUTPUT / 'plan.json')
+    output = OUTPUT
+    if args.interaction:
+        baseline = verified(OUTPUT / 'comparison.json', SELECTOR_SHA)
+        baseline_plan = verified(OUTPUT / 'plan.json', baseline['plan_sha256'])
+        trace = verified(TRACE_OUTPUT / 'comparison.json', TRACE_SHA)
+        fixed = ('jobs', 'seed', 'images', 'fit_images', 'fit_order_sha256', 'batch_size', 'limit',
+                 'small_area', 'selector_negative_cost', 'selector_l2')
+        if (baseline['status'] != 'complete' or baseline['passed'] or trace['status'] != 'complete'
+                or any(plan[key] != baseline_plan[key] for key in fixed)):
+            raise ValueError('Expected the stopped local fit and matching attribution')
+        output = INTERACTION_OUTPUT
+        plan.update(interaction=True, selector_sha256=SELECTOR_SHA, trace_sha256=TRACE_SHA,
+                    factor='Append the per-channel product of L2-normalized frozen decoder query and candidate '
+                           'encoder vectors. Keep paired examples, grouped objective and the zero keep logit.')
+    pin(output / 'plan.json', plan)
+    digest = file_sha256(output / 'plan.json')
     device = torch.device('cuda')
     protocols = {}
     for protocol, job in plan['jobs'].items():
-        dest = OUTPUT / f'{protocol}.json'
+        dest = output / f'{protocol}.json'
         if not dest.exists():
             path = MANIFESTS[protocol]
             manifest = verified(path, job['manifest_sha256'])
@@ -166,6 +193,11 @@ def main():
             post = CompeteWithEmittedUnknown(known_ids=known, scoring='focal', max_detections=plan['limit'])
             print(f'Fitting {protocol} local full-box selector', flush=True)
             params = fit_query_choice(*fit_examples(model, fit, post, known, plan, device))
+            if args.interaction:
+                old = baseline['protocols'][protocol]['selector']
+                if any(params[key] != old[key] for key in ('positive', 'negative')):
+                    raise ValueError(f'Changed released fit group counts: {protocol}')
+                params['interaction'] = True
             counts = Counter(restored_known_queries=0, reverted_images=0)
             transform = protect_known(selector_transform(params, post, known, device), post, known, counts)
             print(f'Evaluating {protocol} frozen local full-box selector', flush=True)
@@ -185,7 +217,7 @@ def main():
         if report['plan_sha256'] != digest:
             raise ValueError(f'Changed dense local selector plan: {dest}')
         protocols[protocol] = {key: report[key] for key in ('selector', 'groups', 'changes', 'protection', 'passed')}
-    write_json(OUTPUT / 'comparison.json', dict(status='complete', plan_sha256=digest, protocols=protocols,
+    write_json(output / 'comparison.json', dict(status='complete', plan_sha256=digest, protocols=protocols,
                                                passed=all(row['passed'] for row in protocols.values())))
 
 
