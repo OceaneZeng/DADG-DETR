@@ -1,5 +1,6 @@
 """Train the S Task 1 midpoint between full and stopped ranking gradients."""
 
+import argparse
 import os
 import subprocess
 from pathlib import Path
@@ -22,7 +23,7 @@ INDEPENDENT_SHA = '66a3df5d4fe4fc4f521a59c8b4dc9f0924c6701e97d94afeded9e85835eb3
 SCALE = 0.5
 
 
-def prepare():
+def prepare(output):
     devices = os.environ.get('CUDA_VISIBLE_DEVICES', '').split(',')
     gpu_names = [torch.cuda.get_device_name(i) for i in range(torch.cuda.device_count())]
     if gpu_names != ['NVIDIA GeForce RTX 3090'] * 2 or len(set(devices)) != 2 or not all(d.isdecimal() for d in devices):
@@ -47,7 +48,7 @@ def prepare():
         raise ValueError('Changed fresh training inputs')
     manifest = verified(manifest_path, reference['manifest_sha256'])
     screening_files(manifest_path, screen, 0)
-    command[command.index('--output_dir') + 1] = str((OUTPUT / PROTOCOL / 'increment').resolve())
+    command[command.index('--output_dir') + 1] = str(output / PROTOCOL / 'increment')
     command.extend(['--screen-rank-feature-grad-scale', str(SCALE)])
     best_ap = max(arm['known_ap50'] for arm in comparison['arms'].values())
     best_small = max(arm['small']['covered'] for arm in comparison['arms'].values())
@@ -63,8 +64,12 @@ def prepare():
 
 
 def main():
-    plan, manifest, annotations = prepare()
-    plan_path = OUTPUT / 'plan.json'
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--output-dir', type=Path, default=OUTPUT,
+                        help='Use a new directory for a fresh attempt with different hardware')
+    output = parser.parse_args().output_dir.resolve()
+    plan, manifest, annotations = prepare(output)
+    plan_path = output / 'plan.json'
     pin(plan_path, plan)
     plan_sha = file_sha256(plan_path)
     print(f'Fitting S Task 1 with auxiliary rank feature gradient scale {SCALE}', flush=True)
@@ -72,7 +77,7 @@ def main():
     if saved.backbone_weights_sha256 != plan['backbone_sha256'] or saved.screen_rank_feature_grad_scale != SCALE:
         raise ValueError('Unexpected final midpoint checkpoint')
     checkpoint_sha = file_sha256(checkpoint)
-    endpoint = OUTPUT / 'independent.json'
+    endpoint = output / 'independent.json'
     if not endpoint.is_file():
         print('Evaluating S Task 1 midpoint on the pinned independent holdout', flush=True)
         model, _ = load_detector(None, checkpoint, torch.device('cuda'))
@@ -88,7 +93,7 @@ def main():
         raise ValueError('Midpoint coverage denominator differs from the independent controls')
     passed = (ap >= plan['min_known_ap50'] and coverage['covered'] >= plan['min_small_coverage']
               and (ap > plan['min_known_ap50'] or coverage['covered'] > plan['min_small_coverage']))
-    write_json(OUTPUT / 'comparison.json', dict(status='complete', plan_sha256=plan_sha, passed=passed,
+    write_json(output / 'comparison.json', dict(status='complete', plan_sha256=plan_sha, passed=passed,
                                                checkpoint_sha256=checkpoint_sha, known_ap50=ap, small=coverage))
 
 
