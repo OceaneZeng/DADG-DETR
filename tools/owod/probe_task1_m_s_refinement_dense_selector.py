@@ -99,7 +99,7 @@ def fit_examples(model, loader, post, known, plan, device):
     return torch.cat(examples), torch.cat(preferred), torch.cat(eligible)
 
 
-def selector_transform(params, post, known, device):
+def selector_transform(params, post, known, device, *, observe=None):
     mean, scale, weight = (torch.tensor(params[key], device=device) for key in ('mean', 'scale', 'weight'))
 
     def transform(outputs):
@@ -113,6 +113,8 @@ def selector_transform(params, post, known, device):
             values = (features(outputs, batch, queries, cells, known) - mean) / scale
             logits = values @ weight + params['bias']
             best, candidate = logits.max(dim=1)
+            if observe is not None:
+                observe(batch, queries, cells, best, candidate)
             replace = best > 0
             chosen = cells[replace, candidate[replace]]
             revised[batch, queries[replace]] = outputs['geometry']['boxes'][batch, chosen]
