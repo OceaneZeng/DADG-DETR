@@ -120,14 +120,16 @@ def prepare():
     return plan, manifest, annotation_path
 
 
-def evaluate(model, manifest, path, plan, *, trace_query_origin=False):
+def evaluate(model, manifest, path, plan, *, trace_query_origin=False, extra_postprocessors=None):
     known = manifest['stages'][0]['classes']
     threshold = manifest['evaluation']['iou_threshold']
     root = resolve_image_root(MANIFESTS[PROTOCOL], manifest)
     dataset, loader = make_loader(root, path, plan['batch_size'], 2)
     spec = dict(manifest['evaluation'], known_only_screening=True, diagnostic_current_precision=True,
                 image_source_ids=[row['owod_source_id'] for row in dataset.coco.dataset['images']])
-    post = CompeteWithEmittedUnknown(known_ids=known, scoring='focal', max_detections=plan['limit'])
+    processors = dict(emitted=CompeteWithEmittedUnknown(known_ids=known, scoring='focal', max_detections=plan['limit']))
+    if extra_postprocessors:
+        processors.update(extra_postprocessors)
     small = Counter(released=0, covered=0)
     origins = {}
 
@@ -155,9 +157,10 @@ def evaluate(model, manifest, path, plan, *, trace_query_origin=False):
                         image_id=image, size=size_group(annotation), learned=hit,
                         proposal=(overlaps(truth, proposal_coords) > threshold).any().item())
 
-    report = evaluate_views(model, loader, dataset.coco, {'emitted': (known, 'focal', plan['limit'])},
+    views = {name: (known, 'focal', plan['limit']) for name in processors}
+    report = evaluate_views(model, loader, dataset.coco, views,
                             spec, [], known, torch.device('cuda'), include_current_stats=True,
-                            postprocessors={'emitted': post}, print_freq=128, rank_observer=observe)
+                            postprocessors=processors, print_freq=128, rank_observer=observe)
     report['released_small_learned_query_coverage'] = small
     if trace_query_origin:
         if len(origins) != small['released']:
