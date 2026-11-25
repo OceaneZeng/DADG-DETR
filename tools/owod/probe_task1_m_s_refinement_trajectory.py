@@ -2,11 +2,13 @@
 
 from collections import Counter
 from pathlib import Path
+import argparse
 import subprocess
 
 from scipy.optimize import linear_sum_assignment
 import torch
 
+from models.graph_local.instance_proposals import nearby_anchor_ids
 from tools.owod.gnn_calibration import load_detector
 from tools.owod.probe_task1_m_s_refinement_center_range import FIT_PAIRING_OUTPUT
 from tools.owod.probe_task1_m_s_refinement_center_residual import PROTECTED_FIT_OUTPUT, QUARTER_FIT_SHA
@@ -21,7 +23,9 @@ from util.box_ops import box_cxcywh_to_xyxy, box_iou
 
 
 OUTPUT = FIT_PAIRING_OUTPUT.with_name('task1-m-s-refinement-released-trajectory')
+CAPACITY_OUTPUT = OUTPUT.with_name('task1-m-s-refinement-dense-query-capacity')
 PAIRING_SHA = '772696e1673d5a7f55bf581ac2c968b8c7d5038f3f80564c84679ba14c55d450'
+TRAJECTORY_SHA = '9c75b77658887154593d2b2d13fc6717a71142284fec71a9935315be123f9378'
 STAGES = ('selected_seed', 'decoder_1', 'decoder_2', 'decoder_3', 'decoder_4', 'decoder_5')
 GROUPS = ('under_16_sq', '16_to_32_sq', 'all_small')
 
@@ -31,9 +35,57 @@ def hits(boxes, truth):
 
 
 def matched_targets(edges):
-    values = edges.cpu().numpy()
+    values = edges[edges.any(dim=1)].cpu().numpy()
     queries, targets = linear_sum_assignment(values, maximize=True)
     return int(values[queries, targets].sum())
+
+
+def dense_image(final, geometry, batch, target, scored, columns, small_area, groups, coverage, multiplier):
+    truth = box_cxcywh_to_xyxy(target['boxes'].cuda())
+    source_area = target['source_box_area'].cuda()
+    native = hits(final, truth)
+    covered = native.any(dim=0)
+    small = source_area < small_area
+    coverage.update(gt=int(small.sum()), final=int((small & covered).sum()))
+    misses = small & ~covered
+    if not misses.any():
+        return
+    boxes = geometry['boxes'][batch]
+    anchors = geometry['anchors'][batch]
+    valid = torch.where(geometry['valid'][batch])[0]
+    scores = geometry['logits'][batch, valid]
+    shortlist = scores.topk(min(len(scores), geometry['chosen'].shape[1] * multiplier)).indices
+    selected = geometry['chosen'][batch, geometry['active'][batch]]
+    selected_at = torch.searchsorted(valid, selected)
+    if not torch.isin(selected_at, shortlist).all():
+        raise ValueError('Selected cells are outside the reconstructed native shortlist')
+    accurate = hits(boxes[valid], truth[misses])
+
+    queries = torch.arange(len(final), device=final.device)
+    emitted_queries = scored['top_indices'] // columns
+    emitted_unknown = scored['labels'] == 91
+    eligible = ~native.any(dim=1) & ~torch.isin(queries, emitted_queries[~emitted_unknown])
+    eligible_unknown = eligible & torch.isin(queries, emitted_queries[emitted_unknown])
+    anchor_area = anchors[0, 2:].prod()
+    finest = geometry['masks'][0][batch].numel()
+    fine_cells = valid[(valid < finest) & (boxes[valid, 2:].prod(dim=1) <= anchor_area)]
+    near = nearby_anchor_ids(final[eligible], anchors, fine_cells)
+    local = accurate[torch.searchsorted(valid, near)].any(dim=1)
+
+    for name, mask in zip(GROUPS, (source_area < 16**2, source_area >= 16**2, small), strict=True):
+        wanted = mask[misses]
+        dense = accurate[:, wanted]
+        unique_cells = matched_targets(dense)
+        local_edges = local[:, wanted]
+        groups[name].update(
+            misses=int(wanted.sum()), dense_targets=int(dense.any(dim=0).sum()),
+            shortlist_targets=int(dense[shortlist].any(dim=0).sum()),
+            selected_targets=int(dense[selected_at].any(dim=0).sum()),
+            global_cell_matched=unique_cells, global_query_matched=min(unique_cells, int(eligible.sum())),
+            global_unknown_matched=min(unique_cells, int(eligible_unknown.sum())),
+            local_targets=int(local_edges.any(dim=0).sum()), local_query_matched=matched_targets(local_edges),
+            local_unknown_matched=matched_targets(local_edges[eligible_unknown[eligible]]),
+        )
 
 
 def trace_image(final, layers, geometry, batch, target, scored, columns, small_area, groups, coverage):
@@ -79,11 +131,14 @@ def trace_image(final, layers, geometry, batch, target, scored, columns, small_a
 
 
 @torch.inference_mode()
-def measure(model, loader, known, plan):
+def measure(model, loader, known, plan, *, dense_capacity=False):
     post = CompeteWithEmittedUnknown(known_ids=known, scoring='focal', max_detections=plan['limit'])
     groups = {name: Counter() for name in GROUPS}
     coverage = Counter()
     observed = 0
+    proposals = model.detr.transformer.instance_proposals
+    if dense_capacity and proposals.rank_within_level:
+        raise ValueError('The released diagnostic expects native global shortlist ranking')
     for step, (samples, targets) in enumerate(loader, 1):
         outputs = model(samples.to('cuda'))
         final = outputs['pred_boxes']
@@ -92,8 +147,12 @@ def measure(model, loader, known, plan):
             raise ValueError('Expected all five earlier boxes from the locked six-layer decoder')
         scored = post(outputs, final.new_ones((len(targets), 2)), include_top_indices=True)
         for batch, (target, row) in enumerate(zip(targets, scored, strict=True)):
-            trace_image(final[batch], [layer[batch] for layer in layers], outputs['geometry'], batch, target, row,
-                        len(known) + 1, plan['small_area'], groups, coverage)
+            if dense_capacity:
+                dense_image(final[batch], outputs['geometry'], batch, target, row, len(known) + 1,
+                            plan['small_area'], groups, coverage, proposals.shortlist_multiplier)
+            else:
+                trace_image(final[batch], [layer[batch] for layer in layers], outputs['geometry'], batch, target, row,
+                            len(known) + 1, plan['small_area'], groups, coverage)
         observed += len(targets)
         if step % 64 == 0 or step == len(loader):
             print(f'Inference {step}/{len(loader)} batches', flush=True)
@@ -103,6 +162,9 @@ def measure(model, loader, known, plan):
 
 
 def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--dense-capacity', action='store_true')
+    args = parser.parse_args()
     if torch.cuda.device_count() != 1 or torch.cuda.get_device_name() != 'NVIDIA GeForce RTX 3090':
         raise ValueError('Use one RTX 3090 for the released trajectory replay')
     pairing = verified(FIT_PAIRING_OUTPUT / 'comparison.json', PAIRING_SHA)
@@ -116,12 +178,25 @@ def main():
                         'on the same query while preserving its existing hits and native known output boxes.',
                 advance='Check one-to-one geometric headroom before fitting any box choice. Candidate edges use released '
                         'labels. Native emitted unknown counts are geometry bounds before any rescoring or suppression.')
-    pin(OUTPUT / 'plan.json', plan)
-    digest = file_sha256(OUTPUT / 'plan.json')
+    output = OUTPUT
+    if args.dense_capacity:
+        trajectory = verified(OUTPUT / 'comparison.json', TRAJECTORY_SHA)
+        trajectory_plan = verified(OUTPUT / 'plan.json', trajectory['plan_sha256'])
+        if trajectory['status'] != 'complete' or any(plan[key] != trajectory_plan[key] for key in ('jobs', 'seed', 'images')):
+            raise ValueError('Expected the same frozen trajectory replay inputs')
+        plan.update(trajectory_sha256=TRAJECTORY_SHA,
+                    factor='Trace final small misses through valid dense encoder boxes, the native shortlist, and selection. '
+                           'Count geometry that fits unprotected query slots with no native hit, including a fixed native '
+                           'Top-50 unknown subset. The local bound uses the 16 nearest eligible fine-level anchors.',
+                    advance='Compare global and local geometry capacity. Local matching can reuse encoder cells, '
+                            'and both bounds precede the output postprocessor.')
+        output = CAPACITY_OUTPUT
+    pin(output / 'plan.json', plan)
+    digest = file_sha256(output / 'plan.json')
     protocols = {}
     device = torch.device('cuda')
     for protocol, job in plan['jobs'].items():
-        dest = OUTPUT / f'{protocol}.json'
+        dest = output / f'{protocol}.json'
         if not dest.exists():
             manifest_path = MANIFESTS[protocol]
             manifest = verified(manifest_path, job['manifest_sha256'])
@@ -134,8 +209,9 @@ def main():
                 raise ValueError(f'Changed released replay order: {protocol}')
             model, _ = load_detector(None, checkpoint, device)
             model.eval()
-            print(f'Tracing {protocol} released decoder geometry', flush=True)
-            report = measure(model, loader, job['classes'], plan)
+            print(f'Tracing {protocol} released ' + ('dense query capacity' if args.dense_capacity else 'decoder geometry'),
+                  flush=True)
+            report = measure(model, loader, job['classes'], plan, dense_capacity=args.dense_capacity)
             reference = quarter['protocols'][protocol]['groups']['small']
             if any(report['coverage'][key] != reference[key] for key in ('gt', 'final')):
                 raise ValueError(f'Changed native small box geometry: {protocol}')
@@ -145,7 +221,7 @@ def main():
         if report['plan_sha256'] != digest:
             raise ValueError(f'Changed released trajectory plan: {dest}')
         protocols[protocol] = {key: report[key] for key in ('groups', 'coverage')}
-    write_json(OUTPUT / 'comparison.json', dict(status='complete', plan_sha256=digest, protocols=protocols))
+    write_json(output / 'comparison.json', dict(status='complete', plan_sha256=digest, protocols=protocols))
 
 
 if __name__ == '__main__':
