@@ -157,7 +157,7 @@ def main():
     run_injection(output, plan, quarter, args.native_selection)
 
 
-def measure_injection(model, loader, known, plan, protocol, native_selection, select=choose_native):
+def measure_injection(model, loader, known, plan, protocol, native_selection, select=choose_native, *, observe=None):
     counts = Counter()
     post = CompeteWithEmittedUnknown(known_ids=known, scoring='focal', max_detections=plan['limit'])
     columns = len(known) + 1
@@ -177,6 +177,8 @@ def measure_injection(model, loader, known, plan, protocol, native_selection, se
             if picked is not None:
                 candidates[batch] = picked
         if not candidates:
+            if observe is not None:
+                observe(post, native, native, candidates, targets)
             return native
         positions = {batch: entry[0] for batch, entry in candidates.items()}
         replacements = {batch: entry[1] for batch, entry in candidates.items()}
@@ -189,6 +191,8 @@ def measure_injection(model, loader, known, plan, protocol, native_selection, se
         if (not torch.equal(revised['geometry']['active'], native['geometry']['active'])
                 or not torch.equal(revised['geometry']['chosen'], expected)):
             raise ValueError('Replacement changed the original query budget or untouched cells')
+        if observe is not None:
+            observe(post, native, revised, candidates, targets)
         if native_selection:
             counts['replacement_slots'] += sum(len(entry[0]) for entry in candidates.values())
             candidates = {
