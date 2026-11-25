@@ -154,7 +154,13 @@ def main():
                     advance='Use the same accepted released dense and known Top-50 gates. Compare new seed hits '
                             'and same-slot transfer with the label-guided fixed-budget reference.')
 
+    run_injection(output, plan, quarter, args.native_selection)
+
+
+def run_injection(output, plan, baseline, native_selection, selectors=None):
     def replay(model, loader, known, plan):
+        protocol = next(name for name, job in plan['jobs'].items() if job['classes'] == known)
+        select = choose_native if selectors is None else selectors[protocol]
         counts = Counter()
         post = CompeteWithEmittedUnknown(known_ids=known, scoring='focal', max_detections=plan['limit'])
         columns = len(known) + 1
@@ -169,7 +175,7 @@ def main():
                 truth = box_cxcywh_to_xyxy(target['boxes'].cuda())
                 truths.append(truth)
                 small = target['source_box_area'].cuda() < plan['small_area']
-                picked = (choose_native(native, batch, detections[batch], columns) if args.native_selection
+                picked = (select(native, batch, detections[batch], columns) if native_selection
                           else choose(native, batch, truth, small, detections[batch], columns, counts))
                 if picked is not None:
                     candidates[batch] = picked
@@ -186,7 +192,7 @@ def main():
             if (not torch.equal(revised['geometry']['active'], native['geometry']['active'])
                     or not torch.equal(revised['geometry']['chosen'], expected)):
                 raise ValueError('Replacement changed the original query budget or untouched cells')
-            if args.native_selection:
+            if native_selection:
                 counts['replacement_slots'] += sum(len(entry[0]) for entry in candidates.values())
                 candidates = {
                     batch: match_new_seeds(native, batch, slots, cells, truths[batch],
@@ -197,20 +203,23 @@ def main():
             return revised
 
         report = measure(model, known, loader, plan, replay=predict)
-        protocol = next(name for name, job in plan['jobs'].items() if job['classes'] == known)
         groups = report['groups']
-        reference = quarter['protocols'][protocol]['groups']
+        reference = baseline['protocols'][protocol]['groups']
         if any(row['native_known_tp'] != reference[name]['native_known_tp'] for name, row in groups.items()):
             raise ValueError(f'Changed native class matches: {protocol}')
         groups['transfer'] = counts
         groups['changes'] = report['changes']
-        if args.native_selection:
+        if selectors is not None:
+            actual = dict(placed=counts['replacement_slots'], matched=counts['assigned'])
+            if actual != plan['expected_reservations'][protocol]:
+                raise ValueError(f'Changed frozen readout selection or slot budget: {protocol}')
+        if native_selection:
             groups['passed'] = (groups['small']['revised'] - groups['small']['final'] >= int(protocol == 's-owodb')
                                 and all(groups[name]['revised_known_tp'] >= groups[name]['native_known_tp']
                                         for name in ('all', 'small')))
         return dict(groups=groups, coverage={key: groups['small'][key] for key in ('gt', 'final')})
 
-    run_released_probe(output, plan, quarter, replay)
+    run_released_probe(output, plan, baseline, replay)
 
 
 if __name__ == '__main__':

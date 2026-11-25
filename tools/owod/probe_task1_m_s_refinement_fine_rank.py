@@ -12,7 +12,7 @@ from tools.owod.gnn_calibration import load_detector
 from tools.owod.probe_task1_m_s_refinement_center_selector import L2, NEGATIVE_COST, fit_selector, source_ids
 from tools.owod.probe_task1_m_s_refinement_dense_oracle import positive_pairs
 from tools.owod.probe_task1_m_s_refinement_fixed_injection import (
-    MAX_REPLACEMENTS, NATIVE_OUTPUT, choose_native, fine_candidates,
+    MAX_REPLACEMENTS, NATIVE_OUTPUT, choose_native, fine_candidates, run_injection,
 )
 from tools.owod.probe_task1_m_s_refinement_known_dedup import CompeteWithEmittedUnknown
 from tools.owod.probe_task1_m_s_refinement_pseudo_scores import training_loader
@@ -27,6 +27,8 @@ from util.box_ops import box_cxcywh_to_xyxy, box_iou
 
 OUTPUT = NATIVE_OUTPUT.with_name('task1-m-s-refinement-fine-seed-rank')
 MINED_OUTPUT = OUTPUT.with_name('task1-m-s-refinement-fine-seed-mining')
+DECODER_OUTPUT = OUTPUT.with_name('task1-m-s-refinement-mined-seed-decoder')
+MINED_SHA = '42f34515a38ed5adcabaef50cb75090e4110322cf5af719edf5806e7226188ce'
 RANK_SHA = '5036b6c15283f3ea603a862a684baa50e5c9592c645948d89f2a58cd48012759'
 RESERVATION_SHA = '1e8b6b879f13943ba41338595391500d7158869f55143cdf1be62b6d81451bd3'
 POSITIVES_PER_TARGET = 4
@@ -58,6 +60,34 @@ def readout_score(params):
         return ((values - mean) / scale) @ weight + params['bias']
 
     return score
+
+
+def mined_selector(params):
+    score = readout_score(params)
+
+    def select(native, batch, detections, columns):
+        geometry = native['geometry']
+        values = features(geometry, batch, fine_candidates(geometry, batch))
+        return choose_native(native, batch, detections, columns, scores=score(values))
+
+    return select
+
+
+def replay_mined_decoder(reservation):
+    result = verified(MINED_OUTPUT / 'comparison.json', MINED_SHA)
+    plan = verified(MINED_OUTPUT / 'plan.json', result['plan_sha256'])
+    if (result['status'] != 'complete' or not result['passed'] or plan['reservation_sha256'] != RESERVATION_SHA
+            or plan['rank_sha256'] != RANK_SHA or set(result['protocols']) != set(plan['jobs'])):
+        raise ValueError('Expected successful paired released ranking with the original reservation')
+    selectors = {key: mined_selector(row['ranker']) for key, row in result['protocols'].items()}
+    plan.update(commit=subprocess.check_output(['git', 'rev-parse', 'HEAD'], text=True).strip(),
+                mined_sha256=MINED_SHA,
+                expected_reservations={key: row['arms']['readout'] for key, row in result['protocols'].items()},
+                factor='Use the pinned mined ranker per protocol for the fixed reservation and rerun the decoder. '
+                       'Compare released small localization and class-correct Top-50 to the unmodified detector.',
+                advance='Require increased small final coverage on S, no loss on M, and no decline in small or '
+                        'all class-correct Top-50 matches on either protocol. Trace actual same-slot emissions.')
+    run_injection(DECODER_OUTPUT, plan, reservation, native_selection=True, selectors=selectors)
 
 
 @torch.no_grad()
@@ -156,8 +186,11 @@ def measure(model, loader, post, params, known, plan, *, trace=False):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--mine-negatives', action='store_true')
-    mining = parser.parse_args().mine_negatives
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument('--mine-negatives', action='store_true')
+    mode.add_argument('--decoder-replay', action='store_true')
+    args = parser.parse_args()
+    mining = args.mine_negatives
     output = MINED_OUTPUT if mining else OUTPUT
     if torch.cuda.device_count() != 1 or torch.cuda.get_device_name() != 'NVIDIA GeForce RTX 3090':
         raise ValueError('Use one RTX 3090 for released fine-level ranking')
@@ -165,6 +198,9 @@ def main():
     plan = verified(NATIVE_OUTPUT / 'plan.json', source['plan_sha256'])
     if source['status'] != 'complete' or all(row['groups']['passed'] for row in source['protocols'].values()):
         raise ValueError('Expected the failed native fine-level reservation')
+    if args.decoder_replay:
+        replay_mined_decoder(source)
+        return
     plan.update(commit=subprocess.check_output(['git', 'rev-parse', 'HEAD'], text=True).strip(),
                 reservation_sha256=RESERVATION_SHA, positives_per_target=POSITIVES_PER_TARGET,
                 negatives_per_image=NEGATIVES_PER_IMAGE, l2=L2, negative_cost=NEGATIVE_COST,
