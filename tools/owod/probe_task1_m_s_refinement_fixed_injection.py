@@ -157,67 +157,74 @@ def main():
     run_injection(output, plan, quarter, args.native_selection)
 
 
+def measure_injection(model, loader, known, plan, protocol, native_selection, select=choose_native):
+    counts = Counter()
+    post = CompeteWithEmittedUnknown(known_ids=known, scoring='focal', max_detections=plan['limit'])
+    columns = len(known) + 1
+    proposal = model.detr.transformer.instance_proposals
+
+    def predict(samples, native, targets):
+        final = native['pred_boxes']
+        detections = post(native, final.new_ones((len(targets), 2)), include_top_indices=True)
+        candidates = {}
+        truths = []
+        for batch, target in enumerate(targets):
+            truth = box_cxcywh_to_xyxy(target['boxes'].cuda())
+            truths.append(truth)
+            small = target['source_box_area'].cuda() < plan['small_area']
+            picked = (select(native, batch, detections[batch], columns) if native_selection
+                      else choose(native, batch, truth, small, detections[batch], columns, counts))
+            if picked is not None:
+                candidates[batch] = picked
+        if not candidates:
+            return native
+        positions = {batch: entry[0] for batch, entry in candidates.items()}
+        replacements = {batch: entry[1] for batch, entry in candidates.items()}
+        hook = partial(replace_cells, replacements=replacements, positions=positions)
+        with proposal.register_forward_hook(hook):
+            revised = model(samples)
+        expected = native['geometry']['chosen'].clone()
+        for batch, (slots, cells, _) in candidates.items():
+            expected[batch, slots] = cells
+        if (not torch.equal(revised['geometry']['active'], native['geometry']['active'])
+                or not torch.equal(revised['geometry']['chosen'], expected)):
+            raise ValueError('Replacement changed the original query budget or untouched cells')
+        if native_selection:
+            counts['replacement_slots'] += sum(len(entry[0]) for entry in candidates.values())
+            candidates = {
+                batch: match_new_seeds(native, batch, slots, cells, truths[batch],
+                                       targets[batch]['source_box_area'].cuda() < plan['small_area'])
+                for batch, (slots, cells, _) in candidates.items()
+            }
+        record(revised, candidates, truths, post, columns, counts)
+        return revised
+
+    report = measure(model, known, loader, plan, replay=predict)
+    groups = report['groups']
+    groups['transfer'] = counts
+    groups['changes'] = report['changes']
+    if native_selection:
+        groups['passed'] = (groups['small']['revised'] - groups['small']['final'] >= int(protocol == 's-owodb')
+                            and all(groups[name]['revised_known_tp'] >= groups[name]['native_known_tp']
+                                    for name in ('all', 'small')))
+    return dict(groups=groups, coverage={key: groups['small'][key] for key in ('gt', 'final')})
+
+
 def run_injection(output, plan, baseline, native_selection, selectors=None):
     def replay(model, loader, known, plan):
         protocol = next(name for name, job in plan['jobs'].items() if job['classes'] == known)
         select = choose_native if selectors is None else selectors[protocol]
-        counts = Counter()
-        post = CompeteWithEmittedUnknown(known_ids=known, scoring='focal', max_detections=plan['limit'])
-        columns = len(known) + 1
-        proposal = model.detr.transformer.instance_proposals
-
-        def predict(samples, native, targets):
-            final = native['pred_boxes']
-            detections = post(native, final.new_ones((len(targets), 2)), include_top_indices=True)
-            candidates = {}
-            truths = []
-            for batch, target in enumerate(targets):
-                truth = box_cxcywh_to_xyxy(target['boxes'].cuda())
-                truths.append(truth)
-                small = target['source_box_area'].cuda() < plan['small_area']
-                picked = (select(native, batch, detections[batch], columns) if native_selection
-                          else choose(native, batch, truth, small, detections[batch], columns, counts))
-                if picked is not None:
-                    candidates[batch] = picked
-            if not candidates:
-                return native
-            positions = {batch: entry[0] for batch, entry in candidates.items()}
-            replacements = {batch: entry[1] for batch, entry in candidates.items()}
-            hook = partial(replace_cells, replacements=replacements, positions=positions)
-            with proposal.register_forward_hook(hook):
-                revised = model(samples)
-            expected = native['geometry']['chosen'].clone()
-            for batch, (slots, cells, _) in candidates.items():
-                expected[batch, slots] = cells
-            if (not torch.equal(revised['geometry']['active'], native['geometry']['active'])
-                    or not torch.equal(revised['geometry']['chosen'], expected)):
-                raise ValueError('Replacement changed the original query budget or untouched cells')
-            if native_selection:
-                counts['replacement_slots'] += sum(len(entry[0]) for entry in candidates.values())
-                candidates = {
-                    batch: match_new_seeds(native, batch, slots, cells, truths[batch],
-                                           targets[batch]['source_box_area'].cuda() < plan['small_area'])
-                    for batch, (slots, cells, _) in candidates.items()
-                }
-            record(revised, candidates, truths, post, columns, counts)
-            return revised
-
-        report = measure(model, known, loader, plan, replay=predict)
+        report = measure_injection(model, loader, known, plan, protocol, native_selection, select)
         groups = report['groups']
         reference = baseline['protocols'][protocol]['groups']
-        if any(row['native_known_tp'] != reference[name]['native_known_tp'] for name, row in groups.items()):
+        if any(groups[key]['native_known_tp'] != reference[key]['native_known_tp'] for key in ('all', 'small')):
             raise ValueError(f'Changed native class matches: {protocol}')
-        groups['transfer'] = counts
-        groups['changes'] = report['changes']
         if selectors is not None:
+            counts = groups['transfer']
             actual = dict(placed=counts['replacement_slots'], matched=counts['assigned'])
             if actual != plan['expected_reservations'][protocol]:
                 raise ValueError(f'Changed frozen readout selection or slot budget: {protocol}')
-        if native_selection:
-            groups['passed'] = (groups['small']['revised'] - groups['small']['final'] >= int(protocol == 's-owodb')
-                                and all(groups[name]['revised_known_tp'] >= groups[name]['native_known_tp']
-                                        for name in ('all', 'small')))
-        return dict(groups=groups, coverage={key: groups['small'][key] for key in ('gt', 'final')})
+        return report
 
     run_released_probe(output, plan, baseline, replay)
 
