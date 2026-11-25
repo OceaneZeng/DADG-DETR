@@ -1,5 +1,6 @@
 """Trace released-class AP and output quotas for two frozen S Task 1 endpoints."""
 
+import argparse
 import subprocess
 from collections import Counter
 from pathlib import Path
@@ -11,7 +12,7 @@ from tools.owod.diagnose_learning import evaluate_views, make_loader
 from tools.owod.gnn_calibration import load_detector
 from tools.owod.probe_s_task1_rank_independent import OUTPUT as INDEPENDENT, PROTOCOL
 from tools.owod.probe_task1_m_s_refinement_aose import with_quota
-from tools.owod.probe_task1_m_s_refinement_known_dedup import CompeteWithEmittedUnknown
+from tools.owod.probe_task1_m_s_refinement_known_dedup import CompeteWithEmittedUnknown, DeduplicateKnown
 from tools.owod.probe_task1_paired_discovery import verified
 from tools.owod.protocol import file_sha256, resolve_image_root
 from tools.owod.run_cross_attention_study import pin
@@ -22,11 +23,13 @@ from util.box_ops import box_cxcywh_to_xyxy, box_iou
 
 
 OUTPUT = MIDPOINT.with_name('task1-s-half-rank-quota')
+SUPPRESSION_OUTPUT = MIDPOINT.with_name('task1-s-half-rank-suppression')
 MIDPOINT_SHA = '58376179753f96f69fc837c62e3ec0409ccc91f34915f0ac9b309f2b08036675'
+QUOTA_SHA = '0d4423f106faa4dfb5d5344cc48766414e89e96387fe0ca4c80307bb5443c746'
 RETRY = MIDPOINT.with_name('task1-s-half-rank-gradient-retry')
 
 
-def prepare():
+def prepare(output):
     before = verified(INDEPENDENT / 'comparison.json', INDEPENDENT_SHA)
     after = verified(RETRY / 'comparison.json', MIDPOINT_SHA)
     full = verified(INDEPENDENT / 'plan.json', before['plan_sha256'])
@@ -51,11 +54,20 @@ def prepare():
                 paper_comparable=False, independent_comparison_sha256=INDEPENDENT_SHA,
                 midpoint_comparison_sha256=MIDPOINT_SHA, arms=arms,
                 **{key: full[key] for key in ('holdout_sha256', 'manifest_sha256', 'batch_size', 'limit')})
-    pin(OUTPUT / 'plan.json', plan)
+    if output == SUPPRESSION_OUTPUT:
+        quota = verified(OUTPUT / 'comparison.json', QUOTA_SHA)
+        prior = verified(OUTPUT / 'plan.json', quota['plan_sha256'])
+        if quota['status'] != 'complete' or any(plan[key] != prior[key] for key in plan if key != 'commit'):
+            raise ValueError('Expected the same frozen quota replay inputs')
+
+        plan['quota_comparison_sha256'] = QUOTA_SHA
+        plan['quota_plan_sha256'] = quota['plan_sha256']
+        plan['quota_reports'] = {name: file_sha256(OUTPUT / f'{name}.json') for name in arms}
+    pin(output / 'plan.json', plan)
     return plan, annotations
 
 
-def replay(arm, manifest, annotations, plan, full_quotas=None):
+def replay(arm, manifest, annotations, plan, full_quotas=None, *, trace_suppression=False):
     device = torch.device('cuda')
     model, _ = load_detector(None, Path(arm['checkpoint']), device)
     known = manifest['stages'][0]['classes']
@@ -65,8 +77,12 @@ def replay(arm, manifest, annotations, plan, full_quotas=None):
                          image_source_ids=[row['owod_source_id'] for row in dataset.coco.dataset['images']])
     limit = plan['limit']
     post = CompeteWithEmittedUnknown(known_ids=known, scoring='focal', max_detections=limit)
+    dedup = DeduplicateKnown(known_ids=known, scoring='focal', max_detections=limit) if trace_suppression else None
     threshold = specification['iou_threshold']
     counts = {str(category): Counter(gt=0, localized=0, correct_class=0, viable=0, emitted=0) for category in known}
+    if trace_suppression:
+        for row in counts.values():
+            row['after_known_nms'] = 0
     quotas, predictions = {}, {}
     known_ids = torch.as_tensor(known, device=device)
     lost_slots = 0
@@ -74,6 +90,7 @@ def replay(arm, manifest, annotations, plan, full_quotas=None):
     def observe(outputs, targets, batch_images, score_tables):
         nonlocal lost_slots
         scores, categories, selected = score_tables[0]
+        dedup_scores = dedup.candidate_scores(outputs)[0] if dedup is not None else None
         queries_xy = box_cxcywh_to_xyxy(outputs['pred_boxes'])
         raw_class = known_ids[outputs['pred_logits'][..., known].argmax(dim=-1)]
         for index, image in batch_images.items():
@@ -90,6 +107,10 @@ def replay(arm, manifest, annotations, plan, full_quotas=None):
             for label, box, cls, survive, output in zip(labels.tolist(), localized.tolist(), correct.tolist(),
                                                         viable.tolist(), emitted.tolist(), strict=True):
                 counts[str(label)].update(gt=1, localized=box, correct_class=cls, viable=survive, emitted=output)
+            if dedup_scores is not None:
+                remaining = (matched & dedup_scores[index][:, columns].isfinite()).any(0)
+                for label, kept in zip(labels.tolist(), remaining.tolist(), strict=True):
+                    counts[str(label)]['after_known_nms'] += kept
             quotas[image] = int((native_columns != len(known)).sum())
             if full_quotas is not None:
                 desired = full_quotas[image]
@@ -115,12 +136,41 @@ def replay(arm, manifest, annotations, plan, full_quotas=None):
     return report, quotas
 
 
+def trace_suppression(plan, manifest, annotations, digest):
+    totals = {}
+    for name, arm in plan['arms'].items():
+        print(f'Evaluating S Task 1 {name} gradient suppression stages', flush=True)
+        report, _ = replay(arm, manifest, annotations, plan, trace_suppression=True)
+        prior = verified(OUTPUT / f'{name}.json', plan['quota_reports'][name])
+        if prior['plan_sha256'] != plan['quota_plan_sha256']:
+            raise ValueError(f'Changed previous quota report plan for {name}')
+        rows = report['released_query_trace']
+        previous = prior['report']['released_query_trace']
+        for label, current in rows.items():
+            if ({key: val for key, val in current.items() if key != 'after_known_nms'} != previous[label]
+                    or not current['correct_class'] >= current['after_known_nms'] >= current['viable']):
+                raise ValueError(f'Suppression stages do not reconstruct the previous trace for {name}/{label}')
+        write_json(SUPPRESSION_OUTPUT / f'{name}.json', dict(plan_sha256=digest, report=report))
+        summary = {key: sum(row[key] for row in rows.values()) for key in next(iter(rows.values()))}
+        summary['known_nms_loss'] = summary['correct_class'] - summary['after_known_nms']
+        summary['unknown_overlap_loss'] = summary['after_known_nms'] - summary['viable']
+        totals[name] = summary
+    write_json(SUPPRESSION_OUTPUT / 'comparison.json', dict(status='complete', plan_sha256=digest, arms=totals))
+
+
 def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--suppression-trace', action='store_true')
+    args = parser.parse_args()
     if torch.cuda.device_count() != 1 or torch.cuda.get_device_name() != 'NVIDIA GeForce RTX 3090':
         raise ValueError('Use one RTX 3090 for the frozen replay')
-    plan, annotations = prepare()
-    digest = file_sha256(OUTPUT / 'plan.json')
+    output = SUPPRESSION_OUTPUT if args.suppression_trace else OUTPUT
+    plan, annotations = prepare(output)
+    digest = file_sha256(output / 'plan.json')
     manifest = verified(MANIFESTS[PROTOCOL], plan['manifest_sha256'])
+    if args.suppression_trace:
+        trace_suppression(plan, manifest, annotations, digest)
+        return
     arms = plan['arms']
     print('Evaluating S Task 1 full-gradient endpoint', flush=True)
     control, quotas = replay(arms['full'], manifest, annotations, plan)
