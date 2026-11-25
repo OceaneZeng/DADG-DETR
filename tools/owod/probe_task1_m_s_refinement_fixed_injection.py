@@ -25,21 +25,28 @@ ORACLE_SHA = '557f726288345153a448b95f970c66eb193856154154619b343215a4b4b5d5e9'
 NMS_IOU = .6
 
 
-def choose_native(native, batch, detections, columns):
+def fine_candidates(geometry, batch):
+    boxes = geometry['boxes'][batch]
+    finest = geometry['masks'][0][batch].numel()
+    area_limit = geometry['anchors'][batch, 0, 2:].prod()
+    valid = torch.where(geometry['valid'][batch, :finest] & (boxes[:finest, 2:].prod(dim=1) <= area_limit))[0]
+    selected = geometry['chosen'][batch, geometry['active'][batch]]
+    return valid[~torch.isin(valid, selected)]
+
+
+def choose_native(native, batch, detections, columns, *, scores=None):
     geometry = native['geometry']
     active = torch.where(geometry['active'][batch])[0]
     selected = geometry['chosen'][batch, active]
     known_queries = detections['top_indices'][detections['labels'] != 91] // columns
     eligible = torch.where(~torch.isin(active, known_queries))[0][-MAX_REPLACEMENTS:]
     boxes = geometry['boxes'][batch]
-    finest = geometry['masks'][0][batch].numel()
-    area_limit = geometry['anchors'][batch, 0, 2:].prod()
-    valid = torch.where(geometry['valid'][batch, :finest] & (boxes[:finest, 2:].prod(dim=1) <= area_limit))[0]
-    candidates = valid[~torch.isin(valid, selected)]
-    priority = geometry['logits'][batch, candidates].argsort(descending=True, stable=True)
+    candidates = fine_candidates(geometry, batch)
+    scores = geometry['logits'][batch, candidates] if scores is None else scores
+    priority = scores.argsort(descending=True, stable=True)
     candidates = candidates[priority]
     candidate_boxes = box_cxcywh_to_xyxy(boxes[candidates])
-    used = torch.zeros_like(candidates, dtype=torch.bool)
+    used = ~scores[priority].isfinite()
     positions = torch.arange(len(active), device=active.device)
     placed = selected.clone()
     slots, cells = [], []
