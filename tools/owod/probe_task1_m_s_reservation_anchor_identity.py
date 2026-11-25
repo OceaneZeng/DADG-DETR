@@ -32,6 +32,8 @@ def shortlist_unknown(scores, limit):
 
 
 def trace(rows, small_area, post, native, protected, picks, targets, witnesses, losses):
+    if not any(loss.any() for loss in losses):
+        return
     native_scores = post.scores_before_competition(native)[0]
     scores, categories, unknown = post.scores_before_competition(protected)
     final = post.candidate_scores(protected)[0].flatten(1)
@@ -93,9 +95,7 @@ def summarize(rows, replay):
     return dict(overlap_losses=len(rows), small_overlap_losses=sum(row['small'] for row in rows), **counts)
 
 
-def main():
-    if torch.cuda.device_count() != 1 or torch.cuda.get_device_name() != 'NVIDIA GeForce RTX 3090':
-        raise ValueError('Use one RTX 3090 for the retained-anchor traceback')
+def prepare_replays():
     plan, holdout, mined = prepare()
     first = verified(DECODER_OUTPUT / 'comparison.json', DECODER_SHA)
     first_plan = verified(DECODER_OUTPUT / 'plan.json', first['plan_sha256'])
@@ -105,6 +105,25 @@ def main():
     if (first['status'] != 'complete' or attention['status'] != 'complete'
             or any(plan[k] != first_plan[k] or plan[k] != prior[k] for k in bindings)):
         raise ValueError('Expected the unchanged paired reservation endpoints and cohorts')
+    return plan, holdout, mined, first, attention
+
+
+def cohort_loaders(protocol, job, plan):
+    holdout, holdout_order = holdout_loader(protocol, job, plan)
+    manifest_path = MANIFESTS[protocol]
+    manifest = verified(manifest_path, job['manifest_sha256'])
+    checkpoint = Path(job['checkpoint'])
+    first, first_order = training_loader(checkpoint, Path(job['training']), resolve_image_root(manifest_path, manifest),
+                                         job, plan, source_box_area=True)
+    if first_order != job['expected_order'] or holdout_order != plan['holdout_order_sha256'][protocol]:
+        raise ValueError(f'Changed cohort order: {protocol}')
+    return {'first': (first, first_order), 'holdout': (holdout, holdout_order)}
+
+
+def main():
+    if torch.cuda.device_count() != 1 or torch.cuda.get_device_name() != 'NVIDIA GeForce RTX 3090':
+        raise ValueError('Use one RTX 3090 for the retained-anchor traceback')
+    plan, holdout, mined, first, attention = prepare_replays()
     plan.update(attention_sha256=ATTENTION_SHA, first_sha256=DECODER_SHA, first_plan_sha256=first['plan_sha256'],
                 factor='Identify every native witness lost to an emitted unknown/query overlap, with the exact '
                        'attention isolation and no changes to logits, boxes, ranking or suppression.',
@@ -117,27 +136,18 @@ def main():
     protocols = {}
     device = torch.device('cuda')
     for protocol, job in plan['jobs'].items():
-        loader, holdout_order = holdout_loader(protocol, job, plan)
-        manifest_path = MANIFESTS[protocol]
-        manifest = verified(manifest_path, job['manifest_sha256'])
+        loaders = cohort_loaders(protocol, job, plan)
         checkpoint = Path(job['checkpoint'])
-        first_loader, first_order = training_loader(checkpoint, Path(job['training']),
-                                                   resolve_image_root(manifest_path, manifest), job, plan,
-                                                   source_box_area=True)
-        if first_order != job['expected_order'] or holdout_order != plan['holdout_order_sha256'][protocol]:
-            raise ValueError(f'Changed cohort order: {protocol}')
         model, _ = load_detector(None, checkpoint, device)
         selector = mined_selector(mined[protocol]['ranker'])
         slices = {}
-        for name, cohort, order, reference in (
-            ('first', first_loader, first_order, first['protocols'][protocol]['groups']),
-            ('holdout', loader, holdout_order, holdout[protocol]['mined']),
-        ):
+        references = {'first': first['protocols'][protocol]['groups'], 'holdout': holdout[protocol]['mined']}
+        for name, (cohort, order) in loaders.items():
             dest = OUTPUT / f'{protocol}-{name}.json'
             if not dest.exists():
                 print(f'Tracing {protocol}/{name} unknown anchor identities', flush=True)
                 rows = []
-                replay = evaluate(model.eval(), cohort, protocol, job, plan, selector, reference,
+                replay = evaluate(model.eval(), cohort, protocol, job, plan, selector, references[name],
                                   observe=partial(trace, rows, plan['small_area']))
                 if any(replay['changed_rows'][key] for key in ('pred_novelty', 'pred_objectness')):
                     raise ValueError(f'Changed retained unknown scores: {protocol}/{name}')

@@ -51,6 +51,9 @@ class CompeteWithEmittedUnknown(DeduplicateKnown):
     def scores_before_competition(self, outputs):
         return super().candidate_scores(outputs)
 
+    def overlap_eligibility(self, outputs, batch, anchors, eligible):
+        return eligible
+
     def candidate_scores(self, outputs):
         scores, categories, unknown = self.scores_before_competition(outputs)
         known_columns = len(self.known_ids)
@@ -73,6 +76,7 @@ class CompeteWithEmittedUnknown(DeduplicateKnown):
                     eligible = eligible & same
                 else:
                     eligible = eligible & (same | prefers_unknown[batch, anchors][None])
+            eligible = self.overlap_eligibility(outputs, batch, anchors, eligible)
             precedes = unknown[batch, anchors][None] > known.amax(-1)[:, None]
             suppressed = (eligible & precedes).any(dim=1)
             known.masked_fill_(suppressed[:, None], -torch.inf)

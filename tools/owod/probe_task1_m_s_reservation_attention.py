@@ -176,8 +176,8 @@ def evaluate(model, loader, protocol, job, plan, selector, reference, *, observe
                 for stage, mask in zip(('known_nms', 'unknown_overlap', 'top50'), stages, strict=True):
                     attribution['all'][stage] += int(mask.sum())
                     attribution['small'][stage] += int((mask & lost_small).sum())
-            if observe is not None:
-                observe(post, native, outputs['protected'], picks, targets, witnesses, losses)
+        if observe is not None:
+            observe(post, native, outputs['protected'], picks, targets, witnesses, losses)
         images += len(targets)
         if step == 1 or step % 32 == 0 or step == len(loader):
             print(f'{protocol} {step}/{len(loader)} batches, {changed_rows["injected"]} fixed replacements', flush=True)
