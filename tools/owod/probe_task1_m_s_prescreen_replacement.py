@@ -25,14 +25,14 @@ MAX_REPLACEMENTS = 2
 MIN_GAIN = .10
 
 
-def replace_cells(module, inputs, output, replacements):
+def replace_cells(module, inputs, output, replacements, *, positions=None):
     memory = inputs[0]
     *mixed, geometry = output
     active = geometry['active']
     chosen = geometry['chosen'].clone()
     changed = torch.zeros_like(active)
     for i, cells in replacements.items():
-        slots = torch.where(active[i])[0][-len(cells):]
+        slots = torch.where(active[i])[0][-len(cells):] if positions is None else positions[i]
         chosen[i, slots] = cells
         changed[i, slots] = True
     batch = torch.arange(len(memory), device=memory.device)[:, None]
