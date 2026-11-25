@@ -125,6 +125,8 @@ def get_args_parser():
                         help='Rank accurate neighbors of released small boxes against the Task 1 encoder shortlist')
     parser.add_argument('--screen-detach-rank-features', action='store_true',
                         help='Update only the quality head from the auxiliary small-box ranking loss')
+    parser.add_argument('--screen-rank-feature-grad-scale', type=float, default=1.,
+                        help='Scale the auxiliary small-box ranking gradient into Task 1 encoder features')
     parser.add_argument('--owod-screening', default='',
                         help='Verified training-only diagnostic selection; not an official benchmark run')
     parser.add_argument('--screen-branch-checkpoint', default='',

@@ -13,7 +13,7 @@ from .discovery_candidates import mine_candidates
 from util import box_ops
 from models.segmentation import sigmoid_focal_loss
 from util.misc import get_world_size, is_dist_avail_and_initialized
-from util.training_runtime import gather_evidence, foreach_ema_parameters, copy_model_buffers
+from util.training_runtime import gather_evidence, foreach_ema_parameters, copy_model_buffers, scale_gradient
 from util.runtime_profile import scope
 
 DISCOVERY_VERSION = 5
@@ -21,11 +21,6 @@ DISCOVERY_RAMP_VERSION = 6
 DISCOVERY_LOSS_VERSION = 7
 DISCOVERY_STABILITY_VERSION = 8
 DISCOVERY_BACKGROUND_VERSION = 9
-
-
-def scale_gradient(value, scale):
-    """Keep the forward value; scale only this branch's input gradient."""
-    return value if scale == 1. else value.detach() + scale * (value - value.detach())
 
 
 def known_unknown_log_ratio(logits, novelty, labels, known_ids, scoring='hierarchical'):
@@ -100,8 +95,10 @@ class DiscoveryDetector(nn.Module):
                 raise ValueError('Mixed instance proposals require one-stage decoder queries')
             # Isolate initialization so common detector and discovery parameters start identically.
             with torch.random.fork_rng(devices=[]):
+                rank_grad_scale = (0. if getattr(args, 'screen_detach_rank_features', False)
+                                   else getattr(args, 'screen_rank_feature_grad_scale', 1.))
                 detector.transformer.instance_proposals = InstanceProposals(
-                    args.hidden_dim, detach_rank_features=getattr(args, 'screen_detach_rank_features', False))
+                    args.hidden_dim, rank_feature_grad_scale=rank_grad_scale)
                 self.instance_projection = nn.Linear(args.hidden_dim, SETTINGS['projection_dim'])
                 self.instance_classes = nn.Linear(SETTINGS['projection_dim'], args.num_classes)
             self.transfer_enabled = False

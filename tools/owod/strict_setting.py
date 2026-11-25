@@ -58,8 +58,12 @@ def configure_run(args):
         raise ValueError('Instance transfer requires discovery')
     small_box_supervision = (getattr(args, 'screen_small_box_extent', False)
                              or getattr(args, 'screen_small_box_quality_rank', False))
-    if getattr(args, 'screen_detach_rank_features', False) and not getattr(args, 'screen_small_box_quality_rank', False):
-        raise ValueError('Detached rank features require the auxiliary small-box ranking loss')
+    rank_scale = getattr(args, 'screen_rank_feature_grad_scale', 1.)
+    detach_rank = getattr(args, 'screen_detach_rank_features', False)
+    if not 0. <= rank_scale <= 1. or (detach_rank and rank_scale != 1.):
+        raise ValueError('Use a rank feature gradient scale in [0, 1] or the legacy detach switch')
+    if (detach_rank or rank_scale != 1.) and not getattr(args, 'screen_small_box_quality_rank', False):
+        raise ValueError('Rank feature gradient scaling requires the auxiliary small-box ranking loss')
     if small_box_supervision and not (
             instance_mode != 'legacy' and args.owod_screening and args.owod_manifest
             and args.owod_stage == 0 and args.owod_phase == 'increment' and not args.screen_author_eval):
@@ -341,6 +345,7 @@ def validate_checkpoint(args, checkpoint, resume=False):
                                ('discovery_saliency_match_count', False),
                                ('screen_small_box_extent', False),
                                ('screen_small_box_quality_rank', False),
+                               ('screen_rank_feature_grad_scale', 1.),
                                ('screen_detach_rank_features', False)):
             if getattr(saved, field, default) != getattr(args, field, default):
                 raise ValueError(f'Discovery checkpoint cannot change {field}')

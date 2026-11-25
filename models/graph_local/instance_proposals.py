@@ -6,6 +6,7 @@ import torch.nn.functional as F
 from torchvision.ops import nms
 
 from util.box_ops import box_cxcywh_to_xyxy
+from util.training_runtime import scale_gradient
 
 
 SMALL_BOX_EXTENT_WEIGHT = 0.1
@@ -21,9 +22,9 @@ def select_encoder_cells(boxes, valid_ids, scores, quota, shortlist_multiplier=1
 class InstanceProposals(nn.Module):
     shortlist_multiplier = 12
 
-    def __init__(self, dim, *, detach_rank_features=False):
+    def __init__(self, dim, *, rank_feature_grad_scale=1.):
         super().__init__()
-        self.detach_rank_features = detach_rank_features
+        self.rank_feature_grad_scale = rank_feature_grad_scale
         self.rank_within_level = False
         self.match_encoder_counts = False
         self.finest_anchor_size = 0.05
@@ -114,8 +115,10 @@ class InstanceProposals(nn.Module):
             chosen=index,
             active=active.squeeze(-1),
         )
-        if self.training and self.detach_rank_features:
-            state["rank_logits"] = self.logits(memory.detach(), boxes)
+        if self.training and self.rank_feature_grad_scale != 1.:
+            rank_features = (memory.detach() if self.rank_feature_grad_scale == 0.
+                             else scale_gradient(memory, self.rank_feature_grad_scale))
+            state["rank_logits"] = self.logits(rank_features, boxes)
         if self.match_encoder_counts:
             state["natural_counts"] = natural_counts
         return (

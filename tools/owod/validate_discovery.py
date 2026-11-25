@@ -48,6 +48,7 @@ def validate_plan_arguments(run, saved):
                    'screen_double_previous_hard_negatives': False,
                    'screen_double_current_low_iou_boxes': False,
                    'screen_small_box_extent': False, 'screen_small_box_quality_rank': False,
+                   'screen_rank_feature_grad_scale': 1.,
                    'screen_detach_rank_features': False}.get(field)
         if getattr(saved, field, default) != value:
             raise ValueError(f'Saved checkpoint differs from launch arguments: {field}')

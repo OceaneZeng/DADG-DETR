@@ -9,6 +9,11 @@ import torch
 import torch.distributed as dist
 
 
+def scale_gradient(value, scale):
+    """Keep the forward value and scale only this branch's input gradient."""
+    return value if scale == 1. else value.detach() + scale * (value - value.detach())
+
+
 def atomic_torch_save(value, destination, **kwargs):
     """Keep the previous checkpoint intact until the new file is complete."""
     destination = Path(destination)
