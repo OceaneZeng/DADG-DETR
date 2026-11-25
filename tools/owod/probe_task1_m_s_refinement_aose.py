@@ -59,13 +59,14 @@ def prepare():
 
 
 class Attribution:
-    def __init__(self, known_ids, iou_threshold):
+    def __init__(self, known_ids, iou_threshold, *, trace_detections=False):
         self.known = set(known_ids)
         self.threshold = iou_threshold
         self.counts = Counter()
         self.targets = Counter()
         self.categories = Counter()
         self.source_categories = Counter()
+        self.detections = [] if trace_detections else None
 
     def add(self, image, predictions, annotations):
         unknown = [ann for ann in annotations if ann['category_id'] not in self.known]
@@ -74,7 +75,9 @@ class Attribution:
         for ann in annotations:
             if ann['category_id'] in self.known:
                 released.setdefault(ann['category_id'], []).append(ann['voc_bbox'])
-        for label, box in zip(predictions['labels'].tolist(), predictions['boxes'].tolist(), strict=True):
+        scores = predictions['scores'].tolist() if self.detections is not None else None
+        detections = zip(predictions['labels'].tolist(), predictions['boxes'].tolist(), strict=True)
+        for rank, (label, box) in enumerate(detections):
             if label == UNKNOWN:
                 continue
             self.counts['known_outputs'] += 1
@@ -93,15 +96,21 @@ class Attribution:
             same_class = overlaps(voc_box, released.get(label, []))
             self.counts['also_overlaps_same_known_class'] += bool(len(same_class) and same_class.max() > self.threshold)
             self.counts['unknown_difficult'] += bool(ann.get('difficult'))
+            if self.detections is not None:
+                self.detections.append(dict(image_id=image, unknown_gt=ann['id'], unknown_class=ann['category_id'],
+                                            known_prediction=label, score=scores[rank], overlap=float(iou[best])))
 
     def result(self):
         hits = self.counts['a_ose']
-        return dict(known_outputs=self.counts['known_outputs'], a_ose=hits, unique_unknown_targets=len(self.targets),
-                    duplicate_hits=hits - len(self.targets),
-                    also_overlaps_same_known_class=self.counts['also_overlaps_same_known_class'],
-                    unknown_difficult=self.counts['unknown_difficult'],
-                    by_known_prediction=dict(self.categories), by_unknown_source_category=dict(self.source_categories),
-                    rate=hits / max(self.counts['known_outputs'], 1))
+        result = dict(known_outputs=self.counts['known_outputs'], a_ose=hits, unique_unknown_targets=len(self.targets),
+                      duplicate_hits=hits - len(self.targets),
+                      also_overlaps_same_known_class=self.counts['also_overlaps_same_known_class'],
+                      unknown_difficult=self.counts['unknown_difficult'],
+                      by_known_prediction=dict(self.categories), by_unknown_source_category=dict(self.source_categories),
+                      rate=hits / max(self.counts['known_outputs'], 1))
+        if self.detections is not None:
+            result['detections'] = self.detections
+        return result
 
 
 def with_quota(scores, categories, boxes, known_count, limit):

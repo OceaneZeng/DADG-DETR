@@ -101,22 +101,25 @@ class MatchedFinalQuota(TransferredNoveltyPostprocess):
         return result
 
 
-def evaluate_fold(model, manifest, path, plan, processors):
+def evaluate_fold(model, manifest, path, plan, processors, *, trace_detections=False):
     known = manifest['stages'][0]['classes']
     root = resolve_image_root(MANIFESTS[PROTOCOL], manifest)
     dataset, loader = make_loader(root, path, plan['batch_size'], 2)
     spec = dict(manifest['evaluation'],
                 image_source_ids=[row['owod_source_id'] for row in dataset.coco.dataset['images']])
-    traces = {view: Attribution(known, spec['iou_threshold']) for view in processors}
+    traces = {view: Attribution(known, spec['iou_threshold'], trace_detections=trace_detections)
+              for view in processors}
 
     def observe(outputs, targets, batch_images, score_tables):
         boxes = box_cxcywh_to_xyxy(outputs['pred_boxes'])
-        for view, (_, categories, positions) in zip(processors, score_tables, strict=True):
+        for view, (scores, categories, positions) in zip(processors, score_tables, strict=True):
             for i, image in batch_images.items():
                 chosen = positions[i]
                 height, width = targets[i]['orig_size'].tolist()
                 corners = boxes[i, chosen // len(categories)] * boxes.new_tensor([width, height, width, height])
                 detections = dict(boxes=corners.cpu(), labels=categories[chosen % len(categories)].cpu())
+                if trace_detections:
+                    detections['scores'] = scores[i].flatten()[chosen].cpu()
                 traces[view].add(image, detections, dataset.coco.imgToAnns[image])
 
     views = {name: (known, 'focal', plan['limit']) for name in processors}
