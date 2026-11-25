@@ -1,5 +1,6 @@
 """Test whether accurate released boxes survive fixed-count injection on the refinement checkpoint."""
 
+import argparse
 from collections import Counter
 from functools import partial
 import subprocess
@@ -18,7 +19,54 @@ from util.box_ops import box_cxcywh_to_xyxy, box_iou
 
 
 OUTPUT = REGRESSION_OUTPUT.with_name('task1-m-s-refinement-fixed-injection')
+NATIVE_OUTPUT = OUTPUT.with_name('task1-m-s-refinement-fine-seed-reservation')
 REGRESSION_SHA = 'd0055702a199e1317a7dd0f8366e24a1fe33b248847ff631c3e6b7106476d2b0'
+ORACLE_SHA = '557f726288345153a448b95f970c66eb193856154154619b343215a4b4b5d5e9'
+NMS_IOU = .6
+
+
+def choose_native(native, batch, detections, columns):
+    geometry = native['geometry']
+    active = torch.where(geometry['active'][batch])[0]
+    selected = geometry['chosen'][batch, active]
+    known_queries = detections['top_indices'][detections['labels'] != 91] // columns
+    eligible = torch.where(~torch.isin(active, known_queries))[0][-MAX_REPLACEMENTS:]
+    boxes = geometry['boxes'][batch]
+    finest = geometry['masks'][0][batch].numel()
+    area_limit = geometry['anchors'][batch, 0, 2:].prod()
+    valid = torch.where(geometry['valid'][batch, :finest] & (boxes[:finest, 2:].prod(dim=1) <= area_limit))[0]
+    candidates = valid[~torch.isin(valid, selected)]
+    priority = geometry['logits'][batch, candidates].argsort(descending=True, stable=True)
+    candidates = candidates[priority]
+    candidate_boxes = box_cxcywh_to_xyxy(boxes[candidates])
+    used = torch.zeros_like(candidates, dtype=torch.bool)
+    positions = torch.arange(len(active), device=active.device)
+    placed = selected.clone()
+    slots, cells = [], []
+    for position in eligible.flip(0):
+        retained = box_cxcywh_to_xyxy(boxes[placed[positions != position]])
+        overlaps = box_iou(candidate_boxes, retained)[0]
+        available = torch.where(~used & ~(overlaps > NMS_IOU).any(dim=1))[0]
+        if len(available):
+            best = available[0]
+            used[best] = True
+            placed[position] = candidates[best]
+            slots.append(active[position])
+            cells.append(candidates[best])
+    if not slots:
+        return None
+    return torch.stack(slots), torch.stack(cells), None
+
+
+def match_new_seeds(native, batch, slots, cells, truth, small):
+    geometry = native['geometry']
+    selected = geometry['chosen'][batch, geometry['active'][batch]]
+    seeds = hits(geometry['boxes'][batch, selected], truth).any(dim=0)
+    final = hits(native['pred_boxes'][batch], truth).any(dim=0)
+    misses = torch.where(small & ~seeds & ~final)[0]
+    boxes = box_cxcywh_to_xyxy(geometry['boxes'][batch, cells])
+    rows, cols = positive_pairs(box_iou(boxes, truth[misses])[0])
+    return slots[rows], cells[rows], misses[cols]
 
 
 def choose(native, batch, truth, small, detections, columns, counts):
@@ -65,6 +113,9 @@ def record(revised, candidates, truths, post, columns, counts):
 
 
 def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--native-selection', action='store_true')
+    args = parser.parse_args()
     if torch.cuda.device_count() != 1 or torch.cuda.get_device_name() != 'NVIDIA GeForce RTX 3090':
         raise ValueError('Use one RTX 3090 for the released fixed-count injection')
     regression = verified(REGRESSION_OUTPUT / 'comparison.json', REGRESSION_SHA)
@@ -82,6 +133,20 @@ def main():
                 advance='Measure first/final same-slot transfer, actual Top-50 unknown geometry and collateral '
                         'known-match changes with the refined detector. Released labels are used only in this audit.')
 
+    output = OUTPUT
+    if args.native_selection:
+        oracle = verified(OUTPUT / 'comparison.json', ORACLE_SHA)
+        oracle_plan = verified(OUTPUT / 'plan.json', oracle['plan_sha256'])
+        if oracle['status'] != 'complete' or any(plan[key] != oracle_plan[key] for key in fixed):
+            raise ValueError('Expected the same fixed-budget oracle cohort')
+        output = NATIVE_OUTPUT
+        plan.update(oracle_sha256=ORACLE_SHA, nms_iou=NMS_IOU,
+                    factor='Reserve up to two existing low-priority active slots outside native known Top-50. '
+                           'Choose unused fine-level valid boxes at most one native anchor area, sorted by the existing '
+                           'cell quality and filtered against retained boxes at original NMS IoU 0.6.',
+                    advance='Use the same accepted released dense and known Top-50 gates. Compare new seed hits '
+                            'and same-slot transfer with the label-guided fixed-budget reference.')
+
     def replay(model, loader, known, plan):
         counts = Counter()
         post = CompeteWithEmittedUnknown(known_ids=known, scoring='focal', max_detections=plan['limit'])
@@ -97,7 +162,8 @@ def main():
                 truth = box_cxcywh_to_xyxy(target['boxes'].cuda())
                 truths.append(truth)
                 small = target['source_box_area'].cuda() < plan['small_area']
-                picked = choose(native, batch, truth, small, detections[batch], columns, counts)
+                picked = (choose_native(native, batch, detections[batch], columns) if args.native_selection
+                          else choose(native, batch, truth, small, detections[batch], columns, counts))
                 if picked is not None:
                     candidates[batch] = picked
             if not candidates:
@@ -113,6 +179,13 @@ def main():
             if (not torch.equal(revised['geometry']['active'], native['geometry']['active'])
                     or not torch.equal(revised['geometry']['chosen'], expected)):
                 raise ValueError('Replacement changed the original query budget or untouched cells')
+            if args.native_selection:
+                counts['replacement_slots'] += sum(len(entry[0]) for entry in candidates.values())
+                candidates = {
+                    batch: match_new_seeds(native, batch, slots, cells, truths[batch],
+                                           targets[batch]['source_box_area'].cuda() < plan['small_area'])
+                    for batch, (slots, cells, _) in candidates.items()
+                }
             record(revised, candidates, truths, post, columns, counts)
             return revised
 
@@ -124,9 +197,13 @@ def main():
             raise ValueError(f'Changed native class matches: {protocol}')
         groups['transfer'] = counts
         groups['changes'] = report['changes']
+        if args.native_selection:
+            groups['passed'] = (groups['small']['revised'] - groups['small']['final'] >= int(protocol == 's-owodb')
+                                and all(groups[name]['revised_known_tp'] >= groups[name]['native_known_tp']
+                                        for name in ('all', 'small')))
         return dict(groups=groups, coverage={key: groups['small'][key] for key in ('gt', 'final')})
 
-    run_released_probe(OUTPUT, plan, quarter, replay)
+    run_released_probe(output, plan, quarter, replay)
 
 
 if __name__ == '__main__':
