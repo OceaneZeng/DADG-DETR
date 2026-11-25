@@ -120,7 +120,7 @@ def prepare():
     return plan, manifest, annotation_path
 
 
-def evaluate(model, manifest, path, plan):
+def evaluate(model, manifest, path, plan, *, trace_query_origin=False):
     known = manifest['stages'][0]['classes']
     threshold = manifest['evaluation']['iou_threshold']
     root = resolve_image_root(MANIFESTS[PROTOCOL], manifest)
@@ -129,26 +129,40 @@ def evaluate(model, manifest, path, plan):
                 image_source_ids=[row['owod_source_id'] for row in dataset.coco.dataset['images']])
     post = CompeteWithEmittedUnknown(known_ids=known, scoring='focal', max_detections=plan['limit'])
     small = Counter(released=0, covered=0)
+    origins = {}
 
     def observe(outputs, targets, batch_images, _score_tables):
         for index, image in batch_images.items():
-            truths = [np.asarray(ann['voc_bbox']) for ann in dataset.coco.imgToAnns[image]
-                      if not ann.get('difficult') and size_group(ann) != '32_sq_plus']
-            if not truths:
+            annotations = [ann for ann in dataset.coco.imgToAnns[image]
+                           if not ann.get('difficult') and size_group(ann) != '32_sq_plus']
+            if not annotations:
                 continue
             boxes = outputs['pred_boxes'][index]
             active = outputs['geometry']['active'][index]
             learned = torch.ones(len(boxes), dtype=torch.bool, device=boxes.device)
             learned[:len(active)] = ~active
             height, width = targets[index]['orig_size'].tolist()
-            coords = voc_coords(boxes[learned], width, height)
-            small['released'] += len(truths)
-            small['covered'] += sum((overlaps(truth, coords) > threshold).any().item() for truth in truths)
+            learned_coords = voc_coords(boxes[learned], width, height)
+            if trace_query_origin:
+                proposal_coords = voc_coords(boxes[~learned], width, height)
+            for annotation in annotations:
+                truth = np.asarray(annotation['voc_bbox'])
+                hit = (overlaps(truth, learned_coords) > threshold).any().item()
+                small['released'] += 1
+                small['covered'] += hit
+                if trace_query_origin:
+                    origins[annotation['id']] = dict(
+                        image_id=image, size=size_group(annotation), learned=hit,
+                        proposal=(overlaps(truth, proposal_coords) > threshold).any().item())
 
     report = evaluate_views(model, loader, dataset.coco, {'emitted': (known, 'focal', plan['limit'])},
                             spec, [], known, torch.device('cuda'), include_current_stats=True,
                             postprocessors={'emitted': post}, print_freq=128, rank_observer=observe)
     report['released_small_learned_query_coverage'] = small
+    if trace_query_origin:
+        if len(origins) != small['released']:
+            raise ValueError('Expected a unique ID for every released small annotation')
+        report['released_small_query_origin'] = origins
     return report
 
 
