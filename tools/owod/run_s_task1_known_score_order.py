@@ -23,9 +23,10 @@ from tools.owod.screening_data import screening_files, write_json
 OUTPUT = RETRY.with_name('task1-s-known-score-order')
 ANCHOR_SHA = '6c3122eb33f76c106f7031b312f1299a1ee0a2496fb4c0e4b5d03a60a1d56505'
 RANK_WEIGHT = 1.
+MATCHED_RANK_FLAG = '--discovery-known-rank-coef'
 
 
-def prepare():
+def prepare(output, rank_flag):
     devices = os.environ.get('CUDA_VISIBLE_DEVICES', '').split(',')
     gpus = [torch.cuda.get_device_name(i) for i in range(torch.cuda.device_count())]
     if gpus != ['NVIDIA GeForce RTX 3090'] * 2 or len(set(devices)) != 2 or not all(d.isdecimal() for d in devices):
@@ -39,8 +40,7 @@ def prepare():
             or locked['manifest_sha256'] != source['manifest_sha256']):
         raise ValueError('Expected the completed, below-gate controls for the same midpoint model')
     command = source['command'].copy()
-    flag = '--discovery-known-rank-coef'
-    if any(item in command for item in (flag, '--resume', '--pretrained')):
+    if any(item in command for item in (MATCHED_RANK_FLAG, rank_flag, '--resume', '--pretrained')):
         raise ValueError('Use only the fresh midpoint recipe without prior score ordering')
     screen = Path(command[command.index('--owod-screening') + 1])
     backbone = Path(command[command.index('--backbone-weights') + 1])
@@ -52,28 +52,27 @@ def prepare():
     verified(Path(source['holdout']), source['holdout_sha256'])
     for entry in locked['folds'].values():
         verified(Path(entry['path']), entry['sha256'])
-    command[command.index('--output_dir') + 1] = str(OUTPUT / PROTOCOL / 'increment')
-    command.extend([flag, str(RANK_WEIGHT)])
+    command[command.index('--output_dir') + 1] = str(output / PROTOCOL / 'increment')
+    command.extend([rank_flag, str(RANK_WEIGHT)])
     plan = {key: source[key] for key in ('manifest_sha256', 'screen_sha256', 'backbone_sha256', 'holdout',
                                           'holdout_sha256', 'epoch_count', 'seed', 'batch_size', 'limit',
                                           'rank_feature_grad_scale', 'min_known_ap50')}
     plan.update(commit=subprocess.check_output(['git', 'rev-parse', 'HEAD'], text=True).strip(),
-                paper_comparable=False, matched_known_rank_coef=RANK_WEIGHT, devices=devices, gpu_names=gpus,
+                paper_comparable=False, devices=devices, gpu_names=gpus,
                 command=command, midpoint_sha256=MIDPOINT_SHA, anchor_sha256=ANCHOR_SHA,
                 min_small_coverage=middle['small']['covered'], released_small_count=middle['small']['released'],
                 folds=locked['folds'], max_wi_increase=locked['max_wi_increase'], max_aose_fraction=locked['max_aose_fraction'],
                 fold_native={fold: row['views']['native'] for fold, row in anchor['outcomes']['half'].items()})
-    pin(OUTPUT / 'plan.json', plan)
     return plan, manifest
 
 
-def evaluate_endpoint(checkpoint, manifest, plan, digest):
+def evaluate_endpoint(output, checkpoint, manifest, plan, digest):
     checkpoint_sha = file_sha256(checkpoint)
     model, _ = load_detector(None, checkpoint, torch.device('cuda'))
     binding = dict(plan_sha256=digest, checkpoint_sha256=checkpoint_sha)
-    released_path = OUTPUT / 'released.json'
+    released_path = output / 'released.json'
     if not released_path.is_file():
-        print('Evaluating known score ordering on the fixed released-only S holdout', flush=True)
+        print('Evaluating the final checkpoint on the fixed released-only S holdout', flush=True)
         report = evaluate_released(model, manifest, Path(plan['holdout']), plan)
         write_json(released_path, dict(**binding, report=report))
     released = verified_endpoint(released_path, binding)
@@ -88,9 +87,9 @@ def evaluate_endpoint(checkpoint, manifest, plan, digest):
     post = CompeteWithEmittedUnknown(known_ids=known, scoring='focal', max_detections=plan['limit'])
     folds = {}
     for name, entry in plan['folds'].items():
-        dest = OUTPUT / f'{name}.json'
+        dest = output / f'{name}.json'
         if not dest.is_file():
-            print(f'Evaluating known score ordering on S {name} fold', flush=True)
+            print(f'Evaluating the final checkpoint on S {name} fold', flush=True)
             report = measure(model, manifest, root, Path(entry['path']), plan['batch_size'], plan['limit'], postprocessor=post)
             write_json(dest, dict(**binding, report=report))
         report = verified_endpoint(dest, binding)
@@ -101,7 +100,7 @@ def evaluate_endpoint(checkpoint, manifest, plan, digest):
                      wi=delta['wi'] <= plan['max_wi_increase'],
                      a_ose=delta['a_ose'] <= max(1., plan['max_aose_fraction'] * native['a_ose']))
         folds[name] = dict(metrics=metrics, delta=delta, gates=gates, passed=all(gates.values()))
-    write_json(OUTPUT / 'comparison.json', dict(status='complete', **binding, known_ap50=ap, small=small,
+    write_json(output / 'comparison.json', dict(status='complete', **binding, known_ap50=ap, small=small,
                                                released_passed=released_passed, folds=folds,
                                                passed=released_passed and all(row['passed'] for row in folds.values())))
 
@@ -114,13 +113,15 @@ def verified_endpoint(path, binding):
 
 
 def main():
-    plan, manifest = prepare()
+    plan, manifest = prepare(OUTPUT, MATCHED_RANK_FLAG)
+    plan['matched_known_rank_coef'] = RANK_WEIGHT
+    pin(OUTPUT / 'plan.json', plan)
     digest = file_sha256(OUTPUT / 'plan.json')
     print('Fitting S Task 1 with matched released-class score ordering', flush=True)
     checkpoint, saved = run_job(plan['command'], plan['screen_sha256'])
     if saved.discovery_known_rank_coef != RANK_WEIGHT or saved.backbone_weights_sha256 != plan['backbone_sha256']:
         raise ValueError('Unexpected score-order endpoint')
-    evaluate_endpoint(checkpoint, manifest, plan, digest)
+    evaluate_endpoint(OUTPUT, checkpoint, manifest, plan, digest)
 
 
 if __name__ == '__main__':

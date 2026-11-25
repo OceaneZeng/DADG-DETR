@@ -63,11 +63,11 @@ class AffinityGraph(nn.Module):
     def similarities(self, features, centers):
         return F.normalize(self.project(features), dim=-1) @ F.normalize(self.project(centers), dim=-1).T
 
-    def forward(self, features, memory):
+    def forward(self, features, memory, *, head_only_novelty=False):
         with scope('affinity_graph'):
-            return self._forward(features, memory)
+            return self._forward(features, memory, head_only_novelty)
 
-    def _forward(self, features, memory):
+    def _forward(self, features, memory, head_only_novelty):
         query = F.normalize(self.project(features), dim=-1)
         nodes = F.normalize(self.project(memory.centers.detach()), dim=-1)
         valid = memory.counts > 0
@@ -76,9 +76,12 @@ class AffinityGraph(nn.Module):
         # Same parameter capacity and heads; the ablation uses only a self-loop.
         context = attention @ nodes if self.use_messages else query
         embedding = self.update(torch.cat([query, context], -1))
-        return {'pred_objectness': self.objectness(embedding).squeeze(-1),
-                'pred_novelty': self.novelty(embedding).squeeze(-1),
-                'affinities': affinities, 'discovery_embedding': F.normalize(embedding, dim=-1)}
+        outputs = {'pred_objectness': self.objectness(embedding).squeeze(-1),
+                   'pred_novelty': self.novelty(embedding).squeeze(-1),
+                   'affinities': affinities, 'discovery_embedding': F.normalize(embedding, dim=-1)}
+        if head_only_novelty:
+            outputs['head_only_novelty'] = self.novelty(embedding.detach()).squeeze(-1)
+        return outputs
 
 
 @torch.no_grad()

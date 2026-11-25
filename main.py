@@ -214,6 +214,8 @@ def get_args_parser():
                         help='Experimental v7 count normalization preserves absolute pseudo confidence for novelty')
     parser.add_argument('--discovery-known-rank-coef', type=float, default=0.,
                         help='Experimental v8 matched-GT known/unknown score ranking loss coefficient')
+    parser.add_argument('--discovery-duplicate-rank-coef', type=float, default=0.,
+                        help='Task 1 screening coefficient for head-only novelty ranking on known duplicates')
     parser.add_argument('--discovery-feature-grad-scale', type=float, default=1.,
                         help='Experimental v8 discovery-graph input and pseudo box-consistency gradient scale')
     parser.add_argument('--discovery-background-negative', action='store_true',
@@ -409,6 +411,8 @@ def main(args):
                        'saliency_top_points': args.discovery_saliency_top_points,
                        'saliency_match_count': args.discovery_saliency_match_count,
                        'implementation': 'project_research_method', 'paper_baseline': False}
+            if args.discovery_duplicate_rank_coef:
+                profile['duplicate_rank_coef'] = args.discovery_duplicate_rank_coef
         elif getattr(args, 'control_postprocess_version', None):
             profile = {'method': 'supervised-control', 'unknown_score': 'none; no unknown predictions',
                        'postprocess_version': args.control_postprocess_version,

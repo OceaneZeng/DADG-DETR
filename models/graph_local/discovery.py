@@ -21,6 +21,7 @@ DISCOVERY_RAMP_VERSION = 6
 DISCOVERY_LOSS_VERSION = 7
 DISCOVERY_STABILITY_VERSION = 8
 DISCOVERY_BACKGROUND_VERSION = 9
+DUPLICATE_KNOWN_IOU = .7
 
 
 def known_unknown_log_ratio(logits, novelty, labels, known_ids, scoring='hierarchical'):
@@ -41,16 +42,31 @@ def known_unknown_log_ratio(logits, novelty, labels, known_ids, scoring='hierarc
 
 
 def matched_known_ranking_loss(log_ratio):
-    """Pairwise logistic loss, normalized by global matched-GT count under DDP."""
+    """Pairwise logistic loss, normalized by global query count under DDP."""
     count = log_ratio.new_tensor(log_ratio.numel(), dtype=torch.float32)
     if is_dist_avail_and_initialized():
         torch.distributed.all_reduce(count)
-        # Clamp the GLOBAL count before dividing by world size. A single GT
+        # Clamp the GLOBAL count before dividing by world size. A single query
         # across two ranks must have the same gradient as a one-process batch.
         count = count.clamp_min(1) / get_world_size()
     else:
         count = count.clamp_min(1)
     return F.softplus(log_ratio).sum() / count
+
+
+@torch.no_grad()
+def duplicate_known_queries(outputs, targets, foreground, known_ids):
+    """Find unselected queries agreeing with a high-IoU released box."""
+    known_logits, columns = outputs['pred_logits'][..., known_ids].max(-1)
+    labels = columns.new_tensor(known_ids)[columns]
+    boxes = box_ops.box_cxcywh_to_xyxy(outputs['pred_boxes'].float())
+    overlaps = []
+    for query_boxes, query_labels, target in zip(boxes, labels, targets, strict=True):
+        target_boxes = box_ops.box_cxcywh_to_xyxy(target['boxes'].float())
+        iou = box_ops.box_iou(query_boxes, target_boxes)[0]
+        overlaps.append(((iou > DUPLICATE_KNOWN_IOU)
+                         & (query_labels[:, None] == target['labels'])).any(-1))
+    return torch.stack(overlaps) & ~foreground, known_logits
 
 
 class DiscoveryFFN(nn.Module):
@@ -85,6 +101,7 @@ class DiscoveryDetector(nn.Module):
         self.transfer_threshold = args.discovery_transfer_threshold
         self.min_support = args.discovery_min_support
         self.feature_grad_scale = getattr(args, 'discovery_feature_grad_scale', 1.)
+        self.duplicate_known_rank = getattr(args, 'discovery_duplicate_rank_coef', 0.) > 0
         if not math.isfinite(self.feature_grad_scale) or not 0 <= self.feature_grad_scale <= 1:
             raise ValueError('discovery_feature_grad_scale must be finite and in [0, 1]')
         self.instance_mode = getattr(args, 'instance_mode', 'legacy')
@@ -128,7 +145,9 @@ class DiscoveryDetector(nn.Module):
             z = F.normalize(self.instance_projection(features), dim=-1)
             outputs['instance_features'] = z
             outputs['instance_logits'] = self.instance_classes(z)
-        outputs.update(self.affinity_graph(scale_gradient(features, self.feature_grad_scale), self.memory))
+        outputs.update(self.affinity_graph(
+            scale_gradient(features, self.feature_grad_scale), self.memory,
+            head_only_novelty=self.duplicate_known_rank and self.training))
         routes, route_inputs = self._discovery_routes()
         if teacher_purpose is None:
             outputs['discovery_routes'] = routes
@@ -295,6 +314,7 @@ class DiscoveryCriterion(nn.Module):
         self.objectness_loss = getattr(args, 'discovery_objectness_loss', 'balanced-bce')
         self.pseudo_normalization = getattr(args, 'discovery_pseudo_normalization', 'weight-sum')
         self.known_rank_coef = getattr(args, 'discovery_known_rank_coef', 0.)
+        self.duplicate_rank_coef = getattr(args, 'discovery_duplicate_rank_coef', 0.)
         self.feature_grad_scale = getattr(args, 'discovery_feature_grad_scale', 1.)
         self.scoring = getattr(args, 'discovery_scoring', 'hierarchical')
         self.background_negative = getattr(args, 'discovery_background_negative', False)
@@ -336,6 +356,8 @@ class DiscoveryCriterion(nn.Module):
                                 loss_discovery_consistency=1., loss_affinity=.1)
         if self.known_rank_coef:
             self.weight_dict['loss_discovery_rank'] = self.known_rank_coef
+        if self.duplicate_rank_coef:
+            self.weight_dict['loss_discovery_duplicate_rank'] = self.duplicate_rank_coef
 
     def forward(self, outputs, targets):
         # Unknown GT in full evaluation annotations is never visible to losses.
@@ -399,6 +421,17 @@ class DiscoveryCriterion(nn.Module):
         losses['loss_unknown'] = balanced_bce(outputs['pred_novelty'], pseudo.float(),
                                              novelty_weights, contribution_scale,
                                              normalization=self.pseudo_normalization)
+        if self.duplicate_rank_coef:
+            rank_loss = outputs['pred_novelty'].new_zeros(())
+            count = rank_loss
+            if self.training and self.epoch >= self.warmup:
+                duplicate, known_logits = duplicate_known_queries(outputs, targets, foreground, self.known_ids)
+                novelty = outputs['head_only_novelty'][duplicate]
+                log_ratio = F.logsigmoid(novelty) - F.logsigmoid(known_logits[duplicate])
+                rank_loss = matched_known_ranking_loss(log_ratio)
+                count = duplicate.sum().float()
+            losses['loss_discovery_duplicate_rank'] = rank_loss
+            losses['discovery_duplicate_rank_count'] = count
         if self.stability:
             matched_logits = outputs['pred_logits'][positive]
             matched_novelty = outputs['pred_novelty'][positive]

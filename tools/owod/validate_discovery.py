@@ -37,6 +37,7 @@ def validate_plan_arguments(run, saved):
                    'discovery_objectness_loss': 'balanced-bce',
                    'discovery_pseudo_normalization': 'weight-sum',
                    'discovery_known_rank_coef': 0.,
+                   'discovery_duplicate_rank_coef': 0.,
                    'discovery_feature_grad_scale': 1.,
                    'discovery_background_negative': False,
                    'decoder_bbox_lr_mult': 1.,

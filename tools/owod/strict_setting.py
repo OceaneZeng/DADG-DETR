@@ -99,6 +99,7 @@ def configure_run(args):
     objectness_loss = getattr(args, 'discovery_objectness_loss', 'balanced-bce')
     pseudo_normalization = getattr(args, 'discovery_pseudo_normalization', 'weight-sum')
     known_rank_coef = getattr(args, 'discovery_known_rank_coef', 0.)
+    duplicate_rank_coef = getattr(args, 'discovery_duplicate_rank_coef', 0.)
     feature_grad_scale = getattr(args, 'discovery_feature_grad_scale', 1.)
     background_negative = getattr(args, 'discovery_background_negative', False)
     if background_negative and not getattr(args, 'owod_discovery', False):
@@ -106,6 +107,13 @@ def configure_run(args):
     if (not math.isfinite(known_rank_coef) or known_rank_coef < 0
             or not math.isfinite(feature_grad_scale) or not 0 <= feature_grad_scale <= 1):
         raise ValueError('Invalid discovery stability configuration: rank coefficient >= 0, gradient scale in [0, 1]')
+    if not math.isfinite(duplicate_rank_coef) or duplicate_rank_coef < 0:
+        raise ValueError('discovery_duplicate_rank_coef must be finite and nonnegative')
+    if duplicate_rank_coef and not (
+            getattr(args, 'owod_discovery', False) and getattr(args, 'owod_screening', '')
+            and args.owod_stage == 0 and args.owod_phase == 'increment'
+            and getattr(args, 'discovery_scoring', 'hierarchical') == 'focal'):
+        raise ValueError('Duplicate novelty ranking requires focal discovery in Task 1 screening')
     stability_experiment = known_rank_coef > 0 or feature_grad_scale != 1.
     if objectness_loss not in ('balanced-bce', 'focal') or pseudo_normalization not in ('weight-sum', 'count'):
         raise ValueError('Invalid discovery loss configuration')
@@ -339,6 +347,7 @@ def validate_checkpoint(args, checkpoint, resume=False):
         for field, default in (('discovery_objectness_loss', 'balanced-bce'),
                                ('discovery_pseudo_normalization', 'weight-sum'),
                                ('discovery_known_rank_coef', 0.),
+                               ('discovery_duplicate_rank_coef', 0.),
                                ('discovery_feature_grad_scale', 1.),
                                ('discovery_background_negative', False),
                                ('discovery_saliency_top_points', None),
