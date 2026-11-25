@@ -1,5 +1,6 @@
 """Attribute gains and losses of the frozen released local full-box selector."""
 
+import argparse
 from collections import Counter
 import subprocess
 
@@ -7,13 +8,17 @@ import torch
 
 from tools.owod.probe_task1_m_s_refinement_center_residual import PROTECTED_FIT_OUTPUT, QUARTER_FIT_SHA
 from tools.owod.probe_task1_m_s_refinement_dense_selector import (
-    OUTPUT as SELECTOR_OUTPUT, SELECTOR_SHA, TRACE_OUTPUT, selector_transform,
+    INTERACTION_OUTPUT, OUTPUT as SELECTOR_OUTPUT, SELECTOR_SHA, TRACE_OUTPUT, selector_transform,
 )
 from tools.owod.probe_task1_m_s_refinement_known_dedup import CompeteWithEmittedUnknown
 from tools.owod.probe_task1_m_s_refinement_protected_residual import protect_known
 from tools.owod.probe_task1_m_s_refinement_trajectory import hits, run_released_probe
 from tools.owod.probe_task1_paired_discovery import verified
 from util.box_ops import box_cxcywh_to_xyxy
+
+
+INTERACTION_SHA = '5fe885d49b4dcde4ddb38aa2ebae9e8bc6ed1ca894d17b79afcda06b2e087d14'
+INTERACTION_TRACE_OUTPUT = INTERACTION_OUTPUT.with_name('task1-m-s-refinement-dense-local-interaction-trace')
 
 
 def trace_image(outputs, revised, target, batch, trace, small_area, stats):
@@ -91,15 +96,21 @@ def measure(model, loader, known, plan, params):
 
 
 def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--interaction', action='store_true')
+    args = parser.parse_args()
     if torch.cuda.device_count() != 1 or torch.cuda.get_device_name() != 'NVIDIA GeForce RTX 3090':
         raise ValueError('Use one RTX 3090 for the frozen local selector attribution')
-    selector = verified(SELECTOR_OUTPUT / 'comparison.json', SELECTOR_SHA)
+    source, digest, output = SELECTOR_OUTPUT, SELECTOR_SHA, TRACE_OUTPUT
+    if args.interaction:
+        source, digest, output = INTERACTION_OUTPUT, INTERACTION_SHA, INTERACTION_TRACE_OUTPUT
+    selector = verified(source / 'comparison.json', digest)
     quarter = verified(PROTECTED_FIT_OUTPUT / 'comparison.json', QUARTER_FIT_SHA)
-    plan = verified(SELECTOR_OUTPUT / 'plan.json', selector['plan_sha256'])
+    plan = verified(source / 'plan.json', selector['plan_sha256'])
     if selector['status'] != 'complete' or selector['passed'] or not quarter['passed']:
         raise ValueError('Expected the stopped local selector and its quarter-cap comparison')
     plan.update(commit=subprocess.check_output(['git', 'rev-parse', 'HEAD'], text=True).strip(),
-                selector_sha256=SELECTOR_SHA,
+                parent_selector_sha256=plan.get('selector_sha256'), selector_sha256=digest,
                 factor='Attribute viable same-query box corrections to candidate rank, the original keep threshold, '
                        'and native known output protection. Count changes that break existing query overlap.',
                 advance='Estimate the geometric effect if an oracle vetoed only damaging moves. Use the fixed replay '
@@ -117,7 +128,7 @@ def main():
             raise ValueError(f'Changed frozen released small geometry: {protocol}')
         return result
 
-    run_released_probe(TRACE_OUTPUT, plan, quarter, verify_measure)
+    run_released_probe(output, plan, quarter, verify_measure)
 
 
 if __name__ == '__main__':
