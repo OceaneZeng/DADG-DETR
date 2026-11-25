@@ -43,6 +43,10 @@ class DeduplicateKnown(TopKnownPerQuery):
 
 
 class CompeteWithEmittedUnknown(DeduplicateKnown):
+    def __init__(self, *args, same_query=False, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.same_query = same_query
+
     def candidate_scores(self, outputs):
         scores, categories, unknown = super().candidate_scores(outputs)
         known_columns = len(self.known_ids)
@@ -54,8 +58,12 @@ class CompeteWithEmittedUnknown(DeduplicateKnown):
                 continue
             known = scores[batch, :, :known_columns]
             overlaps = box_iou(boxes[batch].float(), boxes[batch, anchors].float())[0]
+            eligible = overlaps > OVERLAP
+            if self.same_query:
+                queries = torch.arange(len(known), device=anchors.device)
+                eligible = eligible & (queries[:, None] == anchors)
             precedes = unknown[batch, anchors][None] > known.amax(-1)[:, None]
-            suppressed = ((overlaps > OVERLAP) & precedes).any(dim=1)
+            suppressed = (eligible & precedes).any(dim=1)
             known.masked_fill_(suppressed[:, None], -torch.inf)
         return scores, categories, unknown
 
